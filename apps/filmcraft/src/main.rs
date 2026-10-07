@@ -1,7 +1,7 @@
 //! FilmCraft desktop app.
 //!
 //! Usage: `filmcraft [--control <port>] [--demo|--empty] [--recover|--no-recover] [--data-dir <dir>]
-//! [project.fcproj | media files…]`; `--help` prints the options, `--version` the version. An
+//! [project.fcproj | project.prproj | media files…]`; `--help` prints the options, `--version` the version. An
 //! unknown option is an error (exit code 2), not a file to open.
 //!
 //! Without a project, `--demo` or `--empty`, Settings ▸ General ▸ At Startup decides: Show Home
@@ -121,7 +121,12 @@ fn main() -> eframe::Result {
             }
             // voice-over recording reads the microphone through cpal
             session.voiceover.input = Some(Box::new(audio_in::CpalIn::new(&session.prefs.audio_hardware.device_class)));
-            let project = files.iter().find(|f| f.ends_with(".fcproj")).cloned();
+            // a FilmCraft project, or a Premiere Pro project (opened as a new, unsaved project)
+            let is_project = |f: &String| {
+                let lower = f.to_ascii_lowercase();
+                lower.ends_with(".fcproj") || lower.ends_with(".prproj")
+            };
+            let project = files.iter().find(|f| is_project(f)).cloned();
             if let Some(p) = project {
                 if let Err(e) = session.execute("file.open", json!({"path": p})) {
                     eprintln!("filmcraft: {e}");
@@ -143,7 +148,7 @@ fn main() -> eframe::Result {
             } else if demo {
                 let _ = session.execute("file.openDemoProject", json!({}));
             }
-            let media: Vec<String> = files.iter().filter(|f| !f.ends_with(".fcproj")).cloned().collect();
+            let media: Vec<String> = files.iter().filter(|f| !is_project(f)).cloned().collect();
             if !media.is_empty() {
                 let _ = session.execute("file.import", json!({"paths": media}));
             }

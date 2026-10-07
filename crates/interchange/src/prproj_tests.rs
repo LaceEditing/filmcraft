@@ -295,3 +295,26 @@ fn two_media_objects_for_one_file_become_one_item() {
     let seq = imp.project.sequence(imp.sequences[0]).unwrap();
     assert_eq!(seq.audio_tracks[0].items[0].item, seq.video_tracks[0].items[0].item);
 }
+
+#[test]
+fn the_sequence_premiere_had_open_comes_first_and_stills_get_no_placeholder_duration() {
+    // a second, unrelated sequence listed first in the document, and Premiere's open-sequence hint
+    let d = doc().replace(
+        "<Sequence ObjectUID=\"seq1\">",
+        "<Sequence ObjectUID=\"seq0\"><Name>Scratch</Name></Sequence>\n  <Sequence ObjectUID=\"seq1\"><Node><Properties><MZ.PrefixKey.OpenSequenceGuidList.1>seq1</MZ.PrefixKey.OpenSequenceGuidList.1></Properties></Node>",
+    );
+    let (imp, _) = import(d.as_bytes(), None);
+    assert_eq!(imp.sequences.len(), 2);
+    assert_eq!(imp.project.item(imp.sequences[0]).map(|i| i.name.as_str()), Some("Main Edit"));
+
+    let still = doc().replace(r"Footage\interview.mov</RelativePath>", r"Footage\poster.png</RelativePath>");
+    let (imp, _) = import(still.as_bytes(), Some("/edits/show"));
+    let m = imp.project.items.values().find_map(|i| match &i.kind {
+        ItemKind::Media(m) => Some(m),
+        _ => None,
+    });
+    let m = m.unwrap();
+    assert_eq!(m.info.kind, MediaKind::Still);
+    // only as long as its longest use (15 s of source), not Premiere's 60 s / 12 h placeholder
+    assert_eq!(m.info.duration, Tick(24 * S));
+}

@@ -152,6 +152,16 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
     if top.is_empty() {
         top = seqs.iter().map(|(_, id)| *id).collect();
     }
+    // The sequences Premiere had open (`MZ.PrefixKey.OpenSequenceGuidList.N` view properties)
+    // come first, so the importer opens the same timeline.
+    let open: Vec<ItemId> = root
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name().starts_with("MZ.PrefixKey.OpenSequenceGuidList"))
+        .filter_map(|n| n.text())
+        .flat_map(|t| t.split([';', ',', ' ']).map(str::trim).filter(|u| !u.is_empty()).collect::<Vec<_>>())
+        .filter_map(|u| imp.seq_items.get(u).copied())
+        .collect();
+    top.sort_by_key(|id| open.iter().position(|o| o == id).unwrap_or(usize::MAX));
     if top.is_empty() && imp.b.p.items.is_empty() {
         return Err(Error::Empty);
     }
@@ -352,6 +362,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let kind = kind_from_ext(&path);
         if matches!(kind, MediaKind::Still) {
             spec.kind = Some(kind);
+            // Premiere gives stills a 12-hour placeholder duration; use FilmCraft's own default.
+            spec.duration = None;
         }
         let id = self.b.file_media(key, &title, &path, &spec, bin);
         self.b.register_media(&path_key, id);
