@@ -3159,6 +3159,11 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
 
 fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    // Another application's project or an interchange document (Premiere `.prproj`, FCP XML,
+    // AAF, …) opens as a new, unsaved FilmCraft project; the source file is never written.
+    if let Some(format) = crate::interchange::detect(path, &bytes) {
+        return open_foreign(s, path, &bytes, format);
+    }
     let loaded = filmcraft_format::decode(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let (from, migrated) = (loaded.schema_version, loaded.migrated());
     install_project(s, loaded.project, Some(path.to_string()), true);
@@ -3176,6 +3181,36 @@ fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     }
     let missing = crate::relink::on_open(s);
     Ok(json!({"path": path, "schemaVersion": from, "migrated": migrated, "missingMedia": missing}))
+}
+
+/// Open a document FilmCraft can import but not save as a new untitled project holding its bins,
+/// media and sequences. Saving asks for a `.fcproj` path, so the original is left untouched.
+fn open_foreign(s: &mut Session, path: &str, bytes: &[u8], format: filmcraft_interchange::Format) -> Result<Value> {
+    let name = std::path::Path::new(path).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".to_string());
+    if s.path.is_some() {
+        s.previews.reset_temp();
+    }
+    install_project(s, filmcraft_project::Project::new(&name), None, true);
+    let imported = crate::interchange::import(s, path, bytes, format)?;
+    // The import is the starting point, not an undoable step back to an empty project; the
+    // project stays unsaved (dirty) so closing it asks where to save.
+    s.history = Default::default();
+    s.history.limit = 200;
+    s.saved_revision = 0;
+    if let Some(seq) = s.state.active_sequence {
+        s.events.push(crate::Event::OpenSequence(seq));
+    }
+    let warnings = imported["report"].as_array().map(Vec::len).unwrap_or(0);
+    let offline = imported["offlineMedia"].as_array().map(Vec::len).unwrap_or(0);
+    let mut msg = format!("Opened {name} ({}). Save it as a FilmCraft project to keep your changes", format.name());
+    if offline > 0 {
+        msg.push_str(&format!("; {offline} media file(s) are offline (File ▸ Link Media)"));
+    }
+    if warnings > 0 {
+        msg.push_str(&format!("; {warnings} item(s) could not be carried over (see the import report)"));
+    }
+    s.toast(msg);
+    Ok(json!({"path": path, "format": format.name(), "imported": imported}))
 }
 
 /// Load a recovery candidate (newest when `id` is None) as the current, unsaved project.

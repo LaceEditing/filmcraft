@@ -2006,6 +2006,7 @@ dependencies = [
  "filmcraft-media",
  "filmcraft-project",
  "filmcraft-time",
+ "miniz_oxide 0.8.9",
  "proptest",
  "roxmltree",
  "serde",

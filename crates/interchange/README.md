@@ -1,7 +1,8 @@
 # filmcraft-interchange
 
 Timeline interchange for FilmCraft: CMX 3600 EDL, Final Cut Pro 7 XML (xmeml), FCPXML,
-OpenTimelineIO, AAF and OMF import and export, plus Avid ALE. Layer L2: no file I/O; media
+OpenTimelineIO, AAF and OMF import and export, plus Avid ALE and Premiere Pro project (`.prproj`)
+import. Layer L2: no file I/O; media
 references are strings and audio essence is supplied by the caller (the engine).
 
 ## Specifications
@@ -78,6 +79,63 @@ none of the exports brings one back. Each such clip is named in the export `Repo
 | AAF | a gap | nothing |
 
 OMF carries no video at all.
+
+## Premiere Pro projects (`.prproj`)
+
+Import only (`prproj`). There is no published specification; like the Premiere-exported XML
+layouts above, everything was read off project files saved by Premiere Pro, never from the
+application. These observations come from about 50 projects saved by Premiere Pro 2025–2026
+(1 to 230 media files, up to ~35 000 clip items each):
+
+- The file is a gzip member (RFC 1952, deflate per RFC 1951; inflated by `miniz_oxide`) holding
+  UTF-8 XML whose root is `<PremiereData Version="3">`. Older or hand-made files may be plain XML.
+- The root's children are a flat object table. Objects carry `ObjectID` (integer) or `ObjectUID`
+  (UUID) and point at each other with `ObjectRef` / `ObjectURef`. Nested elements can reuse ids
+  locally (a `Project`'s view state has its own `ObjectID="1"`), so only the root's children are
+  indexed.
+- Times are ticks at 254 016 000 000 per second, the same unit as `Tick`, so positions copy over
+  exactly. Frame rates are ticks per frame (`8467200000` = 30 fps, `10594584000` = 23.976);
+  audio rates are ticks per sample (`5292000` = 48 kHz). `-91445760000000000` in a
+  `StartKeyframe` means "no time" (a static value).
+- Bins: `RootProjectItem` → `ProjectItemContainer/Items` → `BinProjectItem` (recursive) or
+  `ClipProjectItem` → `MasterClip` → `Clips` → `VideoClip`/`AudioClip` → `Clip/Source` →
+  `VideoMediaSource`/`AudioMediaSource` (`MediaSource/Media`) or `VideoSequenceSource`
+  (`SequenceSource/Sequence`). A sequence is a `ClipProjectItem` whose clip source is a sequence.
+- `Media`: `FilePath` / `ActualMediaFilePath` (absolute, as saved) and `RelativePath` (to the
+  project file, `\`-separated; sometimes nonsense such as `..\..\G:\…`). The importer uses a
+  plain relative path against the project's folder, else the absolute path; missing files come in
+  offline. `VideoStream` / `AudioStream` give `FrameRect` (`l,t,r,b`), rate, `Duration` and the
+  channel layout (a JSON array).
+- `Sequence/TrackGroups/TrackGroup/Second` → `VideoTrackGroup` / `AudioTrackGroup`
+  (`TrackGroup/Tracks/Track[@Index]`, `TrackGroup/FrameRate`, `FrameRect` for the frame size) →
+  `VideoClipTrack` / `AudioClipTrack` → `ClipTrack/ClipItems/TrackItems` (clips) and
+  `ClipTrack/TransitionItems/TrackItems` (transitions). Track names are optional `Track/Name`.
+- A clip (`VideoClipTrackItem` / `AudioClipTrackItem`): `ClipTrackItem/TrackItem/Start` (absent =
+  0) and `End` on the timeline; `ClipTrackItem/SubClip` → `SubClip` (`Name`) → `Clip` →
+  `Clip/InPoint`, `Clip/OutPoint`, optional `Clip/PlaybackSpeed` (negative = reversed).
+  `Link` objects group linked video and audio clips (`TrackItemGroup/TrackItems`).
+- Effects: `ClipTrackItem/ComponentOwner/Components` → a component chain → components with
+  `Component/Params` → `…ComponentParam` objects with `Name`, `StartKeyframe` (`time,value,…`) and
+  `Keyframes` (`time,value,…;` repeated). **Keyframe times are source-media ticks**, not timeline
+  ticks (checked on clips whose timeline and source positions differ); the importer converts them
+  to clip time with `(t − InPoint) / speed`. Point values are `x:y` normalised to the frame
+  (Position) or the source (Anchor Point). Motion is `MatchName` `AE.ADBE Motion`, Opacity
+  `AE.ADBE Opacity`; Motion's Uniform Scale is its one boolean parameter and is saved without a
+  name. Interpolation fields after the value are not decoded yet; keyframes import as linear.
+- Clip volume is the audio component with `FilterMatchName` `Internal Volume Stereo` (or Mono…),
+  parameter `Level`, stored as linear gain where `0.177828` (−15 dB, the value on every untouched
+  clip) means 0 dB. Choice recorded here: `dB = 20·log10(level / 0.177828)`.
+- Markers: `Clip/MarkerOwner/Markers` → `Markers/Markers/Marker/Second` → `Marker` with a
+  `DVAMarker` JSON value (`mStartTime.ticks`, optional `mDuration.ticks`, `mName`, `mComment`,
+  `mType`). Markers on a media master clip become source markers; on a sequence's master clip,
+  sequence markers.
+- Transitions: `VideoTransitionTrackItem` / `AudioTransitionTrackItem` →
+  `TransitionTrackItem` (`TrackItem/Start`, `End`, `DisplayName`, `HasOutgoingClip`,
+  `HasIncomingClip`); attached to the clips whose edges fall inside its range.
+
+Everything else (third-party and most native effects, legacy Text titles, masks, Essential Sound,
+multicam, adjustment layers) is listed in the import report. Times are clamped to 48 hours and
+speeds to 0.1 %–10 000 % so a damaged file cannot overflow `Tick` arithmetic.
 
 ## Tests
 

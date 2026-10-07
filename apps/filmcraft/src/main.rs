@@ -185,8 +185,15 @@ fn main() -> eframe::Result {
             app.hooks.pick_open_file = Some(Box::new(|filter: &str, exts: &[&str]| {
                 rfd::FileDialog::new().add_filter(filter, exts).pick_file().map(|p| p.to_string_lossy().to_string())
             }));
-            app.hooks.pick_open_project =
-                Some(Box::new(|| rfd::FileDialog::new().add_filter("FilmCraft Project", &["fcproj"]).pick_file().map(|p| p.to_string_lossy().to_string())));
+            app.hooks.pick_open_project = Some(Box::new(|| {
+                rfd::FileDialog::new()
+                    .add_filter("Projects", &["fcproj", "prproj"])
+                    .add_filter("FilmCraft Project", &["fcproj"])
+                    .add_filter("Premiere Pro Project", &["prproj"])
+                    .add_filter("Interchange (XML, FCPXML, OTIO, AAF, EDL)", &["xml", "fcpxml", "otio", "aaf", "edl"])
+                    .pick_file()
+                    .map(|p| p.to_string_lossy().to_string())
+            }));
             #[cfg(target_os = "macos")]
             {
                 let (rx, update) = native_menu::install(&app, cc.egui_ctx.clone());
