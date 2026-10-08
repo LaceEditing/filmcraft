@@ -507,6 +507,46 @@ pub fn shortcut_text(s: &str) -> String {
 }
 
 /// Parse "Cmd+Shift+K" into modifiers + key.
+/// Keypad key events carry this as their `physical_key` (the patched egui-winit in
+/// `third_party/egui-winit`): Keypad − is told apart from − by it.
+pub const KEYPAD_MARKER: egui::Key = egui::Key::F35;
+
+/// The egui key a keypad key name arrives as (`KeypadMinus` → `Minus`; keypad `*`, which egui has
+/// no key for, as `F34`). None for other names.
+pub fn keypad_key(name: &str) -> Option<egui::Key> {
+    use egui::Key;
+    Some(match name.strip_prefix("Keypad")? {
+        "0" => Key::Num0,
+        "1" => Key::Num1,
+        "2" => Key::Num2,
+        "3" => Key::Num3,
+        "4" => Key::Num4,
+        "5" => Key::Num5,
+        "6" => Key::Num6,
+        "7" => Key::Num7,
+        "8" => Key::Num8,
+        "9" => Key::Num9,
+        "Plus" => Key::Plus,
+        "Minus" => Key::Minus,
+        "Multiply" => Key::F34,
+        "Divide" => Key::Slash,
+        "Decimal" => Key::Period,
+        "Enter" => Key::Enter,
+        _ => return None,
+    })
+}
+
+/// The keypad key's canonical name for an egui key that came from the keypad.
+pub fn keypad_name(key: egui::Key) -> Option<&'static str> {
+    filmcraft_engine::shortcuts::KEYS.iter().copied().find(|n| n.starts_with("Keypad") && keypad_key(n) == Some(key))
+}
+
+/// [`parse_shortcut`] plus whether the key is on the numeric keypad.
+pub fn parse_binding(s: &str) -> Option<(egui::Modifiers, egui::Key, bool)> {
+    let keypad = s.rsplit('+').next().is_some_and(|k| keypad_key(k).is_some());
+    parse_shortcut(s).map(|(m, k)| (m, k, keypad))
+}
+
 pub fn parse_shortcut(s: &str) -> Option<(egui::Modifiers, egui::Key)> {
     let mut m = egui::Modifiers::NONE;
     let mut key = None;
@@ -528,6 +568,8 @@ pub fn parse_shortcut(s: &str) -> Option<(egui::Modifiers, egui::Key)> {
                     "=" => Some(egui::Key::Equals),
                     "-" => Some(egui::Key::Minus),
                     "`" => Some(egui::Key::Backtick),
+                    "Plus" => Some(egui::Key::Plus),
+                    k if keypad_key(k).is_some() => keypad_key(k),
                     _ => egui::Key::from_name(k),
                 }
             }
@@ -536,20 +578,46 @@ pub fn parse_shortcut(s: &str) -> Option<(egui::Modifiers, egui::Key)> {
     key.map(|k| (m, k))
 }
 
-/// One active key binding for the input loop: (modifiers, key, command id, panel or None).
-pub type KeyBinding = (egui::Modifiers, egui::Key, String, Option<String>);
+/// One active key binding for the input loop: (modifiers, key, command id, panel or None, on the
+/// numeric keypad).
+pub type KeyBinding = (egui::Modifiers, egui::Key, String, Option<String>, bool);
 
 /// The active key bindings (from the engine's shortcut set), most specific first so Shift+I
 /// doesn't also fire I.
 pub fn bindings(app: &FilmcraftApp) -> Vec<KeyBinding> {
-    let mut v: Vec<KeyBinding> =
-        app.session.shortcuts.bindings.iter().filter_map(|b| parse_shortcut(&b.keys).map(|(m, k)| (m, k, b.command.clone(), b.panel.clone()))).collect();
+    let mut v: Vec<KeyBinding> = app
+        .session
+        .shortcuts
+        .bindings
+        .iter()
+        .filter_map(|b| parse_binding(&b.keys).map(|(m, k, keypad)| (m, k, b.command.clone(), b.panel.clone(), keypad)))
+        .collect();
     // With Shift held, a punctuation key arrives as its shifted glyph (Shift+; is `:` on US layouts).
     let shifted: Vec<KeyBinding> =
-        v.iter().filter(|b| b.0.shift).filter_map(|(m, k, id, p)| shifted_key(*k).map(|k2| (*m, k2, id.clone(), p.clone()))).collect();
+        v.iter().filter(|b| b.0.shift && !b.4).filter_map(|(m, k, id, p, _)| shifted_key(*k).map(|k2| (*m, k2, id.clone(), p.clone(), false))).collect();
     v.extend(shifted);
-    v.sort_by_key(|(m, ..)| std::cmp::Reverse(m.command as u8 + m.shift as u8 + m.alt as u8 + m.ctrl as u8));
+    // More modifiers first (Cmd+Shift+K before Cmd+K). Where Ctrl is the primary modifier
+    // (Windows, Linux) a Ctrl-spelled binding (a macOS ⌃ extra) and a Cmd-spelled one land on the
+    // same keys: the Cmd one wins, as the shortcut set resolves it (Ctrl+M is Export).
+    let folded = !filmcraft_engine::shortcuts::Platform::current().is_mac();
+    v.sort_by_key(|(m, ..)| (std::cmp::Reverse(m.command as u8 + m.shift as u8 + m.alt as u8 + m.ctrl as u8), folded && m.ctrl && !m.command));
     v
+}
+
+/// The unshifted key a US layout types `k` with (`:` → `;`), when `k` is a shifted glyph: how
+/// a recorded Shift+key is spelled (the defaults write Shift+=, not Shift++).
+pub fn unshifted_key(k: egui::Key) -> Option<egui::Key> {
+    use egui::Key;
+    Some(match k {
+        Key::Colon => Key::Semicolon,
+        Key::Questionmark => Key::Slash,
+        Key::Plus => Key::Equals,
+        Key::Pipe => Key::Backslash,
+        Key::Exclamationmark => Key::Num1,
+        Key::OpenCurlyBracket => Key::OpenBracket,
+        Key::CloseCurlyBracket => Key::CloseBracket,
+        _ => return None,
+    })
 }
 
 /// The key a US layout reports for `k` with Shift held, when it differs.

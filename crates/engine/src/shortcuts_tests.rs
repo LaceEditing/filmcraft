@@ -42,6 +42,36 @@ fn chords_parse_normalise_and_display_per_os() {
     assert!(Chord::parse("Hyper+K").is_err());
 }
 
+/// The numeric keypad's keys are keys of their own (Keypad −, not -), and `+` is a key: neither
+/// could be assigned.
+#[test]
+fn keypad_keys_and_plus_are_keys() {
+    for (text, canonical) in [
+        ("KeypadMinus", "KeypadMinus"),
+        ("numpad-", "KeypadMinus"),
+        ("num subtract", "KeypadMinus"),
+        ("kp_add", "KeypadPlus"),
+        ("Numpad Plus", "KeypadPlus"),
+        ("Keypad7", "Keypad7"),
+        ("numpad 0", "Keypad0"),
+        ("KP_Enter", "KeypadEnter"),
+        ("numpad*", "KeypadMultiply"),
+        ("keypad divide", "KeypadDivide"),
+        ("numpad.", "KeypadDecimal"),
+        ("Cmd+Keypad5", "Cmd+Keypad5"),
+        ("Plus", "Plus"),
+        ("Shift+add", "Shift+Plus"),
+    ] {
+        assert_eq!(Chord::parse(text).map(|c| c.canonical()), Ok(canonical.to_string()), "{text}");
+    }
+    assert_ne!(Chord::parse("KeypadMinus").unwrap(), Chord::parse("-").unwrap(), "the keypad's − is not the main -");
+    assert_eq!(Chord::parse("Return").unwrap().canonical(), "Enter", "Return is still the main Enter");
+    assert_eq!(Chord::parse("KeypadMinus").unwrap().display(Platform::Mac), "Keypad −");
+    assert_eq!(Chord::parse("Cmd+KeypadPlus").unwrap().display(Platform::Linux), "Ctrl+Keypad +");
+    assert_eq!(Chord::parse("Plus").unwrap().display(Platform::Windows), "+");
+    assert!(Chord::parse("Keypad").is_err() && Chord::parse("numpad10").is_err());
+}
+
 #[test]
 fn defaults_follow_the_registry_and_the_premiere_audit() {
     let mut s = Session::default();

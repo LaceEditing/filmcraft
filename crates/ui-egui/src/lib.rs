@@ -96,6 +96,9 @@ pub struct HostHooks {
     /// Open a file in its default application, or (`true`) reveal it in the file manager (Edit ▸
     /// Edit Original, Help ▸ Reveal Log Files).
     pub open_path: Option<Box<dyn FnMut(&str, bool) -> Result<(), String>>>,
+    /// A keyboard shortcut is about to run this command (after focus routing): return false to
+    /// swallow it (key-cast overlays, dispatch tests).
+    pub shortcut: Option<Box<dyn FnMut(&str) -> bool>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +177,8 @@ pub struct FilmcraftApp {
     deferred: Vec<(ControlRequest, f64)>,
     last_ui_time: f64,
     pub(crate) synthetic: Vec<egui::Event>,
+    /// Modifiers the synthetic input last told egui are held (from a press to its release).
+    synthetic_mods: egui::Modifiers,
     /// BS.1770 loudness of the programme as it plays, and the next sample position to feed.
     pub(crate) loudness: Option<(filmcraft_audio_dsp::LoudnessMeter, i64)>,
     /// Status message last shown and when it first appeared (messages expire after a few seconds).
@@ -397,6 +402,7 @@ impl FilmcraftApp {
             deferred: Vec::new(),
             last_ui_time: 0.0,
             synthetic: Vec::new(),
+            synthetic_mods: egui::Modifiers::NONE,
             loudness: None,
             status_seen: (String::new(), 0.0),
             pending_screenshots: Vec::new(),
@@ -1119,16 +1125,40 @@ impl FilmcraftApp {
         // Panel shortcuts of the focused panel first: they override application shortcuts.
         let focused = self.ui.focused.title();
         let mut fire = Vec::new();
+        // The focused panel's bindings and the application's, most modifiers first: a key press
+        // matches a binding with fewer modifiers too (Shift+; arrives as `:`), so Cmd+Shift+W must
+        // be tried before the Timeline's Cmd+W. On the same keys the panel's binding wins.
+        let mut active: Vec<&menus::KeyBinding> = self.bindings.iter().filter(|b| b.3.is_none() || b.3.as_deref() == Some(focused)).collect();
+        active.sort_by_key(|(m, _, _, panel, _)| (std::cmp::Reverse(m.command as u8 + m.shift as u8 + m.alt as u8 + m.ctrl as u8), panel.is_none()));
         ctx.input_mut(|i| {
-            let panel = self.bindings.iter().filter(|b| b.3.as_deref() == Some(focused));
-            let app_wide = self.bindings.iter().filter(|b| b.3.is_none());
-            for (m, k, id, _) in panel.chain(app_wide) {
+            // Keypad keys first: their own bindings (Keypad −), if any. A keypad key without one
+            // stays in the input and works as the main key it types (− zooms out).
+            let keypad: Vec<&&menus::KeyBinding> = active.iter().filter(|b| b.4).collect();
+            if !keypad.is_empty() {
+                i.events.retain(|e| {
+                    let egui::Event::Key { key, physical_key: Some(menus::KEYPAD_MARKER), pressed: true, modifiers, .. } = e else { return true };
+                    match keypad.iter().find(|b| b.1 == *key && modifiers.matches_logically(b.0)) {
+                        Some(b) => {
+                            fire.push(b.2.clone());
+                            false
+                        }
+                        None => true,
+                    }
+                });
+            }
+            for (m, k, id, _, _) in active.iter().filter(|b| !b.4) {
                 if i.consume_key(*m, *k) {
                     fire.push(id.clone());
                 }
             }
         });
         for id in fire {
+            let id = route_clear(self.ui.focused, id);
+            if let Some(hook) = self.hooks.shortcut.as_mut()
+                && !hook(&id)
+            {
+                continue;
+            }
             // Mark In/Out in the Source monitor when it has focus.
             let params = if self.ui.focused == PanelKind::Source
                 && (matches!(id.as_str(), "markers.markIn" | "markers.markOut") || id.starts_with("markers.markSplit") || id.starts_with("markers.goToSplit"))
@@ -1550,7 +1580,30 @@ impl eframe::App for FilmcraftApp {
                     .position(|e| pointer(e) || matches!(e, egui::Event::Key { pressed: false, .. }))
                     .map_or(self.synthetic.len(), |i| if pointer(&self.synthetic[i]) { i.max(1) } else { i + 1 })
             };
-            raw_input.events.extend(self.synthetic.drain(..n));
+            let events: Vec<egui::Event> = self.synthetic.drain(..n).collect();
+            // A keyboard reports the modifiers held with a press (Shift-click, Cmd-drag) to egui
+            // as well, and code reads them from there: hold them from the press to the release.
+            let mut held = self.synthetic_mods;
+            let mut release = false;
+            for e in &events {
+                match e {
+                    egui::Event::PointerButton { modifiers, pressed, .. } | egui::Event::Key { modifiers, pressed, .. } => {
+                        held = *modifiers;
+                        release |= !pressed;
+                    }
+                    _ => {}
+                }
+            }
+            if held != self.synthetic_mods {
+                raw_input.events.push(egui::Event::ModifiersChanged(held));
+                self.synthetic_mods = held;
+            }
+            raw_input.events.extend(events);
+            if release && held != egui::Modifiers::NONE {
+                // let go of them on the next frame
+                self.synthetic.insert(0, egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+                self.synthetic_mods = egui::Modifiers::NONE;
+            }
         }
     }
 
@@ -1719,6 +1772,17 @@ pub fn playback_mix(session: &Session, seq_id: filmcraft_project::ItemId, sr: u3
             filmcraft_engine::settings::map_output(&mix.channels[0], &mix.channels[1.min(mix.channels.len() - 1)], buf, ch, map);
         }
         panels::voiceover::mix_cues(buf, ch, cursor, &cues);
+    }
+}
+
+/// Clear acts on the focused panel's selection, as in Premiere, whichever of the two delete
+/// commands the pressed key is bound to: in the Project panel it deletes project items, anywhere
+/// else it clears timeline clips (or closes the selected gap), never project items out of sight.
+pub(crate) fn route_clear(focused: PanelKind, id: String) -> String {
+    match (id.as_str(), focused) {
+        ("edit.clear", PanelKind::Project) => "project.delete".into(),
+        ("project.delete", f) if f != PanelKind::Project => "edit.clear".into(),
+        _ => id,
     }
 }
 

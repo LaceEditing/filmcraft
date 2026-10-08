@@ -82,7 +82,7 @@ pub(crate) fn has_selection(s: &Session) -> std::result::Result<(), String> {
 /// Clips or captions selected (Clear / Ripple Delete work on either).
 fn has_any_selection(s: &Session) -> std::result::Result<(), String> {
     has_seq(s)?;
-    if s.state.selection.is_empty() && s.state.caption_selection.is_empty() { Err("nothing selected".into()) } else { Ok(()) }
+    if s.state.selection.is_empty() && s.state.caption_selection.is_empty() && s.selected_gap().is_none() { Err("nothing selected".into()) } else { Ok(()) }
 }
 fn has_source(s: &Session) -> std::result::Result<(), String> {
     has_seq(s)?;
@@ -1070,6 +1070,10 @@ fn build() -> Vec<CommandSpec> {
         cmd!("edit.paste", "Paste", ["Edit"], Some("Cmd+V"), "{}", has_clipboard, |s, _| paste(s, false)),
         cmd!("edit.pasteInsert", "Paste Insert", ["Edit"], Some("Cmd+Shift+V"), "{}", has_clipboard, |s, _| paste(s, true)),
         cmd!("edit.clear", "Clear", ["Edit"], Some("Backspace"), r#"{"clips":[id]?}"#, has_any_selection, |s, p| {
+            // a selected gap has nothing to lift: clearing it closes it (Premiere)
+            if let Some((tr, gap)) = s.selected_gap().filter(|_| p.get("clips").is_none() && p.get("clip").is_none()) {
+                return close_gap(s, tr, gap.start);
+            }
             if p.get("clips").is_none() && p.get("clip").is_none() && s.state.selection.is_empty() {
                 let caps = s.state.caption_selection.clone();
                 return crate::captions::delete(s, &caps, false);
@@ -1083,6 +1087,9 @@ fn build() -> Vec<CommandSpec> {
             Ok(Value::Null)
         }),
         cmd!("edit.rippleDelete", "Ripple Delete", ["Edit"], Some("Shift+Delete"), r#"{"clips":[id]?}"#, has_any_selection, |s, p| {
+            if let Some((tr, gap)) = s.selected_gap().filter(|_| p.get("clips").is_none() && p.get("clip").is_none()) {
+                return close_gap(s, tr, gap.start);
+            }
             if p.get("clips").is_none() && p.get("clip").is_none() && s.state.selection.is_empty() {
                 let caps = s.state.caption_selection.clone();
                 return crate::captions::delete(s, &caps, true);
@@ -1418,22 +1425,22 @@ fn build() -> Vec<CommandSpec> {
         cmd!("sequence.closeGap", "Close Gap", ["Sequence"], None, r#"{"track":"V1"|id,"time":ticks}"#, has_seq, |s, p| {
             let tr = track_p(s, p, "track", "sequence.closeGap")?.ok_or_else(|| bad("sequence.closeGap", "need `track`"))?;
             let t = time_p(s, p, "").unwrap_or(s.playhead());
-            s.edit_sequence("Ripple Delete", |q, _, st| {
-                let before: Vec<(ClipId, Tick)> = q.track(tr).map(|x| x.items.iter().map(|i| (i.id, i.start)).collect()).unwrap_or_default();
-                edit::close_gap(q, tr, t)?;
-                if st.ripple_sequence_markers {
-                    // the gap ended where the first clip that moved started
-                    let moved = before
-                        .iter()
-                        .filter_map(|(id, old)| q.find_item(*id).filter(|(_, i)| i.start != *old).map(|(_, i)| (*old, *old - i.start)))
-                        .min_by_key(|m| m.0);
-                    if let Some((end, len)) = moved {
-                        crate::sequence_tools::ripple_markers(&mut q.markers, end, -len);
-                    }
-                }
-                Ok(())
-            })?;
-            Ok(Value::Null)
+            close_gap(s, tr, t)
+        }),
+        cmd!("timeline.selectGap", "Select Gap", [], None, r#"{"track":"V1"|id,"time":ticks}"#, has_seq, |s, p| {
+            let tr = track_p(s, p, "track", "timeline.selectGap")?.ok_or_else(|| bad("timeline.selectGap", "need `track`"))?;
+            let t = time_p(s, p, "").ok_or_else(|| bad("timeline.selectGap", "need `time`"))?;
+            let gap = s.active_sequence().and_then(|q| edit::gap_at(q, tr, t));
+            // selecting a gap deselects clips, captions and edit points (Premiere)
+            s.state.selection.clear();
+            s.state.caption_selection.clear();
+            s.state.edit_points.clear();
+            s.state.trim_shift = Default::default();
+            s.state.selected_gap = gap.and(s.state.active_sequence).map(|sequence| crate::GapSel { sequence, track: tr, time: t });
+            Ok(match gap {
+                Some(g) => json!({"track": tr.0, "start": g.start.0, "end": g.end().0}),
+                None => Value::Null,
+            })
         }),
         cmd!("sequence.snap", "Snap in Timeline", ["Sequence"], Some("S"), r#"{"on":bool?}"#, always, |s, p| {
             s.state.snapping = bool_p(p, "on").unwrap_or(!s.state.snapping);
@@ -1846,6 +1853,7 @@ fn build() -> Vec<CommandSpec> {
             has_seq,
             move_clips
         ),
+        cmd!("timeline.copyTo", "Copy Clips", [], None, r#"{"moves":[{"clip":id,"track":id|"V2","time":ticks}],"insert":bool}"#, has_seq, copy_clips),
         cmd!(
             "timeline.trim",
             "Trim Edit",
@@ -2311,7 +2319,7 @@ fn build() -> Vec<CommandSpec> {
                 p.get("items").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_u64().map(ItemId)).collect()).unwrap_or_default();
             Ok(Value::Null)
         }),
-        cmd!("project.delete", "Clear", [], Some("Delete"), r#"{"items":[id]?}"#, has_project_selection, |s, p| {
+        cmd!("project.delete", "Clear", [], None, r#"{"items":[id]?}"#, has_project_selection, |s, p| {
             let asked: Vec<ItemId> = p
                 .get("items")
                 .and_then(Value::as_array)
@@ -2620,6 +2628,74 @@ pub(crate) fn json_to_param(template: &ParamValue, v: &Value) -> Option<ParamVal
             ParamValue::Curve(v.as_array()?.iter().filter_map(|p| Some([p.get(0)?.as_f64()? as f32, p.get(1)?.as_f64()? as f32])).collect())
         }
     })
+}
+
+/// Alt-drag: copies of the listed clips land at the given places (overwriting, or inserting), the
+/// originals stay. Copies of linked clips are linked to each other; the copies are selected.
+fn copy_clips(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "timeline.copyTo";
+    let mut listed: Vec<(ClipId, TrackId, Tick)> = Vec::new();
+    for m in p.get("moves").and_then(Value::as_array).into_iter().flatten() {
+        let track = track_p(s, m, "track", CMD)?;
+        if let (Some(clip), Some(track), Some(time)) = (clip_p(m, "clip"), track, m.get("time").and_then(Value::as_i64)) {
+            listed.push((clip, track, Tick(time).max(Tick::ZERO)));
+        }
+    }
+    if listed.is_empty() {
+        return Err(bad(CMD, "need `moves`"));
+    }
+    let insert = bool_p(p, "insert").unwrap_or(false);
+    let ids = s.edit_sequence("Copy Clips", |q, ctx, st| {
+        let mut placements = Vec::new();
+        let mut links = std::collections::HashMap::new();
+        let copied_links: Vec<u64> = listed.iter().filter_map(|m| q.find_item(m.0).and_then(|(_, i)| i.link)).collect();
+        for (clip, track, time) in &listed {
+            let (from, it) = q.find_item(*clip).ok_or(edit::EditError::NoItem(*clip))?;
+            let dest = q.track(*track).ok_or(edit::EditError::NoTrack(*track))?;
+            if dest.locked {
+                return Err(edit::EditError::Locked.into());
+            }
+            if q.track(from).map(|t| t.kind) != Some(dest.kind) {
+                return Err(bad(CMD, "a clip can only be copied onto a track of its kind"));
+            }
+            let mut copy = it.clone();
+            copy.id = ClipId(ctx.alloc());
+            copy.start = *time;
+            // copies of linked clips are linked to each other; a copy whose partner stays behind is not linked
+            copy.link = copy.link.filter(|l| copied_links.iter().filter(|x| *x == l).count() > 1).map(|l| *links.entry(l).or_insert_with(|| ctx.alloc()));
+            placements.push((*track, copy));
+        }
+        let ids = if insert { edit::insert(q, placements, ctx)? } else { edit::overwrite(q, placements, ctx)? };
+        st.selection = ids.clone();
+        Ok(ids)
+    })?;
+    Ok(json!({"clips": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))
+}
+
+/// Ripple Delete on the gap of `tr` around `t`: later clips (and sync-locked tracks) move left
+/// to close it; sequence markers follow when Ripple Sequence Markers is on.
+fn close_gap(s: &mut Session, tr: TrackId, t: Tick) -> Result<Value> {
+    s.edit_sequence("Ripple Delete", |q, _, st| {
+        let before: Vec<(ClipId, Tick)> = q.track(tr).map(|x| x.items.iter().map(|i| (i.id, i.start)).collect()).unwrap_or_default();
+        edit::close_gap(q, tr, t).map_err(|e| match e {
+            edit::EditError::SyncLockConflict => EngineError::Other(
+                "can't ripple delete this gap: clips on other sync-locked tracks overlap it (turn off Sync Lock on those tracks, or clear them first)".into(),
+            ),
+            e => e.into(),
+        })?;
+        if st.ripple_sequence_markers {
+            // the gap ended where the first clip that moved started
+            let moved = before
+                .iter()
+                .filter_map(|(id, old)| q.find_item(*id).filter(|(_, i)| i.start != *old).map(|(_, i)| (*old, *old - i.start)))
+                .min_by_key(|m| m.0);
+            if let Some((end, len)) = moved {
+                crate::sequence_tools::ripple_markers(&mut q.markers, end, -len);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(Value::Null)
 }
 
 fn copy_selection(s: &mut Session) {

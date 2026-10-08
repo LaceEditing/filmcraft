@@ -62,3 +62,36 @@ Frame has no default key; the Premiere preset moves Shift+E to Export Frame and 
 | Text panel: Edit Segment (Return) | No inline transcript text editing (corrections go through `transcript.set`). |
 | Text panel: Follow Active Monitor (⇧C), Show Source Transcript (⇧Z) | Only sequence transcripts exist; source clips have no transcript view. |
 | Timeline: Set Work Area Bar In/Out Point (⌥[ / ⌥]) | FilmCraft has no work area bar (Premiere hides it by default; renders use In/Out). |
+
+## How keys reach commands
+
+- **Order.** The focused panel's keys and the application keys are tried together, most modifiers
+  first (a press also matches a binding with fewer modifiers, since `Shift+;` arrives as `:`), and
+  on the same keys the panel's binding wins: in the Timeline, `Cmd+Shift+W` is Close Project and
+  `Cmd+W` is Close Sequence.
+- **Ctrl off macOS.** On Windows and Linux, `Ctrl` is the command key, so a binding written with
+  the macOS Control key (`Ctrl+M`, Add Range Marker to In and Out) lands on the same keys as a
+  `Cmd` binding (`Cmd+M`, Export). The `Cmd` binding runs, as the shortcut editor resolves it.
+- **Clear acts on the focused panel.** Edit ▸ Clear (`edit.clear`) and the Project panel's Clear
+  (`project.delete`) are one key in Premiere: whichever of the two a key is bound to, it deletes
+  project items when the Project panel has focus and clears timeline clips everywhere else, so a
+  project item selected out of sight is never deleted from the Timeline.
+- **Gaps.** Clicking empty track space between clips (or before the first clip) selects the gap
+  (`timeline.selectGap`); with no clips selected, Clear and Ripple Delete close it, and
+  right-clicking it offers Ripple Delete. Clips on other sync-locked tracks inside the gap keep it
+  open (turn their Sync Lock off).
+- **Delete keys.** Clear is `Backspace` and `Delete`; Ripple Delete is `Shift+Delete`, and
+  `Alt+Backspace` in the Timeline (Premiere's keys).
+- **Numeric keypad.** Keypad keys are keys of their own (`KeypadMinus`, `KeypadPlus`,
+  `Keypad0`–`Keypad9`, `KeypadMultiply`, `KeypadDivide`, `KeypadDecimal`, `KeypadEnter`), shown as
+  "Keypad −" etc. and recordable in the shortcut editor. Keypad + and − zoom the timeline by
+  default; a keypad key with no binding of its own acts as the main key it types. egui does not tell
+  the keypad apart, so FilmCraft builds with a patched egui-winit (`third_party/egui-winit`, see its
+  `FILMCRAFT-PATCH.md`).
+
+Tests: `crates/ui-egui/tests/timeline_keys_ui.rs` presses every application and Timeline key of
+FilmCraft Default in the headless app and checks the command each one runs; it also covers gaps,
+the focused-panel Clear, the keypad and recording keys in the shortcut editor.
+`crates/ui-egui/tests/timeline_gestures_ui.rs` drives the timeline tools with the mouse (select,
+marquee, move, Cmd-drag insert, Alt-drag copy, trim, ripple, roll, razor, slip, slide, rate stretch,
+track select, ruler scrub) and the core editing keys.

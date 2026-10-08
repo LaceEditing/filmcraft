@@ -431,15 +431,24 @@ pub fn ripple_delete_items(seq: &mut Sequence, items: &[ClipId]) -> Result<Vec<T
     Ok(spans)
 }
 
-/// Close the gap containing `t` on a track (Ripple Delete on a gap).
-pub fn close_gap(seq: &mut Sequence, track: TrackId, t: Tick) -> Result<()> {
-    let tr = seq.track(track).ok_or(EditError::NoTrack(track))?;
-    if tr.item_at(t).is_some() {
-        return Err(EditError::Nothing);
+/// The gap containing `t` on a track: the empty span between the clip before it (or the sequence
+/// start) and the next clip. None over a clip, after the last clip or on a missing track.
+pub fn gap_at(seq: &Sequence, track: TrackId, t: Tick) -> Option<TimeRange> {
+    let tr = seq.track(track)?;
+    if t < Tick::ZERO || tr.item_at(t).is_some() {
+        return None;
     }
     let prev_end = tr.items.iter().filter(|i| i.end() <= t).map(|i| i.end()).max().unwrap_or(Tick::ZERO);
-    let next_start = tr.items.iter().filter(|i| i.start > t).map(|i| i.start).min().ok_or(EditError::Nothing)?;
-    let gap = TimeRange::from_bounds(prev_end, next_start);
+    let next_start = tr.items.iter().filter(|i| i.start > t).map(|i| i.start).min()?;
+    (next_start > prev_end).then(|| TimeRange::from_bounds(prev_end, next_start))
+}
+
+/// Close the gap containing `t` on a track (Ripple Delete on a gap).
+pub fn close_gap(seq: &mut Sequence, track: TrackId, t: Tick) -> Result<()> {
+    if seq.track(track).ok_or(EditError::NoTrack(track))?.locked {
+        return Err(EditError::Locked);
+    }
+    let gap = gap_at(seq, track, t).ok_or(EditError::Nothing)?;
     let mut work = seq.clone();
     for tr in work.all_tracks_mut() {
         if tr.locked {

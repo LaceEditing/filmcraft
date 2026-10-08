@@ -332,11 +332,19 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
         }
         "ui.key" => {
             let Some(name) = s("key") else { return err("missing `key`") };
-            let Some((mut m, key)) = crate::menus::parse_shortcut(name) else { return err(format!("unknown key `{name}`")) };
+            let Some((mut m, key, keypad)) = crate::menus::parse_binding(name) else { return err(format!("unknown key `{name}`")) };
             let extra = modifiers(p);
             m |= extra;
-            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: m });
-            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: m });
+            // as winit reports them: Ctrl is also the command key off macOS, ⌘ is on macOS
+            if filmcraft_engine::shortcuts::Platform::current().is_mac() {
+                m.mac_cmd |= m.command;
+            } else if m.ctrl || m.command {
+                (m.ctrl, m.command) = (true, true);
+            }
+            // keypad keys arrive as their main key marked as from the keypad (third_party/egui-winit)
+            let physical_key = keypad.then_some(crate::menus::KEYPAD_MARKER);
+            app.synthetic.push(egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m });
+            app.synthetic.push(egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m });
             Outcome::AfterInput
         }
         "ui.type" => {

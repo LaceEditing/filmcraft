@@ -325,11 +325,33 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
 
+    // ---- the selected gap (Clear / Ripple Delete close it)
+    app.session.drop_stale_gap();
+    if let Some((track, gap)) = app.session.selected_gap()
+        && let Some(r) = rows.iter().find(|r| r.track == track)
+    {
+        let clip = if r.kind == TrackKind::Video { vclip } else { aclip };
+        let g = Rect::from_min_max(pos2(layout.x_of(gap.start), r.rect.min.y + 1.0), pos2(layout.x_of(gap.end()), r.rect.max.y - 1.0));
+        let shown = g.intersect(clip).intersect(content);
+        if shown.width() > 0.0 && shown.height() > 0.0 {
+            // a light wash, unlike any clip colour
+            painter.rect_filled(shown, 0.0, Color32::from_white_alpha(34));
+            painter.with_clip_rect(shown).rect_stroke(g, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+        }
+        app.auto.add("timeline.gap", shown, "Gap");
+    }
+
     // ---- clips
     let visible = (layout.tick_at(content.min.x - 2.0), layout.tick_at(content.max.x + 2.0));
     let selection: Vec<ClipId> = app.session.state.selection.clone();
     let mut previews: HashMap<ClipId, (Tick, Tick, Option<TrackId>)> = HashMap::new(); // live drag preview: (start, dur, track)
     preview_drag(app, &seq, &layout, &mut previews);
+    // an Alt-drag copies: the clips stay and their copies follow the pointer
+    let copying = matches!(app.tl.drag, Some(Drag::Move { .. })) && ui.input(|i| i.modifiers.alt);
+    let mut copies: Vec<(ClipId, Tick, Tick, Option<TrackId>)> = Vec::new();
+    if copying {
+        copies = previews.drain().map(|(c, (s, d, t))| (c, s, d, t)).collect();
+    }
     for r in &rows {
         let Some(tr) = seq.track(r.track) else { continue };
         let clip_rect = if r.kind == TrackKind::Video { vclip } else { aclip };
@@ -371,6 +393,16 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             {
                 let body = Rect::from_min_max(pos2(layout.x_of(*start), r.rect.min.y + 1.0), pos2(layout.x_of(*start + *dur), r.rect.max.y - 1.0));
                 draw_clip(app, &ctx, &p, body, it, r.kind, true, &t, rate);
+            }
+        }
+        // the copies an Alt-drag is placing on this track
+        for (cid, start, dur, mt) in &copies {
+            if *mt == Some(r.track)
+                && let Some((_, it)) = seq.find_item(*cid)
+            {
+                let body = Rect::from_min_max(pos2(layout.x_of(*start), r.rect.min.y + 1.0), pos2(layout.x_of(*start + *dur), r.rect.max.y - 1.0));
+                draw_clip(app, &ctx, &p, body, it, r.kind, true, &t, rate);
+                p.rect_filled(body, 0.0, Color32::from_white_alpha(40));
             }
         }
         // Show Through Edits: a small bow-tie on cuts between continuous pieces of one clip
@@ -1772,7 +1804,10 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
 
     // ---- press
     if resp.drag_started() || (resp.clicked() && app.tl.drag.is_none()) {
-        let Some(p) = resp.interact_pointer_pos() else { return };
+        // a drag starts once the pointer has moved a few pixels: it acts on where the button went
+        // down (an edge grabbed is trimmed, a clip moves by the whole distance), not where it is
+        let origin = if resp.drag_started() { ctx.input(|i| i.pointer.press_origin()) } else { None };
+        let Some(p) = origin.or_else(|| resp.interact_pointer_pos()) else { return };
         let h = hit(seq, layout, p);
         let t = layout.tick_at(p.x);
         let started = match (tool, h.clone()) {
@@ -1878,12 +1913,15 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 }
             }
             (_, Hit::Transition { .. }) => None,
-            (_, Hit::Empty { .. }) => {
+            (_, Hit::Empty { track }) => {
                 if resp.drag_started() {
+                    app.session.state.selected_gap = None;
                     Some(Drag::Marquee { start: p })
                 } else {
-                    app.session.state.selection.clear();
-                    app.session.state.edit_points.clear();
+                    // a click in a gap selects it; anywhere else it deselects everything
+                    if let Err(e) = app.session.execute("timeline.selectGap", json!({"track": track.0, "time": t.max(Tick::ZERO).0})) {
+                        app.ui.status = e.to_string();
+                    }
                     None
                 }
             }
@@ -1907,6 +1945,9 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         && let Some(d) = app.tl.drag.clone()
     {
         let t_here = layout.tick_at(p.x);
+        // how far the pointer has moved since the press: a grabbed edge moves by that much, so it
+        // doesn't jump to the pointer when grabbed a few pixels off
+        let moved = t_here - ctx.input(|i| i.pointer.press_origin()).map(|o| layout.tick_at(o.x)).unwrap_or(t_here);
         let new = match d {
             Drag::Scrub => {
                 let mut tt = rate.snap_nearest(t_here.max(Tick::ZERO));
@@ -1943,21 +1984,21 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             }
             Drag::Trim { clip, edge, mode, .. } => seq.find_item(clip).map(|(_, it)| {
                 let base = if edge == filmcraft_edit::Edge::In { it.start } else { it.end() };
-                let target = snap(app, seq, layout, rate.snap_nearest(t_here), &[clip]);
+                let target = snap(app, seq, layout, rate.snap_nearest(base + moved), &[clip]);
                 let delta = target - base;
                 Drag::Trim { clip, edge, mode, delta }
             }),
             Drag::Remix { clip, .. } => seq.find_item(clip).map(|(_, it)| {
-                let target = rate.snap_nearest(t_here).max(it.start + rate.frame_duration());
+                let target = rate.snap_nearest(it.end() + moved).max(it.start + rate.frame_duration());
                 Drag::Remix { clip, delta: target - it.end() }
             }),
             Drag::Stretch { clip, edge, .. } => seq.find_item(clip).map(|(_, it)| {
                 let base = if edge == filmcraft_edit::Edge::In { it.start } else { it.end() };
-                let target = snap(app, seq, layout, rate.snap_nearest(t_here), &[clip]);
+                let target = snap(app, seq, layout, rate.snap_nearest(base + moved), &[clip]);
                 Drag::Stretch { clip, edge, delta: target - base }
             }),
             Drag::Roll { left, right, .. } => seq.find_item(left).map(|(_, l)| {
-                let target = snap(app, seq, layout, rate.snap_nearest(t_here), &[left, right]);
+                let target = snap(app, seq, layout, rate.snap_nearest(l.end() + moved), &[left, right]);
                 Drag::Roll { left, right, delta: target - l.end() }
             }),
             Drag::Slip { clip, .. } => {
@@ -2001,7 +2042,9 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     .iter()
                     .filter_map(|c| seq.find_item(*c).map(|(tid, it)| json!({"clip": c.0, "track": shift_track(seq, tid, track_delta).unwrap_or(tid).0, "time": (it.start + offset).max(Tick::ZERO).0})))
                     .collect();
-                Some(app.session.execute("timeline.move", json!({"moves": moves, "insert": mods.command, "linked": false})))
+                // Alt (Option) held on release copies the clips there instead (Premiere)
+                let cmd = if mods.alt { "timeline.copyTo" } else { "timeline.move" };
+                Some(app.session.execute(cmd, json!({"moves": moves, "insert": mods.command, "linked": false})))
             }
             Drag::Trim { clip, edge, mode, delta } if delta != Tick::ZERO => Some(app.session.execute(
                 "timeline.trim",
@@ -2059,7 +2102,27 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
     {
         let _ = app.session.execute("timeline.select", json!({"clips": [clip.0]}));
     }
+    // ---- right-clicking a gap selects it and offers Ripple Delete
+    if resp.secondary_clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+        && let Hit::Empty { track } = hit(seq, layout, p)
+    {
+        let t = layout.tick_at(p.x).max(Tick::ZERO);
+        let _ = app.session.execute("timeline.selectGap", json!({"track": track.0, "time": t.0}));
+    }
     resp.context_menu(|ui| {
+        if app.session.selected_gap().is_some() {
+            ui.set_min_width(160.0);
+            let r = ui.add_enabled(app.session.is_enabled("edit.rippleDelete"), egui::Button::new("Ripple Delete"));
+            app.auto.add("timeline.gapMenu.rippleDelete", r.rect, "Ripple Delete");
+            if r.clicked() {
+                if let Err(e) = crate::menus::invoke(app, &ctx, "edit.rippleDelete", json!({})) {
+                    app.ui.status = e;
+                }
+                ui.close();
+            }
+            return;
+        }
         ui.set_min_width(220.0);
         let sel = app.session.state.selection.clone();
         let picked: Vec<&filmcraft_project::TrackItem> = sel.iter().filter_map(|c| seq.find_item(*c).map(|(_, it)| it)).collect();

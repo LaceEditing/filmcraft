@@ -299,6 +299,18 @@ pub struct EditorState {
     /// The last Edit ▸ Find… (Find Next continues it).
     #[serde(default)]
     pub find: Option<project_tools::FindState>,
+    /// The gap selected by clicking empty track space (Premiere selects gaps): with no clips
+    /// selected, Clear and Ripple Delete close it. Any edit deselects it.
+    #[serde(default)]
+    pub selected_gap: Option<GapSel>,
+}
+
+/// A selected gap: the empty span of `track` around `time` in `sequence`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapSel {
+    pub sequence: ItemId,
+    pub track: TrackId,
+    pub time: Tick,
 }
 
 /// Events for frontends (drained each frame).
@@ -578,8 +590,13 @@ impl Session {
     /// Replace preferences (persisting them and updating the worker).
     pub fn set_prefs(&mut self, p: autosave::Preferences) -> std::io::Result<()> {
         let cache_changed = self.prefs.media_cache != p.media_cache;
+        // the codec switches are process-wide: only a change of theirs touches them
+        let hw_changed =
+            (&self.prefs.playback.hardware_decoding, self.prefs.media.hardware_encoding) != (&p.playback.hardware_decoding, p.media.hardware_encoding);
         self.prefs = p;
-        self.prefs.apply_hardware_decoding();
+        if hw_changed {
+            self.prefs.apply_hardware_decoding();
+        }
         if cache_changed {
             self.apply_media_cache();
         }
@@ -639,6 +656,7 @@ impl Session {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
             .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
         self.exec_depth -= 1;
+        self.drop_stale_gap();
         // source graphics: an edited instance updates the shared layers and the other instances
         if r.is_ok() && spec.journal && id.starts_with("graphics.") && !self.project.source_graphics.is_empty() {
             graphic_templates::sync_source_graphics(self);
@@ -772,6 +790,7 @@ impl Session {
         self.history.redo.clear();
         self.history.merge_key = None;
         self.state = st;
+        self.state.selected_gap = None;
         self.bump();
         Ok(r)
     }
@@ -791,6 +810,7 @@ impl Session {
         self.refuse_self_nesting(&p)?;
         self.project = Arc::new(p);
         self.state = st;
+        self.state.selected_gap = None;
         self.bump();
         Ok(r)
     }
@@ -869,6 +889,7 @@ impl Session {
             self.state.caption_selection.clear();
         }
         self.state.project_selection.retain(|i| p.item(*i).is_some());
+        self.state.selected_gap = None;
     }
 
     fn bump(&mut self) {
@@ -897,6 +918,25 @@ impl Session {
 
     pub fn active_sequence(&self) -> Option<&Sequence> {
         self.state.active_sequence.and_then(|s| self.project.sequence(s))
+    }
+
+    /// Forget a selected gap that something else replaced as the selection (clips, captions or
+    /// edit points got selected), so it doesn't come back when they are deselected.
+    pub fn drop_stale_gap(&mut self) {
+        if self.state.selected_gap.is_some() && self.selected_gap().is_none() {
+            self.state.selected_gap = None;
+        }
+    }
+
+    /// The selected gap's track and span, while it is the selection: it is in the active
+    /// sequence, still a gap, and no clips, captions or edit points are selected.
+    pub fn selected_gap(&self) -> Option<(TrackId, filmcraft_time::TimeRange)> {
+        let g = self.state.selected_gap?;
+        let st = &self.state;
+        if st.active_sequence != Some(g.sequence) || !st.selection.is_empty() || !st.caption_selection.is_empty() || !st.edit_points.is_empty() {
+            return None;
+        }
+        filmcraft_edit::gap_at(self.active_sequence()?, g.track, g.time).map(|r| (g.track, r))
     }
 
     pub fn playhead(&self) -> Tick {
@@ -1016,6 +1056,8 @@ mod explicit_targets_tests;
 mod export_tests;
 #[cfg(test)]
 mod file_tests;
+#[cfg(test)]
+mod gap_selection_tests;
 #[cfg(test)]
 mod image_sequence_tests;
 #[cfg(test)]

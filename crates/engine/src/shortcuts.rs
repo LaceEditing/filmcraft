@@ -142,7 +142,49 @@ pub const KEYS: &[&str] = &[
     "Down",
     "Left",
     "Right",
+    // `+` on layouts that type it without Shift (on US layouts Shift+= is spelled that way)
+    "Plus",
+    // the numeric keypad, bound apart from the main keys
+    "KeypadDivide",
+    "KeypadMultiply",
+    "KeypadMinus",
+    "Keypad7",
+    "Keypad8",
+    "Keypad9",
+    "KeypadPlus",
+    "Keypad4",
+    "Keypad5",
+    "Keypad6",
+    "Keypad1",
+    "Keypad2",
+    "Keypad3",
+    "KeypadEnter",
+    "Keypad0",
+    "KeypadDecimal",
 ];
+
+/// The keypad key's legend (`KeypadMinus` → `−`), None for other keys.
+pub fn keypad_legend(key: &str) -> Option<&'static str> {
+    Some(match key.strip_prefix("Keypad")? {
+        "0" => "0",
+        "1" => "1",
+        "2" => "2",
+        "3" => "3",
+        "4" => "4",
+        "5" => "5",
+        "6" => "6",
+        "7" => "7",
+        "8" => "8",
+        "9" => "9",
+        "Plus" => "+",
+        "Minus" => "−",
+        "Multiply" => "*",
+        "Divide" => "/",
+        "Decimal" => ".",
+        "Enter" => "Enter",
+        _ => return None,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -211,8 +253,25 @@ fn canon_key(tok: &str) -> Option<&'static str> {
         return Some(k);
     }
     let t = tok.to_ascii_lowercase().replace([' ', '_'], "");
+    // keypad spellings: `Num 5`, `KP_Add`, `NumpadSubtract`, `Keypad -`…
+    for pre in ["keypad", "numpad", "kp", "num"] {
+        if let Some(rest) = t.strip_prefix(pre).filter(|r| !r.is_empty()) {
+            let k = match rest {
+                "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => return KEYS.iter().find(|k| **k == format!("Keypad{rest}")).copied(),
+                "+" | "plus" | "add" => "KeypadPlus",
+                "-" | "−" | "minus" | "subtract" => "KeypadMinus",
+                "*" | "multiply" | "times" => "KeypadMultiply",
+                "/" | "divide" => "KeypadDivide",
+                "." | "decimal" | "period" | "dot" => "KeypadDecimal",
+                "enter" | "return" => "KeypadEnter",
+                _ => continue,
+            };
+            return Some(k);
+        }
+    }
     Some(match t.as_str() {
-        "return" | "⏎" | "↩" | "numpadenter" => "Enter",
+        "return" | "⏎" | "↩" => "Enter",
+        "plus" | "add" => "Plus",
         "esc" | "⎋" => "Escape",
         "del" | "forwarddelete" | "fwddelete" | "⌦" => "Delete",
         "⌫" | "back" => "Backspace",
@@ -327,9 +386,13 @@ impl Chord {
                 "Down" => "↓",
                 "PageUp" => "Page Up",
                 "PageDown" => "Page Down",
+                "Plus" => "+",
                 k => k,
             };
-            s.push_str(k);
+            match keypad_legend(k) {
+                Some(l) => s.push_str(&format!("Keypad {l}")),
+                None => s.push_str(k),
+            }
             s
         } else {
             let e = self.effective(p);
@@ -339,11 +402,16 @@ impl Chord {
                     s.push_str(n);
                 }
             }
-            s.push_str(match self.key {
+            let k = match self.key {
                 "PageUp" => "Page Up",
                 "PageDown" => "Page Down",
+                "Plus" => "+",
                 k => k,
-            });
+            };
+            match keypad_legend(k) {
+                Some(l) => s.push_str(&format!("Keypad {l}")),
+                None => s.push_str(k),
+            }
             s
         }
     }

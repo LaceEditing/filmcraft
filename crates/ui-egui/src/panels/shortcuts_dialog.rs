@@ -64,10 +64,16 @@ fn egui_key(name: &str) -> Option<egui::Key> {
     crate::menus::parse_shortcut(name).map(|(_, k)| k)
 }
 
-/// Canonical chord text from an egui key event.
-pub fn chord_of(key: egui::Key, m: egui::Modifiers) -> Option<String> {
-    let name = KEYS.iter().find(|k| egui_key(k) == Some(key))?;
+/// Canonical chord text from an egui key event (`keypad`: it came from the numeric keypad).
+pub fn chord_of(key: egui::Key, m: egui::Modifiers, keypad: bool) -> Option<String> {
     let mods = Mods { cmd: m.command || m.mac_cmd, ctrl: m.ctrl && cfg!(target_os = "macos"), alt: m.alt, shift: m.shift };
+    if keypad && let Some(name) = crate::menus::keypad_name(key) {
+        return Some(format!("{}{}", mods.prefix(), name));
+    }
+    // with Shift held a punctuation key arrives as its shifted glyph (Shift+= as `+`): spelled
+    // as the key it is on (US layout), as the default shortcuts are
+    let key = if m.shift { crate::menus::unshifted_key(key).unwrap_or(key) } else { key };
+    let name = KEYS.iter().filter(|k| !k.starts_with("Keypad")).find(|k| egui_key(k) == Some(key))?;
     Some(format!("{}{}", mods.prefix(), name))
 }
 
@@ -111,8 +117,8 @@ fn record(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let got = ctx.input_mut(|i| {
         let mut got = None;
         i.events.retain(|e| match e {
-            egui::Event::Key { key, pressed: true, modifiers, .. } if got.is_none() => {
-                got = Some((*key, *modifiers));
+            egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } if got.is_none() => {
+                got = Some((*key, *modifiers, *physical_key == Some(crate::menus::KEYPAD_MARKER)));
                 false
             }
             egui::Event::Key { .. } | egui::Event::Text(_) => false,
@@ -120,13 +126,13 @@ fn record(app: &mut FilmcraftApp, ctx: &egui::Context) {
         });
         got
     });
-    let Some((key, m)) = got else { return };
+    let Some((key, m, keypad)) = got else { return };
     app.shortcut_editor.recording = None;
     if key == egui::Key::Escape && !m.any() {
         app.shortcut_editor.message = "Cancelled".into();
         return;
     }
-    match chord_of(key, m) {
+    match chord_of(key, m, keypad) {
         Some(k) => assign(app, &cmd, &k, add),
         None => app.shortcut_editor.message = format!("{key:?} can't be used as a shortcut"),
     }
@@ -383,7 +389,30 @@ const NAV_ROWS: [&[(&str, f32)]; 6] = [
     &[("Left", 0.0), ("Down", 1.0), ("Right", 2.0)],
 ];
 
+/// The numeric keypad of the drawn keyboard: (key, column, row, width, height) in key units.
+const KEYPAD: [(&str, f32, f32, f32, f32); 16] = [
+    ("KeypadDivide", 1.0, 1.0, 1.0, 1.0),
+    ("KeypadMultiply", 2.0, 1.0, 1.0, 1.0),
+    ("KeypadMinus", 3.0, 1.0, 1.0, 1.0),
+    ("Keypad7", 0.0, 2.0, 1.0, 1.0),
+    ("Keypad8", 1.0, 2.0, 1.0, 1.0),
+    ("Keypad9", 2.0, 2.0, 1.0, 1.0),
+    ("KeypadPlus", 3.0, 2.0, 1.0, 2.0),
+    ("Keypad4", 0.0, 3.0, 1.0, 1.0),
+    ("Keypad5", 1.0, 3.0, 1.0, 1.0),
+    ("Keypad6", 2.0, 3.0, 1.0, 1.0),
+    ("Keypad1", 0.0, 4.0, 1.0, 1.0),
+    ("Keypad2", 1.0, 4.0, 1.0, 1.0),
+    ("Keypad3", 2.0, 4.0, 1.0, 1.0),
+    ("KeypadEnter", 3.0, 4.0, 1.0, 2.0),
+    ("Keypad0", 0.0, 5.0, 2.0, 1.0),
+    ("KeypadDecimal", 2.0, 5.0, 1.0, 1.0),
+];
+
 fn key_legend(name: &str, mac: bool) -> String {
+    if let Some(l) = filmcraft_engine::shortcuts::keypad_legend(name) {
+        return l.to_string();
+    }
     match name {
         "#Caps" => "Caps Lock".into(),
         "#Shift" => "⇧ Shift".into(),
@@ -447,7 +476,8 @@ fn keyboard(app: &mut FilmcraftApp, ui: &mut egui::Ui, area: Rect, t: &Tokens) {
     }
     let panel = app.shortcut_editor.panel().map(str::to_string);
     let map = app.session.shortcuts.keyboard(mods, panel.as_deref());
-    let units_w = 15.0 + 0.5 + 3.0;
+    // main block, navigation block, numeric keypad
+    let units_w = 15.0 + 0.5 + 3.0 + 0.5 + 4.0;
     let gap = 3.0;
     let u = (area.width() / units_w).min(area.height() / 6.2);
     let row_h = u * 0.98;
@@ -549,6 +579,13 @@ fn keyboard(app: &mut FilmcraftApp, ui: &mut egui::Ui, area: Rect, t: &Tokens) {
         for (name, off) in row.iter() {
             draw(ui, Rect::from_min_size(pos2(nav_x + off * u, y), vec2(u, row_h)), name);
         }
+    }
+    // numeric keypad: (name, column, row, width, height) in key units
+    let pad_x = origin.x + 19.0 * u;
+    let row_y = |ri: f32| origin.y + ri * row_h + if ri > 0.0 { u * 0.15 } else { 0.0 };
+    for (name, col, row, w, h) in KEYPAD {
+        let r = Rect::from_min_size(pos2(pad_x + col * u, row_y(row)), vec2(w * u, h * row_h));
+        draw(ui, r, name);
     }
     let ed = &mut app.shortcut_editor;
     if let Some(m) = toggled {

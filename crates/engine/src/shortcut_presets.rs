@@ -8,9 +8,16 @@
 
 pub type Entry = (&'static str, &'static str, &'static str);
 
-/// FilmCraft additions to the per-command defaults: panel-specific shortcuts.
+/// FilmCraft additions to the per-command defaults: panel-specific shortcuts and second keys.
 pub const FILMCRAFT_PANEL: &[Entry] = &[
     ("project.delete", "Backspace", "Project"),
+    ("project.delete", "Delete", "Project"),
+    // Premiere's Clear and Ripple Delete keys besides Backspace / Shift+Delete
+    ("edit.clear", "Delete", ""),
+    ("edit.rippleDelete", "Alt+Backspace", "Timeline"),
+    // the numeric keypad's + and − zoom like = and -
+    ("view.zoomIn", "KeypadPlus", ""),
+    ("view.zoomOut", "KeypadMinus", ""),
     ("file.newBin", "Cmd+B", "Project"),
     ("edit.undo", "Left", "History"),
     ("edit.redo", "Right", "History"),

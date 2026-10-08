@@ -235,6 +235,38 @@ fn close_gap_works() {
 }
 
 #[test]
+fn gaps_lie_between_clips_or_before_the_first() {
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    fx.put(v1, 5, 10, 0);
+    fx.put(v1, 25, 10, 0);
+    let span = |r: TimeRange| (r.start, r.end());
+    assert_eq!(gap_at(&fx.seq, v1, f(0)).map(span), Some((f(0), f(5))));
+    assert_eq!(gap_at(&fx.seq, v1, f(20)).map(span), Some((f(15), f(25))));
+    assert_eq!(gap_at(&fx.seq, v1, f(15)).map(span), Some((f(15), f(25))), "a clip's end is the gap's start");
+    assert_eq!(gap_at(&fx.seq, v1, f(10)), None, "over a clip");
+    assert_eq!(gap_at(&fx.seq, v1, f(40)), None, "after the last clip");
+    assert_eq!(gap_at(&fx.seq, v1, Tick(-1)), None);
+    // closing the leading gap starts the track at zero
+    close_gap(&mut fx.seq, v1, f(2)).unwrap();
+    assert_eq!(fx.spans(v1), vec![(0, 10), (20, 10)]);
+}
+
+#[test]
+fn a_gap_on_a_locked_track_stays() {
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    fx.put(v1, 0, 10, 0);
+    fx.put(v1, 25, 10, 0);
+    if let Some(t) = fx.seq.track_mut(v1) {
+        t.locked = true;
+    }
+    let before = fx.seq.clone();
+    assert!(matches!(close_gap(&mut fx.seq, v1, f(15)), Err(EditError::Locked)));
+    assert_eq!(fx.seq, before);
+}
+
+#[test]
 fn regular_trim_respects_neighbours_and_handles() {
     let mut fx = Fx::new();
     let v1 = fx.v(0);

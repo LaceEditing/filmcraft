@@ -129,3 +129,8 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# egui-winit with the numeric keypad told apart from the main keys (third_party/egui-winit/FILMCRAFT-PATCH.md)
+[patch.crates-io]
+egui-winit = { path = "third_party/egui-winit" }
+

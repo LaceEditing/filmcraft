@@ -247,3 +247,48 @@ fn a_move_that_lands_on_another_clip_reports_what_it_cut() {
     let r = s.execute("timeline.move", json!({"moves": [{"clip": a1.id.0, "track": a_track.0, "time": a2.start.0}], "insert": true, "linked": false})).unwrap();
     assert_eq!(r["overwritten"], json!([]));
 }
+
+/// `timeline.copyTo` (an Alt-drag): copies land where asked, the originals stay, copies of a
+/// linked pair are linked to each other (not to the originals), a copy whose partner stays behind
+/// is not linked, and it is one undo step.
+#[test]
+fn copy_to_places_copies_and_keeps_the_originals() {
+    let mut s = demo();
+    let (v1, v, a1, a) = pair_in_an_empty_sequence(&mut s, 0.0);
+    let at = v.end() + Tick::from_seconds_f64(1.0);
+    let before = s.project.clone();
+    let r =
+        s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": v1.0, "time": at.0}, {"clip": a.id.0, "track": a1.0, "time": at.0}]})).unwrap();
+    let copies: Vec<ClipId> = r["clips"].as_array().unwrap().iter().map(|c| ClipId(c.as_u64().unwrap())).collect();
+    assert_eq!(copies.len(), 2);
+    let q = s.active_sequence().unwrap();
+    assert_eq!((state(&s, v.id), state(&s, a.id)), ((v1, v.start), (a1, a.start)), "the originals stay");
+    let cv = q.find_item(copies[0]).map(|(_, i)| i.clone()).unwrap();
+    let ca = q.find_item(copies[1]).map(|(_, i)| i.clone()).unwrap();
+    assert_eq!((cv.start, ca.start, cv.item, cv.duration), (at, at, v.item, v.duration));
+    assert!(cv.link.is_some() && cv.link == ca.link && cv.link != v.link, "the copies are linked to each other");
+    let mut sel = s.state.selection.clone();
+    sel.sort();
+    assert_eq!(sel, copies, "the copies are selected");
+    q.check().unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.project, *before, "one undo step");
+
+    // one side alone: its copy is not linked; inserting pushes later clips along
+    let r = s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": "V2", "time": 0}]})).unwrap();
+    let c = ClipId(r["clips"][0].as_u64().unwrap());
+    assert_eq!(s.active_sequence().unwrap().find_item(c).and_then(|(_, i)| i.link), None);
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": v1.0, "time": 0}], "insert": true})).unwrap();
+    assert_eq!(state(&s, v.id), (v1, v.duration), "an insert copy pushes the original along");
+    s.execute("edit.undo", json!({})).unwrap();
+
+    // refused: a picture onto an audio track, a locked track, a missing clip; nothing changes
+    let undo = s.history.undo.len();
+    assert!(s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": a1.0, "time": 0}]})).is_err());
+    s.execute("timeline.setTrack", json!({"track": "V2", "locked": true})).unwrap();
+    assert!(s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": "V2", "time": 0}]})).is_err());
+    assert!(s.execute("timeline.copyTo", json!({"moves": [{"clip": 999_999, "track": v1.0, "time": 0}]})).is_err());
+    assert!(s.execute("timeline.copyTo", json!({"moves": []})).is_err());
+    assert_eq!(s.history.undo.len(), undo + 1, "only the lock was a change");
+}
