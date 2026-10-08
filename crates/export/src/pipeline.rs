@@ -2,8 +2,15 @@
 //! output frame rate, fit it into the output frame (scale to fit / fill / stretch, pixel aspect),
 //! apply the Export effects (image, name and timecode overlays, video limiter) and convert to the
 //! encoder's input (straight sRGB RGBA8, or encoded R'G'B' floats for HDR).
+//!
+//! With a registered plan renderer (the GPU compositor: the desktop app and the CLI register it),
+//! SDR frames rendered at the output size without Export overlays are planned
+//! ([`filmcraft_render::plan::plan_frame`]) and composited on the GPU; they match the CPU's
+//! pictures within one code value. Everything else, and any frame the GPU cannot take, is
+//! rendered on the CPU. `FILMCRAFT_NO_GPU_RENDER` in the environment turns the GPU path off.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use filmcraft_geom::Vec2;
 use filmcraft_project::{ItemId, Project};
@@ -66,6 +73,16 @@ pub(crate) struct Pipeline {
     overlay: Option<Image>,
     start_tc: i64,
     drop_frame: bool,
+    /// The GPU compositor for this export (None: every frame on the CPU).
+    gpu: Option<Mutex<Box<dyn filmcraft_render::plan::PlanRenderer>>>,
+}
+
+static GPU_FRAMES: AtomicU64 = AtomicU64::new(0);
+static CPU_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Export frames composited on the GPU and on the CPU since the process started (statistics).
+pub fn composited_frames() -> (u64, u64) {
+    (GPU_FRAMES.load(Ordering::Relaxed), CPU_FRAMES.load(Ordering::Relaxed))
 }
 
 impl Pipeline {
@@ -82,7 +99,14 @@ impl Pipeline {
         } else {
             None
         };
+        let direct = geom.content.is_none() && geom.offset == (0, 0);
+        let overlays = overlay.is_some() || effects.name_overlay.enabled || effects.timecode_overlay.enabled;
+        let gpu = (!hdr_out && direct && !overlays && std::env::var_os("FILMCRAFT_NO_GPU_RENDER").is_none())
+            .then(filmcraft_render::plan::plan_renderer)
+            .flatten()
+            .map(Mutex::new);
         Ok(Pipeline {
+            gpu,
             seq_rate: q.settings.frame_rate,
             start_tc: q.start_timecode,
             drop_frame: q.settings.drop_frame,
@@ -104,6 +128,14 @@ impl Pipeline {
     /// R'G'B' floats (3 per pixel).
     pub fn frame(&self, f: i64, sources: &dyn SourceProvider) -> (Vec<u8>, Vec<f32>) {
         let t = self.rate.tick_of(f);
+        if let Some(mut rgba) = self.gpu_frame(t, sources) {
+            let lim = &self.effects.video_limiter;
+            if lim.enabled {
+                limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
+            }
+            return (rgba, Vec::new());
+        }
+        CPU_FRAMES.fetch_add(1, Ordering::Relaxed);
         let img = filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources);
         let mut img = self.place(img);
         self.overlays(&mut img, t);
@@ -125,6 +157,30 @@ impl Pipeline {
             limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
         }
         (rgba, Vec::new())
+    }
+
+    /// The frame composited on the GPU, when this export has a renderer and the plan is the
+    /// output size (None: render it on the CPU).
+    fn gpu_frame(&self, t: filmcraft_time::Tick, sources: &dyn SourceProvider) -> Option<Vec<u8>> {
+        let gpu = self.gpu.as_ref()?;
+        let plan = filmcraft_render::plan::plan_frame(&self.project, self.seq, t, self.opts, sources);
+        let size = match &plan {
+            filmcraft_render::plan::FramePlan::Layers { width, height, .. } => (*width, *height),
+            // the CPU already rendered this one: no GPU work needed
+            filmcraft_render::plan::FramePlan::Image(img) => {
+                let fits = (img.w, img.h) == (self.w as usize, self.h as usize);
+                if fits {
+                    CPU_FRAMES.fetch_add(1, Ordering::Relaxed);
+                }
+                return fits.then(|| img.over_black_rgba8());
+            }
+        };
+        if size != (self.w as usize, self.h as usize) {
+            return None;
+        }
+        let rgba = gpu.lock().unwrap_or_else(|e| e.into_inner()).render_rgba8(&plan).filter(|px| px.len() == size.0 * size.1 * 4)?;
+        GPU_FRAMES.fetch_add(1, Ordering::Relaxed);
+        Some(rgba)
     }
 
     /// Fit the rendered picture into the output frame.

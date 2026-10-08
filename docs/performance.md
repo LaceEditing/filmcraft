@@ -439,3 +439,25 @@ decode 2642 / 2925 → 2506 / 2064; playback 5246 / 7903 → 3379 / 3121; scrub 
 Not feasible / not done: reduced-resolution decode for H.264 / HEVC (inter prediction needs
 full-resolution references, so it cannot be bit-exact; ½/¼ playback already decimates after
 decode); AV1 internals untouched (measured only); export encoders not optimised.
+
+## GPU compositing for exports
+
+Exports composite on the GPU when the app or CLI registered the headless compositor
+(`filmcraft_gpu::headless::register_plan_renderer`) and the frame can be rendered that way: SDR,
+at the export's own frame size, without Export overlays (image, name, timecode). The export
+pipeline plans the frame (`filmcraft_render::plan::plan_frame`), the compositor draws it on its own
+device and the RGBA8 picture is read back; anything else is rendered on the CPU as before.
+`filmcraft_export::composited_frames` counts both; `FILMCRAFT_NO_GPU_RENDER=1` turns it off.
+
+Parity: the CPU now upsamples 4:2:0 / 4:2:2 chroma bilinearly at the GPU's sample positions (it
+held each chroma sample over two pixels), and the GPU loads texels exactly at texel centres. GPU
+and CPU pictures differ by at most one code value (8 % of bytes on real footage); the GPU effect
+suite (`fx_tests`) is exact again.
+
+10 s of a 1440p60 H.264 timeline (Arkham11.prproj, RTX 5070, Ryzen 7 7700X):
+
+| Export | CPU compositing | GPU compositing |
+|---|---|---|
+| H.264 (NVENC) | 37 fps, 16.5 s, 2.7 GB peak | 81 fps, 8.1 s, 1.5 GB peak |
+| HEVC (NVENC) | 36 fps, 16.8 s, 2.8 GB peak | 78 fps, 8.2 s, 1.5 GB peak |
+| PNG sequence, 1 s | 34 fps | 58 fps |

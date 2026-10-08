@@ -162,6 +162,8 @@ async fn main() {
     }
     // OS hardware video decoders (VideoToolbox on macOS) in front of our own, as in the desktop app.
     let _ = filmcraft_platform::register();
+    // exports composite on the GPU when the machine has one (the CPU otherwise)
+    filmcraft_gpu::headless::register_plan_renderer();
     let a = Args::parse(std::env::args().skip(1));
     let Some(cmd) = a.pos(0) else { usage("missing subcommand") };
     match cmd {

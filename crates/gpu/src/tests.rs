@@ -320,3 +320,73 @@ fn gpu_draws_yuv_alpha_plane_like_the_cpu() {
         assert!(r != at(&bg, w - 2), "{bits}-bit: right edge {r:?} should differ from the background");
     }
 }
+
+/// A 4:2:0 frame of random samples (sharp chroma edges everywhere: the worst case for chroma
+/// upsampling).
+fn noisy_yuv420(w: u32, h: u32) -> Arc<VideoFrame> {
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (16 + (s >> 32) % 220) as u8
+    };
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let y: Vec<u8> = (0..w * h).map(|_| next()).collect();
+    let u: Vec<u8> = (0..cw * ch).map(|_| next()).collect();
+    let v: Vec<u8> = (0..cw * ch).map(|_| next()).collect();
+    Arc::new(VideoFrame {
+        width: w,
+        height: h,
+        data: PixelData::Yuv8 { planes: [Arc::new(y), Arc::new(u), Arc::new(v)], chroma: Chroma::C420, alpha: None },
+        color: filmcraft_color::ColorInfo::REC709,
+        ..VideoFrame::rgba8(1, 1, vec![0; 4])
+    })
+}
+
+/// A video frame drawn 1:1 (what most export frames are) matches the CPU within one code value:
+/// both upsample chroma bilinearly at the same positions, and texel centres load exactly.
+#[test]
+fn identity_yuv_frames_match_the_cpu_within_one_level() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    for (w, h) in [(320u32, 180u32), (321, 179)] {
+        let plan = FramePlan::Layers {
+            width: w as usize,
+            height: h as usize,
+            layers: vec![PlanLayer { frame: noisy_yuv420(w, h), matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None }],
+        };
+        let cpu = execute_cpu(&plan).over_black_rgba8();
+        c.composite(&plan);
+        let (_, _, gpu) = c.read_output().expect("readback");
+        let worst = cpu.iter().zip(&gpu).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs()).max().unwrap_or(0);
+        assert!(worst <= 1, "{w}x{h}: worst {worst}");
+    }
+}
+
+/// The export renderer (its own device) gives the compositor's pictures.
+#[cfg(feature = "headless")]
+#[test]
+fn headless_renderer_renders_plans_like_the_cpu() {
+    use filmcraft_render::plan::PlanRenderer;
+    let Some(mut r) = crate::headless::HeadlessRenderer::new() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let plan = FramePlan::Layers {
+        width: 256,
+        height: 144,
+        layers: vec![PlanLayer { frame: noisy_yuv420(256, 144), matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None }],
+    };
+    let gpu = r.render_rgba8(&plan).expect("rendered");
+    let cpu = execute_cpu(&plan).over_black_rgba8();
+    assert_eq!(gpu.len(), cpu.len());
+    assert!(cpu.iter().zip(&gpu).all(|(a, b)| a.abs_diff(*b) <= 1), "{}", r.name());
+    // a CPU-rendered frame (the planner's fallback) comes back as it is
+    let img = filmcraft_render::Image::filled(64, 36, [0.25, 0.5, 0.75, 1.0]);
+    let out = r.render_rgba8(&FramePlan::Image(img.clone())).expect("rendered");
+    assert!(img.over_black_rgba8().iter().zip(&out).all(|(a, b)| a.abs_diff(*b) <= 1));
+}

@@ -276,18 +276,25 @@ impl VideoFrame {
                 let kg = 1.0 - kr - kb;
                 let (cr_r, cb_b) = (2.0 * (1.0 - kr), 2.0 * (1.0 - kb));
                 let (cr_g, cb_g) = (cr_r * kr / kg, cb_b * kb / kg);
+                let (xt, yt) = (chroma_taps(w, cw), chroma_taps(h, h.div_ceil(1 << sy)));
+                let at = |p: &[u8], c: Tap, r: Tap| -> f32 {
+                    let v = |y: usize, x: usize| ctab[p.get(y * cw + x).copied().unwrap_or(128) as usize];
+                    let top = v(r.0, c.0) + (v(r.0, c.1) - v(r.0, c.0)) * c.2;
+                    let bot = v(r.1, c.0) + (v(r.1, c.1) - v(r.1, c.0)) * c.2;
+                    top + (bot - top) * r.2
+                };
                 out.par_chunks_mut(ow * 4).enumerate().for_each(|(oy, row)| {
                     for ox in 0..ow {
                         let mut acc = [0f32; 4];
                         for dy in 0..n {
                             let y = (oy * n + dy).min(h - 1);
-                            let cy = y >> sy;
+                            let r = yt[y];
                             for dx in 0..n {
                                 let x = (ox * n + dx).min(w - 1);
-                                let cx = x >> sx;
+                                let c = xt[x];
                                 let yy = ytab[planes[0][y * w + x] as usize];
-                                let u = ctab[planes[1][cy * cw + cx] as usize];
-                                let v = ctab[planes[2][cy * cw + cx] as usize];
+                                let u = at(&planes[1], c, r);
+                                let v = at(&planes[2], c, r);
                                 let a = alpha.as_ref().map_or(1.0, |al| al[y * w + x] as f32 / 255.0);
                                 acc[0] += q(yy + cr_r * v) * a;
                                 acc[1] += q(yy - cr_g * v - cb_g * u) * a;
@@ -306,18 +313,26 @@ impl VideoFrame {
                 let cw = w.div_ceil(1 << sx);
                 let bits = *bits;
                 let amax = ((1u32 << bits) - 1) as f32;
+                let (xt, yt) = (chroma_taps(w, cw), chroma_taps(h, h.div_ceil(1 << sy)));
+                let mid = 1u32 << bits.saturating_sub(1);
+                let at = |p: &[u16], c: Tap, r: Tap| -> f32 {
+                    let v = |y: usize, x: usize| normalize_c(p.get(y * cw + x).map_or(mid, |&s| s as u32), bits, info.range);
+                    let top = v(r.0, c.0) + (v(r.0, c.1) - v(r.0, c.0)) * c.2;
+                    let bot = v(r.1, c.0) + (v(r.1, c.1) - v(r.1, c.0)) * c.2;
+                    top + (bot - top) * r.2
+                };
                 out.par_chunks_mut(ow * 4).enumerate().for_each(|(oy, row)| {
                     for ox in 0..ow {
                         let mut acc = [0f32; 4];
                         for dy in 0..n {
                             let y = (oy * n + dy).min(h - 1);
-                            let cy = y >> sy;
+                            let r = yt[y];
                             for dx in 0..n {
                                 let x = (ox * n + dx).min(w - 1);
-                                let cx = x >> sx;
+                                let c = xt[x];
                                 let yy = normalize_y(planes[0][y * w + x] as u32, bits, info.range);
-                                let u = normalize_c(planes[1][cy * cw + cx] as u32, bits, info.range);
-                                let v = normalize_c(planes[2][cy * cw + cx] as u32, bits, info.range);
+                                let u = at(&planes[1], c, r);
+                                let v = at(&planes[2], c, r);
                                 let rgb = ycbcr_to_rgb(yy, u, v, info.matrix);
                                 let a = alpha.as_ref().map_or(1.0, |al| al[y * w + x] as f32 / amax);
                                 acc[0] += q(rgb[0]) * a;
@@ -529,8 +544,58 @@ fn rotate_chroma<T: Copy + Default + Send + Sync>(planes: &[Arc<Vec<T>>; 3], chr
     ([rotate_plane(&planes[1], cw, ch, 1, q), rotate_plane(&planes[2], cw, ch, 1, q)], chroma)
 }
 
+/// The two chroma samples either side of a luma sample, and the weight of the second.
+type Tap = (usize, usize, f32);
+
+/// Bilinear chroma upsampling taps for each of `n` luma samples from `nc` chroma samples, with
+/// the chroma samples centred between their luma samples: the positions the GPU compositor
+/// samples at (`load4` in `composite.wgsl`), so CPU and GPU pictures agree. With as many chroma
+/// as luma samples (4:4:4, or the vertical axis of 4:2:2) every weight is 0: no filtering.
+fn chroma_taps(n: usize, nc: usize) -> Vec<Tap> {
+    let last = nc.max(1) - 1;
+    let k = nc as f64 / n.max(1) as f64;
+    (0..n)
+        .map(|i| {
+            let q = (i as f64 + 0.5) * k - 0.5;
+            let f = q.floor();
+            let i0 = f.max(0.0) as usize;
+            let i0c = i0.min(last);
+            let i1 = if f < 0.0 { 0 } else { (i0 + 1).min(last) };
+            (i0c, i1, if f < 0.0 { 0.0 } else { (q - f) as f32 })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn chroma_taps_are_centred_and_clamped() {
+        // 4:2:0 horizontally: chroma sample k sits between luma 2k and 2k+1
+        assert_eq!(chroma_taps(4, 2), vec![(0, 0, 0.0), (0, 1, 0.25), (0, 1, 0.75), (1, 1, 0.25)]);
+        // as many chroma as luma samples: no filtering
+        assert!(chroma_taps(5, 5).iter().enumerate().all(|(i, t)| t.0 == i && t.2 == 0.0));
+        assert!(chroma_taps(0, 0).is_empty());
+        assert_eq!(chroma_taps(1, 1), vec![(0, 0, 0.0)]);
+    }
+
+    /// A chroma step between two 4:2:0 samples is interpolated (it used to be held, a hard
+    /// two-pixel edge the GPU compositor did not draw).
+    #[test]
+    fn chroma_is_upsampled_bilinearly() {
+        let f = VideoFrame {
+            width: 4,
+            height: 2,
+            data: PixelData::Yuv8 { planes: [Arc::new(vec![126; 8]), Arc::new(vec![128, 128]), Arc::new(vec![16, 240])], chroma: Chroma::C420, alpha: None },
+            color: filmcraft_color::ColorInfo::REC709,
+            ..VideoFrame::rgba8(1, 1, vec![0; 4])
+        };
+        let px = f.to_linear_f32();
+        let red: Vec<f32> = (0..4).map(|x| px[x * 4]).collect();
+        assert!(red[0] < red[1] && red[1] < red[2] && red[2] < red[3], "{red:?}");
+        assert_eq!(red[0], f.to_linear_f32()[0]);
+    }
 
     #[test]
     fn rotation_turns_every_plane_clockwise() {
@@ -591,7 +656,6 @@ mod tests {
         assert!(f.box_decimated(1).is_none());
         assert!(VideoFrame::rgba8(2, 2, vec![0; 16]).box_decimated(2).is_none());
     }
-    use super::*;
 
     #[test]
     fn rgba8_roundtrip_through_linear() {

@@ -385,3 +385,31 @@ pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
         }
     }
 }
+
+/// Executes frame plans into finished pictures: straight sRGB RGBA8 over black, the same pixels
+/// as `execute_cpu(plan).over_black_rgba8()` (the GPU compositor; within one code value, its
+/// half-float accumulator rounding). Exports use one when registered ([`register_plan_renderer`]).
+pub trait PlanRenderer: Send {
+    /// The picture of `plan` (`width` × `height` × 4 bytes), or None when it cannot render it
+    /// (the caller renders that frame on the CPU).
+    fn render_rgba8(&mut self, plan: &FramePlan) -> Option<Vec<u8>>;
+    /// What renders (adapter name), for logs and statistics.
+    fn name(&self) -> String;
+}
+
+/// Creates a [`PlanRenderer`]; None when the machine has none (no GPU adapter).
+pub type PlanRendererFactory = fn() -> Option<Box<dyn PlanRenderer>>;
+
+static PLAN_RENDERER: std::sync::RwLock<Option<PlanRendererFactory>> = std::sync::RwLock::new(None);
+
+/// Register the plan renderer exports use (the desktop app and the CLI register the GPU
+/// compositor at startup; without one, exports composite on the CPU).
+pub fn register_plan_renderer(f: PlanRendererFactory) {
+    *PLAN_RENDERER.write().unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+
+/// A new renderer from the registered factory.
+pub fn plan_renderer() -> Option<Box<dyn PlanRenderer>> {
+    let f = *PLAN_RENDERER.read().unwrap_or_else(|e| e.into_inner());
+    f.and_then(|f| f())
+}

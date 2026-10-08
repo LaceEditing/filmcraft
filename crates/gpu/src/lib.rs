@@ -39,6 +39,8 @@ use filmcraft_render::Blend;
 use filmcraft_render::plan::{FramePlan, PlanLayer};
 
 pub mod fx;
+#[cfg(all(feature = "headless", not(target_arch = "wasm32")))]
+pub mod headless;
 pub mod lut;
 pub mod mask;
 pub use lut::GpuLut;

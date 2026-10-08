@@ -45,7 +45,12 @@ fn vs(@builtin(vertex_index) vi: u32) -> VOut {
 
 fn load4(t: texture_2d<f32>, p: vec2<f32>) -> vec4<f32> {
     let d = vec2<i32>(textureDimensions(t));
-    let q = p - 0.5;
+    // A position interpolated across the quad lands a few ulps beside a texel centre even when
+    // the layer maps texels onto pixels exactly; weights of 1e-5 then leak the neighbours, which
+    // effects like Gamma amplify near black. Within 1/4096 texel of a centre, load that texel.
+    let q0 = p - 0.5;
+    let r = round(q0);
+    let q = select(q0, r, abs(q0 - r) < vec2(1.0 / 4096.0));
     let i = vec2<i32>(floor(q));
     let f = q - floor(q);
     let a = textureLoad(t, clamp(i, vec2(0), d - 1), 0);

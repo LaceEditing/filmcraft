@@ -257,6 +257,8 @@ fn open_path(path: &str, reveal: bool) -> Result<(), String> {
 fn register_hardware_decoders() -> filmcraft_platform::Availability {
     let hardware = filmcraft_platform::register();
     log::info!("hardware decoding: {hardware:?}");
+    // exports composite on the GPU (a device of their own) when the machine has one
+    filmcraft_gpu::headless::register_plan_renderer();
     hardware
 }
 

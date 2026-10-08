@@ -17,6 +17,12 @@ filmcraft-render = { workspace = true }
 wgpu = { version = "30", default-features = false, features = ["wgsl"] }
 log = { workspace = true }
 rayon = { workspace = true }
+pollster = { version = "0.4", optional = true }
+
+[features]
+# A compositor on its own device for exports (`headless`, `register_plan_renderer`): blocks on
+# device creation and read-back, so native only; enables wgpu's native backends.
+headless = ["dep:pollster", "wgpu/vulkan", "wgpu/metal", "wgpu/dx12"]
 
 [dev-dependencies]
 pollster = "0.4"
