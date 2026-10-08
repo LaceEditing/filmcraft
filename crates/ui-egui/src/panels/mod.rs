@@ -182,6 +182,11 @@ pub fn panel_menu_popup(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     let id = egui::Id::new("panel-menu");
     let Some((p, pos)) = ui.ctx().data(|d| d.get_temp::<(PanelKind, egui::Pos2)>(id)) else { return };
     let mut close = false;
+    // kept inside the window: moved up (by its size last frame) when it would run off the bottom
+    let size_id = id.with("size");
+    let last = ui.ctx().data(|d| d.get_temp::<egui::Vec2>(size_id)).unwrap_or_default();
+    let screen = ui.ctx().content_rect();
+    let pos = egui::pos2(pos.x.min(screen.max.x - last.x - 4.0).max(screen.min.x), pos.y.min(screen.max.y - last.y - 4.0).max(screen.min.y));
     let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(190.0);
@@ -200,19 +205,58 @@ pub fn panel_menu_popup(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
                     let _ = app.session.execute("sequence.closeOthers", serde_json::json!({}));
                     close = true;
                 }
-            } else if ui.button("Close Panel").clicked() {
-                app.ui.dock.close(p);
+            } else {
+                let r = ui.button("Close Panel");
+                app.auto.add(&format!("panel.menu.{}.close", p.id()), r.rect, "Close Panel");
+                if r.clicked() {
+                    app.close_panels(&[p]);
+                    close = true;
+                }
+            }
+            let (group, active) = app.ui.dock.group_of(p).unwrap_or((vec![p], 0));
+            let r = ui.button("Undock Panel");
+            app.auto.add(&format!("panel.menu.{}.undock", p.id()), r.rect, "Undock Panel");
+            if r.clicked() {
+                app.undock(&[p], 0, [640.0, 420.0]);
                 close = true;
             }
-            if ui.button("Maximize Frame").clicked() {
-                app.ui.dock = crate::dock::DockNode::Tabs { panels: vec![p], active: 0 };
-                close = true;
-            }
-            if ui.button("Restore Workspace").clicked() {
-                let w = app.ui.workspace.clone();
-                app.set_workspace(&w);
-                close = true;
-            }
+            let others: Vec<crate::dock::PanelKind> = group.iter().copied().filter(|x| *x != p).collect();
+            let gs = ui.menu_button("Panel Group Settings", |ui| {
+                let r = ui.add_enabled(!others.is_empty(), egui::Button::new("Close Other Panels in Group"));
+                app.auto.add(&format!("panel.menu.{}.closeOthers", p.id()), r.rect, "Close Other Panels in Group");
+                if r.clicked() {
+                    app.close_panels(&others);
+                    close = true;
+                }
+                let r = ui.button("Close Panel Group");
+                app.auto.add(&format!("panel.menu.{}.closeGroup", p.id()), r.rect, "Close Panel Group");
+                if r.clicked() {
+                    app.close_panels(&group);
+                    close = true;
+                }
+                let r = ui.button("Undock Panel Group");
+                app.auto.add(&format!("panel.menu.{}.undockGroup", p.id()), r.rect, "Undock Panel Group");
+                if r.clicked() {
+                    app.undock(&group, active, [800.0, 500.0]);
+                    close = true;
+                }
+                let maxed = app.ui.keys.maximized == Some(p);
+                let r = ui.button(if maxed { "Restore Frame Size" } else { "Maximize Panel Group" });
+                app.auto.add(&format!("panel.menu.{}.maximize", p.id()), r.rect, "Maximize Panel Group");
+                if r.clicked() {
+                    // the layout is kept: ` (backquote) or this item again restores it
+                    app.ui.keys.maximized = if maxed { None } else { Some(p) };
+                    close = true;
+                }
+                let r = ui.button("Restore Workspace");
+                app.auto.add(&format!("panel.menu.{}.restoreWorkspace", p.id()), r.rect, "Restore Workspace");
+                if r.clicked() {
+                    let w = app.ui.workspace.clone();
+                    app.reset_workspace(&w);
+                    close = true;
+                }
+            });
+            app.auto.add(&format!("panel.menu.{}.groupSettings", p.id()), gs.response.rect, "Panel Group Settings");
             if p == PanelKind::Timeline {
                 ui.separator();
                 let r = ui.add_enabled(app.session.state.active_sequence.is_some(), egui::Button::new("Reveal Sequence in Project"));
@@ -234,6 +278,8 @@ pub fn panel_menu_popup(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
             }
         });
     });
+    let size = area.response.rect.size();
+    ui.ctx().data_mut(|d| d.insert_temp(size_id, size));
     // A click elsewhere or Escape closes the menu. The click that opened it is over the tab, not
     // the menu, and must not close it again in the same frame.
     let fresh = ui.ctx().data(|d| d.get_temp::<u64>(egui::Id::new("panel-menu-opened"))) == Some(ui.ctx().cumulative_frame_nr());

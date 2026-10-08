@@ -11,6 +11,7 @@ pub mod brand;
 pub mod control;
 pub mod crash;
 pub mod dock;
+pub mod docking;
 pub mod frames;
 pub mod header;
 pub mod i18n;
@@ -204,6 +205,8 @@ pub struct FilmcraftApp {
     pub fps: f32,
     /// UI-thread time per part of a frame (`perf.stats` `ui.sections`).
     pub(crate) sections: perf::Sections,
+    /// Panel dragging, undocked windows' menus, layout persistence.
+    pub(crate) docking: docking::DockingState,
     /// When the last UI pass ended (the gap to the next frame is egui's paint, the GPU submit,
     /// present and the wait for the display).
     ui_end: Option<web_time::Instant>,
@@ -366,7 +369,7 @@ impl FilmcraftApp {
         let frames = Arc::new(FrameServer::new(session.media.clone(), session.services.clone(), session.previews.clone(), FrameServer::default_workers()));
         let workspaces =
             session.prefs_path.as_ref().and_then(|p| p.parent()).map(|d| dock::WorkspacePrefs::load(&d.join(dock::WORKSPACES_FILE))).unwrap_or_default();
-        Self {
+        let mut app = Self {
             session,
             ui: UiState::default(),
             tokens: Tokens::for_kind(ThemeKind::Dark),
@@ -402,6 +405,7 @@ impl FilmcraftApp {
             timeline_view_last: None,
             fps: 60.0,
             sections: Default::default(),
+            docking: Default::default(),
             ui_end: None,
             frame_start: None,
             intervals_playing: [0; 5],
@@ -418,7 +422,12 @@ impl FilmcraftApp {
             workspace_restored: false,
             workspaces,
             menu_workspaces: Default::default(),
-        }
+        };
+        // the layout the app opens with is what the workspaces file holds: changes from here on
+        // are saved
+        let (dock, floating) = (app.ui.dock.clone(), app.ui.floating.clone());
+        app.docking.set_persisted(&dock, &floating);
+        app
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
@@ -564,8 +573,12 @@ impl FilmcraftApp {
     }
 
     pub fn set_workspace(&mut self, name: &str) {
+        // keep how the workspace being left was arranged
+        self.persist_layout(true);
         self.ui.workspace = name.to_string();
-        self.ui.dock = dock::saved_layout(&self.workspaces, name);
+        (self.ui.dock, self.ui.floating) = dock::current_layout(&self.workspaces, name);
+        self.ui.keys.maximized = None;
+        self.docking.set_persisted(&self.ui.dock, &self.ui.floating);
         if self.workspaces.current != name {
             let mut next = self.workspaces.clone();
             next.current = name.to_string();
@@ -579,6 +592,16 @@ impl FilmcraftApp {
     }
 
     pub fn show_panel(&mut self, p: PanelKind) {
+        // an undocked panel: show its tab in its window
+        if let Some(f) = self.ui.floating.iter_mut().find(|f| f.panels.contains(&p)) {
+            f.active = f.panels.iter().position(|x| *x == p).unwrap_or(0);
+            self.ui.focused = p;
+            return;
+        }
+        if !self.ui.dock.contains(p) {
+            // back where it was closed from, this session
+            self.reopen_at_home(p);
+        }
         if p == PanelKind::Timeline {
             self.ui.dock.restore_timeline();
         }
@@ -1205,8 +1228,7 @@ impl FilmcraftApp {
                 filmcraft_engine::Event::OpenSequence(_) => {
                     // show the sequence with its own view (or fitted, the first time)
                     self.timeline_view_of = None;
-                    self.ui.dock.restore_timeline();
-                    self.ui.dock.activate(PanelKind::Timeline);
+                    self.show_panel(PanelKind::Timeline);
                 }
                 filmcraft_engine::Event::OpenSource(_) => {
                     self.ui.dock.activate(PanelKind::Source);
@@ -1241,6 +1263,7 @@ impl FilmcraftApp {
             state::Mode::Import => panels::import_mode::show(self, ui, body),
             state::Mode::Export => panels::export_mode::show(self, ui, body),
         }
+        self.floating_windows(&ctx);
         panels::dialogs::show(self, &ctx);
         // Status / hint bar
         let sb = egui::Rect::from_min_max(egui::pos2(full.min.x, full.max.y - status_h), full.max);
@@ -1339,20 +1362,15 @@ impl FilmcraftApp {
         let mut groups = Vec::new();
         dock::layout(ui, &mut dock, body, &t, "", &mut groups, &mut self.auto);
         let mut actions = Vec::new();
-        let seqs = dock::SeqTabs {
-            open: self
-                .session
-                .state
-                .open_sequences
-                .iter()
-                .filter_map(|id| {
-                    self.session.project.item(*id).filter(|i| matches!(i.kind, filmcraft_project::ItemKind::Sequence(_))).map(|i| (id.0, i.name.clone()))
-                })
-                .collect(),
-            active: self.session.state.active_sequence.map(|i| i.0),
-        };
+        let seqs = self.seq_tabs();
+        self.docking.tab_rects.clear();
         for g in &groups {
-            actions.extend(dock::draw_group_chrome(ui, g, self.ui.focused, &seqs, &t, &mut self.auto));
+            let (a, tabs) = dock::draw_group_chrome(ui, g, self.ui.focused, &seqs, &t, &mut self.auto);
+            actions.extend(a);
+            self.docking.tab_rects.push((g.path.clone(), tabs));
+        }
+        if dock.is_empty() && maximized.is_none() {
+            docking::hint(ui.painter(), body, &t, "Every panel is closed: open one from the Window menu, or Window ▸ Workspaces ▸ Reset to Saved Layout.");
         }
         if maximized.is_none() {
             self.ui.dock = dock;
@@ -1372,7 +1390,45 @@ impl FilmcraftApp {
                     self.ui.dock.activate(p);
                 }
                 dock::DockAction::Focus(p) => self.ui.focused = p,
-                dock::DockAction::Close(p) => self.ui.dock.close(p),
+                dock::DockAction::Close(p) => self.close_panels(&[p]),
+                dock::DockAction::StartDrag(panels, active) => {
+                    if self.docking.drag.is_none() {
+                        self.docking.drag = Some(docking::Drag { panels, active });
+                    }
+                }
+                other => self.sequence_tab_action(&ui.ctx().clone(), other),
+            }
+        }
+        self.dock_drag(ui, body, &groups);
+        panels::panel_menu_popup(self, ui);
+    }
+
+    /// The sequences open in the Timeline panel, for its tabs.
+    pub(crate) fn seq_tabs(&self) -> dock::SeqTabs {
+        dock::SeqTabs {
+            open: self
+                .session
+                .state
+                .open_sequences
+                .iter()
+                .filter_map(|id| {
+                    self.session.project.item(*id).filter(|i| matches!(i.kind, filmcraft_project::ItemKind::Sequence(_))).map(|i| (id.0, i.name.clone()))
+                })
+                .collect(),
+            active: self.session.state.active_sequence.map(|i| i.0),
+        }
+    }
+
+    /// Timeline sequence tabs and panel menus (shared by the dock and undocked windows).
+    pub(crate) fn sequence_tab_action(&mut self, ctx: &egui::Context, a: dock::DockAction) {
+        {
+            match a {
+                dock::DockAction::Activate(p) => {
+                    self.ui.dock.activate(p);
+                }
+                dock::DockAction::Focus(p) => self.ui.focused = p,
+                dock::DockAction::Close(p) => self.close_panels(&[p]),
+                dock::DockAction::StartDrag(..) => {}
                 dock::DockAction::OpenSequence(id) => {
                     if self.session.state.active_sequence.map(|i| i.0) != Some(id)
                         && let Err(e) = self.session.execute("sequence.open", json!({"item": id}))
@@ -1392,15 +1448,14 @@ impl FilmcraftApp {
                 }
                 dock::DockAction::PanelMenu(p, pos) => {
                     // (with the frame it opened in: the click that opens it is not a click elsewhere)
-                    let frame = ui.ctx().cumulative_frame_nr();
-                    ui.ctx().data_mut(|d| {
+                    let frame = ctx.cumulative_frame_nr();
+                    ctx.data_mut(|d| {
                         d.insert_temp(egui::Id::new("panel-menu"), (p, pos));
                         d.insert_temp(egui::Id::new("panel-menu-opened"), frame);
                     });
                 }
             }
         }
-        panels::panel_menu_popup(self, ui);
     }
 }
 
@@ -1518,10 +1573,12 @@ impl eframe::App for FilmcraftApp {
         let settled = !std::mem::take(&mut self.monitor_inexact) && self.timeline_still > 0;
         self.issue_screenshots(ctx, settled);
         self.collect_screenshots(ctx);
+        self.persist_layout(false);
         self.sections.record("logic", t_logic.elapsed().as_secs_f64() * 1e3);
     }
 
     fn on_exit(&mut self) {
+        self.persist_layout(true);
         // Flush the recovery journal and stop the auto-save worker; a session with nothing unsaved
         // removes its journal, one with unsaved changes keeps it for the next launch.
         self.session.shutdown();

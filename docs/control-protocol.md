@@ -52,6 +52,21 @@ without activating itself. UI requests and screenshots that need a rendered fram
 forward without making it key (macOS `orderFrontRegardless`), so the user's typing keeps going to
 the app they are in. Only an explicit `ui.focus` activates FilmCraft.
 
+Panels and docking (`window.dock.*`, Premiere's panel docking): `window.dock.layout` returns
+`{workspace, dock, floating}`; `window.dock.move {panel | panels: [..], active?, target?, zone:
+center|left|right|top|bottom, index?}` docks onto the group holding `target` (as tabs, or beside
+it), or without `target` onto that outer edge of the dock area; `window.dock.undock {panel,
+group?}` opens the panel (or its group) in a window of its own; `window.dock.redock {panel}` puts an
+undocked group back where it came from; `window.dock.close {panel, group?, others?}`;
+`window.dock.maximize {panel}` toggles Maximize Frame. `window.panel.<Panel>` opens or shows a
+panel (back where it was closed from); `ui.menu.list` ticks the open ones. Element ids:
+`panel.tab.<Panel>` (drag it to move the panel), `panel.grip.<Panel>` (the empty part of a tab
+strip, or a compact panel's grip: drag the group), `panel.close.<Panel>` (the tab's ×),
+`panel.menu.<Panel>` and its items `panel.menu.<Panel>.close|undock|groupSettings` (the Panel Group
+Settings submenu: `.closeOthers|closeGroup|undockGroup|maximize|restoreWorkspace`). A
+`ui.drag` with `modifiers: {command: true}` undocks at the drop. Arrangements are kept per
+workspace across launches until `window.workspace.reset`.
+
 Element ids are stable, e.g. `timeline.clip.<id>`, `timeline.track.V1.lock`, `tools.Razor`,
 `project.item.<id>`, `effects.item.gaussian_blur`, `panel.tab.Timeline`, `program.transport.playback.toggle`.
 

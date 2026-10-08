@@ -271,28 +271,41 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         TimeDisplay::Timecode,
         48000,
     );
-    ui.painter().text(pos2(row1.max.x, row1.center().y), Align2::RIGHT_CENTER, &dur_tc, Tokens::timecode(), t.text_dim);
+    // A narrow monitor (a panel moved beside another, or undocked small) drops controls instead
+    // of drawing them over each other: first the duration, then the zoom, then the resolution;
+    // the timecode and the wrench stay.
+    let show_dur = row1.width() >= 410.0;
+    let right = if show_dur { row1.max.x - 106.0 } else { row1.max.x };
+    let show_res = right - 90.0 >= row1.min.x + 116.0;
+    let show_zoom = show_res && right - 90.0 >= row1.min.x + 116.0 + 76.0;
+    if show_dur {
+        ui.painter().text(pos2(row1.max.x, row1.center().y), Align2::RIGHT_CENTER, &dur_tc, Tokens::timecode(), t.text_dim);
+    }
     // zoom + resolution dropdowns centred-ish
-    let zr = Rect::from_min_size(pos2(row1.min.x + 116.0, row1.min.y), vec2(70.0, 24.0));
+    let zr = Rect::from_min_size(pos2(row1.min.x + 116.0, row1.min.y), if show_zoom { vec2(70.0, 24.0) } else { vec2(0.0, 0.0) });
     let zoom_label = match mv.zoom {
         None => "Fit".to_string(),
         Some(z) => format!("{}%", (z * 100.0).round() as i32),
     };
-    let zresp = crate::widgets::dropdown_text(ui, zr, &zoom_label, &t, egui::Id::new((prefix, "zoom")));
-    app.auto.add(&format!("{prefix}.zoom"), zr, "Select Zoom Level");
-    monitor_view::zoom_menu(app, &zresp, which);
+    if show_zoom {
+        let zresp = crate::widgets::dropdown_text(ui, zr, &zoom_label, &t, egui::Id::new((prefix, "zoom")));
+        app.auto.add(&format!("{prefix}.zoom"), zr, "Select Zoom Level");
+        monitor_view::zoom_menu(app, &zresp, which);
+    }
     let res = mv.res;
-    let rr = Rect::from_min_size(pos2(row1.max.x - 196.0, row1.min.y), vec2(62.0, 24.0));
-    let rresp = crate::widgets::dropdown_text(ui, rr, res.label(), &t, egui::Id::new((prefix, "res")));
-    app.auto.add(&format!("{prefix}.resolution"), rr, "Select Playback Resolution");
-    egui::Popup::menu(&rresp).show(|ui| {
-        for r in PlaybackRes::ALL {
-            if ui.selectable_label(r == res, r.label()).clicked() {
-                monitor_view::view_mut(app, which).res = r;
+    let rr = Rect::from_min_size(pos2(right - 90.0, row1.min.y), vec2(62.0, 24.0));
+    if show_res {
+        let rresp = crate::widgets::dropdown_text(ui, rr, res.label(), &t, egui::Id::new((prefix, "res")));
+        app.auto.add(&format!("{prefix}.resolution"), rr, "Select Playback Resolution");
+        egui::Popup::menu(&rresp).show(|ui| {
+            for r in PlaybackRes::ALL {
+                if ui.selectable_label(r == res, r.label()).clicked() {
+                    monitor_view::view_mut(app, which).res = r;
+                }
             }
-        }
-    });
-    let wr = Rect::from_min_size(pos2(rr.max.x + 6.0, row1.min.y + 1.0), vec2(22.0, 22.0));
+        });
+    }
+    let wr = Rect::from_min_size(pos2((rr.max.x + 6.0).max(row1.min.x + 116.0), row1.min.y + 1.0), vec2(22.0, 22.0));
     let wresp = ui.interact(wr, egui::Id::new((prefix, "wrench")), Sense::click());
     icons::paint(ui.painter(), wr.shrink(4.0), Icon::Wrench, if wresp.hovered() { t.tab_text_active } else { t.icon });
     app.auto.add(&format!("{prefix}.settings"), wr, "Settings");

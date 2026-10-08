@@ -363,6 +363,9 @@ pub struct UiState {
     pub mode: Mode,
     pub workspace: String,
     pub dock: DockNode,
+    /// Panel groups undocked into windows of their own.
+    #[serde(default)]
+    pub floating: Vec<crate::dock::FloatingGroup>,
     /// Focused panel (blue outline, receives shortcuts).
     pub focused: PanelKind,
     pub timeline: TimelineView,
@@ -771,6 +774,7 @@ impl Default for UiState {
             mode: Mode::Edit,
             workspace: "Editing".into(),
             dock: crate::dock::workspace("Editing"),
+            floating: Vec::new(),
             focused: PanelKind::Timeline,
             timeline: TimelineView::default(),
             program: MonitorView::default(),

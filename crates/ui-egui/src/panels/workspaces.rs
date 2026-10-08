@@ -23,7 +23,7 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
     let r = match ws {
         "reset" => {
             let n = app.ui.workspace.clone();
-            app.set_workspace(&n);
+            app.reset_workspace(&n);
             Ok(json!({"workspace": n}))
         }
         "saveChanges" => {
@@ -56,13 +56,15 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
 
 /// Save the current layout as the saved layout of `name`.
 fn save(app: &mut FilmcraftApp, name: &str) -> Result<(), String> {
-    let layout = serde_json::to_value(&app.ui.dock).map_err(|e| e.to_string())?;
+    let entry = dock::SavedWorkspace::new(name, &app.ui.dock, &app.ui.floating);
     let mut next = app.workspaces.clone();
     let saved = &mut next.saved;
     match saved.iter_mut().find(|s| s.name == name) {
-        Some(s) => s.layout = layout,
-        None => saved.push(dock::SavedWorkspace { name: name.to_string(), layout }),
+        Some(s) => *s = entry,
+        None => saved.push(entry),
     }
+    // the saved layout is now the arrangement itself
+    next.live.retain(|s| s.name != name);
     next.current = name.to_string();
     app.set_workspaces(next)
 }
@@ -98,7 +100,7 @@ fn rename(app: &mut FilmcraftApp, from: &str, to: &str) -> Result<Value, String>
     }
     let to = new_name(app, to)?;
     let mut next = app.workspaces.clone();
-    for s in next.saved.iter_mut().filter(|s| s.name == from) {
+    for s in next.saved.iter_mut().chain(next.live.iter_mut()).filter(|s| s.name == from) {
         s.name = to.clone();
     }
     if next.current == from {
@@ -119,6 +121,7 @@ fn delete(app: &mut FilmcraftApp, name: &str) -> Result<Value, String> {
     if next.saved.len() == before {
         return Err(if is_builtin(name) { format!("`{name}` is a built-in workspace and can't be deleted") } else { format!("unknown workspace `{name}`") });
     }
+    next.live.retain(|s| s.name != name);
     app.set_workspaces(next)?;
     if app.ui.workspace == name {
         app.set_workspace(if is_builtin(name) { name } else { "Editing" });

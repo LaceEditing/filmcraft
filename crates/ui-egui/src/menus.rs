@@ -179,6 +179,9 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
     if let Some(r) = crate::panels::workspaces::route(app, id, &params) {
         return r;
     }
+    if let Some(r) = crate::docking::route(app, id, &params) {
+        return r;
+    }
     if let Some(t) = id.strip_prefix("tool.") {
         let tool = Tool::from_name(t).ok_or_else(|| format!("unknown tool `{t}`"))?;
         app.ui.tool = tool;
@@ -420,6 +423,12 @@ pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
             "app.language.japanese" => it.checked = Some(app.ui.language == crate::i18n::Language::Ja),
             "app.language.spanish" => it.checked = Some(app.ui.language == crate::i18n::Language::Es),
             _ => {}
+        }
+        // Window ▸ panels: ticked when open (docked or undocked)
+        if let Some(name) = it.id.strip_prefix("window.panel.")
+            && let Some(p) = PanelKind::from_name(name)
+        {
+            it.checked = Some(app.panel_open(p));
         }
         if it.id.starts_with("view.") {
             it.checked = crate::panels::monitor_view::checked(app, &it.id).or(crate::panels::menu_dialogs::checked(app, &it.id));
