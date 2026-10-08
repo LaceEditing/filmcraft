@@ -361,3 +361,17 @@ fn hevc_settings_and_hardware_performance() {
         assert_eq!((v["width"].as_u64(), v["height"].as_u64()), (Some(1920), Some(1080)), "{preset}");
     }
 }
+
+/// A timeline zoom still animating when Export mode hides the timeline used to block every
+/// `ui.elements` request (and screenshot) for good: the animation only advanced while drawn.
+#[test]
+fn a_hidden_timeline_does_not_hold_up_automation() {
+    let mut d = Driver::new("hidden-zoom");
+    let v = &mut d.app().ui.timeline;
+    v.target_pps = v.pps * 8.0;
+    d.ok("ui.set", json!({"mode": "export"}));
+    // `call` steps up to 600 frames for the reply and panics without one
+    assert!(d.has("export.format"));
+    let v = &d.app().ui.timeline;
+    assert_eq!((v.pps, v.scroll), (v.target_pps, v.target_scroll), "the animation finished while hidden");
+}

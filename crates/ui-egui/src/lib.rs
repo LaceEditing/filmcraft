@@ -178,6 +178,9 @@ pub struct FilmcraftApp {
     /// Consecutive frames the timeline zoom / scroll has been at rest. `ui.elements` answers from
     /// the frame before the last one, so its timeline rects are final from 2 on.
     pub(crate) timeline_still: u32,
+    /// The timeline panel drew in the last frame (its zoom / scroll animation only advances
+    /// there; hidden, e.g. in Export mode, it jumps to its target).
+    pub(crate) timeline_drawn: bool,
     input_waiters: Vec<Sender<Value>>,
     next_token: u64,
     styled: bool,
@@ -372,6 +375,7 @@ impl FilmcraftApp {
             queued_screenshots: Vec::new(),
             monitor_inexact: false,
             timeline_still: 0,
+            timeline_drawn: false,
             input_waiters: Vec::new(),
             next_token: 1,
             styled: false,
@@ -1443,6 +1447,12 @@ impl eframe::App for FilmcraftApp {
         if self.playback.playing && ctx.input(|i| i.viewport().visible()) == Some(false) {
             // Nothing is shown while the window is hidden: not a dropped frame.
             self.playback.hidden = true;
+        }
+        if !std::mem::take(&mut self.timeline_drawn) && self.ui.timeline.animating() {
+            // nothing shows the animation: finish it, or `ui.elements` and screenshots would wait
+            // for a timeline that is not on screen
+            let v = &mut self.ui.timeline;
+            (v.pps, v.scroll) = (v.target_pps, v.target_scroll);
         }
         self.timeline_still = if self.ui.timeline.animating() { 0 } else { self.timeline_still.saturating_add(1) };
         let had_synthetic = !self.synthetic.is_empty();

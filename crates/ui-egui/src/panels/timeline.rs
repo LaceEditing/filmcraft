@@ -196,6 +196,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let content = Rect::from_min_max(pos2(rect.min.x + header_w, rect.min.y + TOP_H), pos2(rect.max.x - 10.0, rect.max.y - SCROLLBAR_H));
     let ruler = Rect::from_min_max(pos2(content.min.x, rect.min.y + TOP_H - RULER_H), pos2(content.max.x, rect.min.y + TOP_H));
     app.last_timeline_width = content.width();
+    app.timeline_drawn = true;
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, t.panel_bg);
 
