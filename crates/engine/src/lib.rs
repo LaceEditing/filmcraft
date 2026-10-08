@@ -1005,6 +1005,8 @@ mod interchange_auto_points_tests;
 #[cfg(test)]
 mod keyboard_tests;
 #[cfg(test)]
+mod large_media_tests;
+#[cfg(test)]
 mod linked_speed_tests;
 #[cfg(test)]
 mod masks_tests;

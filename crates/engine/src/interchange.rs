@@ -83,10 +83,9 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
     let mut linked = 0;
     let mut offline = Vec::new();
     for (id, mpath) in new_media {
-        let opened = s.services.read_file(&mpath).ok().and_then(|b| {
-            let fname = std::path::Path::new(&mpath).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            s.media.open_bytes(&fname, b.into()).ok()
-        });
+        // through the host's random-access reader: a container reads its index now and samples on
+        // demand, so a project linking a 30 GB recording does not load 30 GB into memory
+        let opened = s.media.open_file(&mpath, &*s.services).ok();
         match opened {
             Some(src) => {
                 let info = src.info().clone();

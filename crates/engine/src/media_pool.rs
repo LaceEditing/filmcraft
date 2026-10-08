@@ -182,6 +182,11 @@ impl MediaPool {
             let openers = self.openers.read().unwrap_or_else(|e| e.into_inner()).clone();
             return filmcraft_media::reader::open_reader(&file_name(path), r.map_err(io)?, &filmcraft_codecs::reader_openers(), &openers);
         }
+        // no reader: the file has to be read whole, so not one bigger than the media crate allows
+        let size = services.file_size(path).map_err(io)?;
+        if size > filmcraft_media::reader::MAX_WHOLE_FILE {
+            return Err(MediaError::Unsupported(format!("{}: {} GB is too large to open without streaming", file_name(path), size >> 30)));
+        }
         let bytes = services.read_file(path).map_err(io)?;
         self.open_bytes(&file_name(path), bytes.into())
     }

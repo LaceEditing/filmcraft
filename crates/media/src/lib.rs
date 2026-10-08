@@ -168,11 +168,11 @@ pub fn open_bytes(name: &str, bytes: Arc<[u8]>, extra: &[Opener]) -> Result<Shar
 }
 
 /// Open a file from disk (native only).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(unix, windows))]
 pub fn open_path(path: &Path, extra: &[Opener]) -> Result<SharedSource> {
-    let bytes = std::fs::read(path).map_err(|e| MediaError::Io(format!("{}: {e}", path.display())))?;
+    let file = reader::FileReader::open(path).map_err(|e| MediaError::Io(format!("{}: {e}", path.display())))?;
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    open_bytes(&name, bytes.into(), extra)
+    reader::open_reader(&name, Arc::new(file), &[], extra)
 }
 
 /// A source that renders nothing (used for offline media): the "Media Offline" slate.

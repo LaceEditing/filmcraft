@@ -2,8 +2,9 @@
 //!
 //! A [`ByteReader`] serves reads at any offset (a native file, a web `Blob` read in chunks, an
 //! in-memory buffer). Container openers that only need the index and then single samples (MP4/MOV,
-//! Matroska) open from a reader ([`ReaderOpener`]); formats decoded in one go (stills, WAV,
-//! standalone compressed audio) fall back to reading the whole file through it.
+//! Matroska, WAV) open from a reader ([`ReaderOpener`]); formats decoded in one go (stills,
+//! standalone compressed audio) fall back to reading the whole file through it, up to
+//! [`MAX_WHOLE_FILE`].
 
 use std::io;
 use std::sync::Arc;
@@ -109,8 +110,8 @@ pub type ReaderOpener = fn(name: &str, head: &[u8], reader: &SharedReader) -> Op
 /// Bytes sniffed by [`open_reader`].
 pub const HEAD_LEN: usize = 64 * 1024;
 
-/// Open media from a reader: reader openers first; otherwise read the whole file and use the
-/// byte openers (`extra`, then stills / WAV).
+/// Open media from a reader: reader openers first, then WAV (streamed too); otherwise read the
+/// whole file (at most [`MAX_WHOLE_FILE`]) and use the byte openers (`extra`, then stills).
 pub fn open_reader(name: &str, reader: SharedReader, reader_openers: &[ReaderOpener], extra: &[Opener]) -> Result<SharedSource> {
     let head = read_range(&*reader, 0, HEAD_LEN).map_err(|e| MediaError::Io(format!("{name}: {e}")))?;
     for o in reader_openers {
@@ -118,8 +119,34 @@ pub fn open_reader(name: &str, reader: SharedReader, reader_openers: &[ReaderOpe
             return r;
         }
     }
-    let all = read_range(&*reader, 0, usize::try_from(reader.len()).unwrap_or(usize::MAX)).map_err(|e| MediaError::Io(format!("{name}: {e}")))?;
-    crate::open_bytes(name, all.into(), extra)
+    if crate::wav::sniff(&head) {
+        return Ok(Arc::new(crate::wav::WavSource::open_reader(name, reader)?));
+    }
+    crate::open_bytes(name, read_whole(name, &*reader)?, extra)
+}
+
+/// The largest file [`open_reader`] reads whole for a format it cannot stream (stills,
+/// standalone compressed audio). Anything bigger is refused rather than loaded: a multi-gigabyte
+/// file in an unstreamable format would otherwise take the machine's memory with it.
+pub const MAX_WHOLE_FILE: u64 = 2 << 30;
+
+/// Read all of `reader` into one shared buffer, refusing files over [`MAX_WHOLE_FILE`].
+pub fn read_whole(name: &str, reader: &dyn ByteReader) -> Result<Arc<[u8]>> {
+    let len = reader.len();
+    if len > MAX_WHOLE_FILE {
+        return Err(MediaError::Unsupported(format!(
+            "{name}: {} GB in a format FilmCraft can only open by reading it whole (the limit is {} GB)",
+            len >> 30,
+            MAX_WHOLE_FILE >> 30
+        )));
+    }
+    let n = usize::try_from(len).map_err(|_| MediaError::Io(format!("{name}: too large")))?;
+    // allocated once, at its final size (collecting a sized iterator into an `Arc<[u8]>` does not
+    // go through a `Vec`), then filled in place: no second copy of the file
+    let mut all: Arc<[u8]> = std::iter::repeat_n(0u8, n).collect();
+    let buf = Arc::get_mut(&mut all).ok_or_else(|| MediaError::Io(format!("{name}: buffer shared")))?;
+    reader.read_at(0, buf).map_err(|e| MediaError::Io(format!("{name}: {e}")))?;
+    Ok(all)
 }
 
 #[cfg(test)]
@@ -165,5 +192,34 @@ mod tests {
         let r: SharedReader = Arc::new(MemReader(wav.into()));
         let s = open_reader("a.wav", r, &[], &[]).unwrap();
         assert!(s.info().has_audio());
+    }
+
+    /// An unknown format can only be opened by reading it whole: a huge one is refused instead of
+    /// being loaded (only its first bytes are read to sniff it).
+    #[test]
+    fn a_huge_file_in_an_unstreamable_format_is_refused_not_loaded() {
+        struct Huge(std::sync::atomic::AtomicU64);
+        impl ByteReader for Huge {
+            fn len(&self) -> u64 {
+                40 << 30
+            }
+            fn read_at(&self, _offset: u64, buf: &mut [u8]) -> io::Result<()> {
+                self.0.fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                buf.fill(7);
+                Ok(())
+            }
+        }
+        let huge = Arc::new(Huge(Default::default()));
+        let r = open_reader("odd.bin", huge.clone(), &[], &[]);
+        assert!(matches!(r, Err(MediaError::Unsupported(ref m)) if m.contains("40 GB")), "{:?}", r.err());
+        assert_eq!(huge.0.load(std::sync::atomic::Ordering::Relaxed), HEAD_LEN as u64);
+    }
+
+    #[test]
+    fn a_wav_opens_through_a_reader_and_small_files_are_read_whole() {
+        let wav = crate::wav::write_wav16(&[0.0, 0.5, -0.5, 0.25], 2, 48_000);
+        let src = open_reader("a.wav", Arc::new(MemReader(wav.clone().into())), &[], &[]).unwrap();
+        assert!(src.info().has_audio());
+        assert_eq!(&read_whole("a.wav", &MemReader(wav.clone().into())).unwrap()[..], &wav[..]);
     }
 }
