@@ -190,6 +190,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         if !playing && !exact {
             app.monitor_inexact = true;
         }
+        if playing && !exact && app.playback.preroll.is_none() {
+            let why = app.frames.miss_reason(&key);
+            *app.playback.misses.entry(why).or_default() += 1;
+        }
         if playing {
             if std::mem::take(&mut app.playback.hidden) {
                 app.playback.meter.resync(frame, exact);

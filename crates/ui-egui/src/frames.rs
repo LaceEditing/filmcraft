@@ -470,6 +470,18 @@ impl FrameServer {
         self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()).get(k)
     }
 
+    /// Why `k` is not ready (playback statistics): `queued`, `rendering` (a worker has it), or
+    /// `notRequested` (dropped from the queue, cancelled or never asked for).
+    pub fn miss_reason(&self, k: &FrameKey) -> &'static str {
+        if self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(j, _, _)| j == k) {
+            return "rendering";
+        }
+        if self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|j| j.key == *k) {
+            return "queued";
+        }
+        "notRequested"
+    }
+
     /// Whether the exact frame (image or plan) is ready.
     pub fn is_ready(&self, k: &FrameKey) -> bool {
         match k.target {
@@ -659,6 +671,59 @@ impl FrameServer {
             }
         }
         done
+    }
+}
+
+/// Locks playback to the display's refreshes when the sequence's frame rate matches the refresh
+/// rate (60 fps on a 60 Hz display, 59.94 on 60, 24 on 24…).
+///
+/// Then every refresh should show the next frame. Frame boundaries fall right on the refreshes,
+/// though, so a refresh a millisecond early shows the same frame again and the next one, on
+/// time, skips a frame: a visible stutter several times a second. While the rates match, a
+/// refresh shows the frame after the last one as long as the clock is within [`Self::BAND`] of
+/// a frame of it; only a real drift (or a late refresh) beyond that repeats or skips a frame.
+/// Video then stays within a third of a frame of the clock.
+#[derive(Clone, Debug, Default)]
+pub struct Cadence {
+    last: Option<i64>,
+    last_refresh: Option<f64>,
+    /// Mean refresh interval (s), over `samples` intervals (a running mean for the first ones).
+    period: f64,
+    samples: u32,
+}
+
+impl Cadence {
+    /// How far (in frames) the clock may run from the locked frame before a frame is skipped or
+    /// repeated.
+    pub const BAND: f64 = 0.3;
+
+    /// Forget the last frame (playback (re)started, a seek, another speed).
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+
+    /// The frame to show at a refresh at `now` (s) when the clock is at frame position `pos`
+    /// (frames, fractional) of a sequence at `fps`.
+    pub fn frame(&mut self, now: f64, pos: f64, fps: f64) -> i64 {
+        if let Some(prev) = self.last_refresh.replace(now) {
+            let dt = now - prev;
+            if dt > 0.0 && dt < 0.25 {
+                self.samples = self.samples.saturating_add(1);
+                let w = (1.0 / self.samples as f64).max(0.05);
+                self.period += (dt - self.period) * w;
+            }
+        }
+        let n = pos.floor() as i64;
+        let frac = pos - n as f64;
+        let content = if fps > 0.0 { 1.0 / fps } else { 0.0 };
+        let matched = self.period > 0.0 && content > 0.0 && ((self.period - content) / content).abs() < 0.03;
+        let chosen = match self.last {
+            Some(k) if matched && n == k && frac > 1.0 - Self::BAND => k + 1,
+            Some(k) if matched && n == k + 2 && frac < Self::BAND => k + 1,
+            _ => n,
+        };
+        self.last = Some(chosen);
+        chosen
     }
 }
 
@@ -941,7 +1006,7 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
 
 #[cfg(test)]
 mod tests {
-    use super::{PlaybackMeter, playback_plan};
+    use super::{Cadence, PlaybackMeter, playback_plan};
 
     #[test]
     fn draft_decoding_only_for_reduced_resolution_playback() {
@@ -1004,5 +1069,58 @@ mod tests {
         }
         m.finish();
         assert_eq!((m.shown, m.dropped), (4, 0));
+    }
+
+    /// 60 fps on a 60 Hz display whose refreshes jitter by ±2 ms around the frame boundaries:
+    /// every refresh shows the next frame (it used to repeat and skip several times a second).
+    #[test]
+    fn cadence_lock_shows_every_frame_when_rates_match() {
+        let (fps, hz) = (60.0, 60.0);
+        let phase = 0.0; // refreshes land on the frame boundaries: the worst case
+        let mut seed = 1u64;
+        let mut jitter = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 0.004
+        };
+        let run = |lock: bool, jitter: &mut dyn FnMut() -> f64| {
+            let mut c = Cadence::default();
+            let mut m = PlaybackMeter::default();
+            m.start(1.0);
+            for i in 0..600 {
+                let now = i as f64 / hz + phase + jitter();
+                let pos = now * fps;
+                let f = if lock { c.frame(now, pos, fps) } else { pos.floor() as i64 };
+                m.refresh(f, true);
+            }
+            m.finish();
+            m.counts()
+        };
+        let (_, dropped_free) = run(false, &mut jitter);
+        let (shown, dropped) = run(true, &mut jitter);
+        assert!(dropped_free > 50, "without the lock the jitter drops frames ({dropped_free})");
+        assert!(dropped <= 1 && shown >= 598, "locked: shown {shown}, dropped {dropped}");
+    }
+
+    /// A display slower than the sequence (59.94 Hz for 60 fps) must still drop the frames it
+    /// cannot show, evenly, and keep video with the clock.
+    #[test]
+    fn cadence_lock_follows_a_real_drift() {
+        let mut c = Cadence::default();
+        let (fps, hz) = (60.0, 59.94);
+        let mut last = 0;
+        for i in 0..6000 {
+            let now = i as f64 / hz;
+            let pos = now * fps;
+            last = c.frame(now, pos, fps);
+            assert!((pos - last as f64) > -Cadence::BAND - 1e-9 && (pos - last as f64) < 1.0 + Cadence::BAND + 1e-9, "refresh {i}: clock {pos}, frame {last}");
+        }
+        // 100 s at 59.94 Hz shows the 6006 frames of the clock minus the ~6 it had to skip
+        assert!((6000 - 1..=6006).contains(&last), "{last}");
+        // a sequence slower than the display (24 fps on 60 Hz) is not locked: the clock decides
+        let mut c = Cadence::default();
+        for i in 0..120 {
+            let now = i as f64 / 60.0;
+            assert_eq!(c.frame(now, now * 24.0, 24.0), (now * 24.0).floor() as i64);
+        }
     }
 }

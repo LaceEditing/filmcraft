@@ -118,6 +118,9 @@ pub enum Dialog {
 
 #[derive(Default)]
 pub struct Playback {
+    /// Refreshes while playing whose due frame was not ready, by reason
+    /// ([`frames::FrameServer::miss_reason`]; `perf.stats` `playback.misses`).
+    pub misses: std::collections::BTreeMap<&'static str, u64>,
     pub playing: bool,
     pub speed: f64,
     pub looping: bool,
@@ -139,6 +142,8 @@ pub struct Playback {
     pub hidden: bool,
     /// Forward playback stops here (Play In to Out, Play from Playhead to Out Point).
     pub stop_at: Option<Tick>,
+    /// One frame per display refresh when the sequence rate matches the refresh rate.
+    pub cadence: frames::Cadence,
 }
 
 /// How long `ui.screenshot` waits for the window to present the frame.
@@ -197,6 +202,15 @@ pub struct FilmcraftApp {
     timeline_view_of: Option<filmcraft_engine::project::ItemId>,
     timeline_view_last: Option<filmcraft_engine::project::SequenceView>,
     pub fps: f32,
+    /// UI-thread time per part of a frame (`perf.stats` `ui.sections`).
+    pub(crate) sections: perf::Sections,
+    /// When the last UI pass ended (the gap to the next frame is egui's paint, the GPU submit,
+    /// present and the wait for the display).
+    ui_end: Option<web_time::Instant>,
+    /// Start of the last frame, and the frame intervals while playing in buckets (<15, 15–18.5,
+    /// 18.5–25, 25–40, ≥40 ms; `perf.stats` `ui.intervalsPlaying`).
+    frame_start: Option<web_time::Instant>,
+    pub(crate) intervals_playing: [u64; 5],
     last_time: f64,
     bindings: Vec<menus::KeyBinding>,
     /// Shortcut-set revision `bindings` (and the native menu) were built from.
@@ -387,6 +401,10 @@ impl FilmcraftApp {
             timeline_view_of: None,
             timeline_view_last: None,
             fps: 60.0,
+            sections: Default::default(),
+            ui_end: None,
+            frame_start: None,
+            intervals_playing: [0; 5],
             last_time: 0.0,
             bindings: Vec::new(),
             bindings_rev: 0,
@@ -654,6 +672,7 @@ impl FilmcraftApp {
         if !self.playback.playing || self.playback.speed != speed {
             self.playback.meter.start(speed);
         }
+        self.playback.cadence.reset();
         self.playback.playing = true;
         self.playback.speed = speed;
         self.playback.anchor_tick = self.session.playhead();
@@ -669,6 +688,7 @@ impl FilmcraftApp {
     /// Start the clock (and audio) once the first frames are ready or the preroll timed out.
     fn end_preroll(&mut self, now: f64) {
         self.playback.preroll = None;
+        self.playback.cadence.reset();
         self.playback.anchor_time = now;
         self.playback.anchor_tick = self.session.playhead();
         self.start_audio();
@@ -788,6 +808,13 @@ impl FilmcraftApp {
         } else if t <= Tick::ZERO && self.playback.speed < 0.0 {
             self.session.set_playhead(Tick::ZERO);
             self.stop();
+        } else if (self.playback.speed - 1.0).abs() < 1e-9 {
+            // real-time forward play: one frame per refresh when the rates match
+            let n = rate.frame_at(t);
+            let (start, next) = (rate.tick_of(n), rate.tick_of(n + 1));
+            let frac = if next > start { (t - start).0 as f64 / (next - start).0 as f64 } else { 0.0 };
+            let shown = self.playback.cadence.frame(now, n as f64 + frac, rate.as_f64());
+            self.session.set_playhead(if shown == n { t } else { rate.tick_of(shown) });
         } else {
             self.session.set_playhead(t);
         }
@@ -1335,7 +1362,9 @@ impl FilmcraftApp {
             self.auto.add(&format!("panel.{}", p.id()), g.content, p.title());
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(g.content).id_salt(("panel", p.id())));
             child.set_clip_rect(g.content);
+            let t0 = web_time::Instant::now();
             panels::show(self, &mut child, p, g.content);
+            self.sections.record(&format!("panel.{}", p.id()), t0.elapsed().as_secs_f64() * 1e3);
         }
         for a in actions {
             match a {
@@ -1426,6 +1455,21 @@ impl eframe::App for FilmcraftApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let t_logic = web_time::Instant::now();
+        if let Some(prev) = self.frame_start.replace(t_logic)
+            && self.playback.playing
+        {
+            let ms = t_logic.duration_since(prev).as_secs_f64() * 1e3;
+            let b = [15.0, 18.5, 25.0, 40.0].iter().position(|&e| ms < e).unwrap_or(4);
+            self.intervals_playing[b] += 1;
+        }
+        if let Some(end) = self.ui_end.take() {
+            let gap = t_logic.duration_since(end).as_secs_f64() * 1e3;
+            self.sections.record("between frames", gap);
+            if self.playback.playing {
+                self.sections.record("between frames (playing)", gap);
+            }
+        }
         if !self.styled {
             theme::install(ctx, &self.tokens);
             // theme::install replaces the fonts: add the system Japanese font back (or fall back to
@@ -1441,7 +1485,9 @@ impl eframe::App for FilmcraftApp {
         let now = ctx.input(|i| i.time);
         let dt = (now - self.last_time) as f32;
         if dt > 0.0 {
-            self.fps = self.fps * 0.9 + (1.0 / dt).min(480.0) * 0.1;
+            // the mean of the intervals (a mean of 1/interval reads low when refreshes jitter)
+            let mean_dt = (1.0 / self.fps.max(1.0)) * 0.9 + dt * 0.1;
+            self.fps = (1.0 / mean_dt).min(480.0);
         }
         self.last_time = now;
         if self.playback.playing && ctx.input(|i| i.viewport().visible()) == Some(false) {
@@ -1472,6 +1518,7 @@ impl eframe::App for FilmcraftApp {
         let settled = !std::mem::take(&mut self.monitor_inexact) && self.timeline_still > 0;
         self.issue_screenshots(ctx, settled);
         self.collect_screenshots(ctx);
+        self.sections.record("logic", t_logic.elapsed().as_secs_f64() * 1e3);
     }
 
     fn on_exit(&mut self) {
@@ -1487,7 +1534,9 @@ impl eframe::App for FilmcraftApp {
         }
         // No frame worker threads on the web: render queued frames here, within a time budget
         // that leaves room for the UI pass (a no-op where workers run).
+        let t_ui = web_time::Instant::now();
         self.frames.pump(std::time::Duration::from_millis(if self.playback.playing { 24 } else { 40 }));
+        self.sections.record("pump", t_ui.elapsed().as_secs_f64() * 1e3);
         // A panic in one panel must not close the app (losing unsaved work) or leave a blank
         // window: catch it, keep the session, and say what happened.
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame(ui))).is_err() {
@@ -1495,6 +1544,8 @@ impl eframe::App for FilmcraftApp {
             self.playback.playing = false;
         }
         self.error_window(ui.ctx());
+        self.sections.record("ui", t_ui.elapsed().as_secs_f64() * 1e3);
+        self.ui_end = Some(web_time::Instant::now());
         let ctx = ui.ctx().clone();
         self.last_ui_time = ctx.input(|i| i.time);
         if !self.synthetic.is_empty() {
