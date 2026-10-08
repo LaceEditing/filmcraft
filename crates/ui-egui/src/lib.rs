@@ -272,11 +272,21 @@ pub struct GpuState {
 fn plan_side(plan: &filmcraft_render::plan::FramePlan) -> usize {
     use filmcraft_render::plan::FramePlan;
     match plan {
-        FramePlan::Layers { width, height, layers } => {
-            layers.iter().map(|l| l.frame.width.max(l.frame.height) as usize).fold((*width).max(*height), usize::max)
-        }
+        FramePlan::Layers { width, height, layers } => layers_side(layers).max((*width).max(*height)),
         FramePlan::Image(img) => img.w.max(img.h),
     }
+}
+
+/// Largest texture side of `layers`: their frames, and a nested group's canvas and layers.
+fn layers_side(layers: &[filmcraft_render::plan::PlanLayer]) -> usize {
+    layers
+        .iter()
+        .map(|l| match &l.group {
+            Some(g) => layers_side(&g.layers).max(g.width.max(g.height)),
+            None => l.frame.width.max(l.frame.height) as usize,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Whether the GPU compositor can run on this adapter: it renders and blends Rgba16Float
@@ -1793,8 +1803,14 @@ mod gpu_fallback_tests {
     #[test]
     fn plan_side_covers_output_and_every_layer() {
         let frame = |w: u32, h: u32| std::sync::Arc::new(filmcraft_frame::VideoFrame::rgba_f32(w, h, vec![0.0; (w * h * 4) as usize]));
-        let layer =
-            |w, h| PlanLayer { frame: frame(w, h), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0, blend: filmcraft_render::Blend::Normal, fx: None };
+        let layer = |w, h| PlanLayer {
+            frame: frame(w, h),
+            matrix: filmcraft_geom::Affine::IDENTITY,
+            opacity: 1.0,
+            blend: filmcraft_render::Blend::Normal,
+            fx: None,
+            group: None,
+        };
         // a 4K source in an HD sequence still needs a 3840-wide texture on the GPU
         let p = FramePlan::Layers { width: 1920, height: 1080, layers: vec![layer(64, 64), layer(3840, 2160)] };
         assert_eq!(super::plan_side(&p), 3840);

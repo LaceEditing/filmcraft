@@ -251,11 +251,16 @@ impl GpuPlan {
     /// Bytes this plan keeps alive (layer frames + converted texels).
     fn bytes(&self) -> usize {
         let frames = match &self.plan {
-            filmcraft_render::plan::FramePlan::Layers { layers, .. } => layers.iter().map(|l| l.frame.byte_size()).sum(),
+            filmcraft_render::plan::FramePlan::Layers { layers, .. } => layer_bytes(layers),
             filmcraft_render::plan::FramePlan::Image(img) => img.px.len() * 4,
         };
         frames + self.prepared.bytes()
     }
+}
+
+/// Bytes the frames of `layers` keep alive, nested groups' included.
+fn layer_bytes(layers: &[filmcraft_render::plan::PlanLayer]) -> usize {
+    layers.iter().map(|l| l.frame.byte_size() + l.group.as_ref().map_or(0, |g| layer_bytes(&g.layers))).sum()
 }
 
 /// Finished plans, bounded by count and bytes (oldest use evicted first).
@@ -948,7 +953,7 @@ fn plan_job(job: &Job, seq: ItemId, pool: &Arc<MediaPool>, services: &Arc<dyn Se
         // captions (they are not part of the preview hash), so captions are layered on live.
         let (w, h) = filmcraft_render::output_size(q, job.scale);
         let matrix = filmcraft_geom::Affine::scale(w as f64 / frame.width.max(1) as f64, h as f64 / frame.height.max(1) as f64);
-        let mut layers = vec![filmcraft_render::plan::PlanLayer { frame, matrix, opacity: 1.0, blend: filmcraft_render::Blend::Normal, fx: None }];
+        let mut layers = vec![filmcraft_render::plan::PlanLayer { frame, matrix, opacity: 1.0, blend: filmcraft_render::Blend::Normal, fx: None, group: None }];
         for o in filmcraft_render::caption_overlays(q, job.time, w, h) {
             layers.push(filmcraft_render::plan::PlanLayer {
                 frame: Arc::new(filmcraft_frame::VideoFrame::rgba_f32(o.w as u32, o.h as u32, o.px)),
@@ -956,6 +961,7 @@ fn plan_job(job: &Job, seq: ItemId, pool: &Arc<MediaPool>, services: &Arc<dyn Se
                 opacity: 1.0,
                 blend: filmcraft_render::Blend::Normal,
                 fx: None,
+                group: None,
             });
         }
         return (filmcraft_render::plan::FramePlan::Layers { width: w, height: h, layers }, true);

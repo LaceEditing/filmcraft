@@ -10,6 +10,12 @@
 //! layers, nested sequences, non-dissolve transitions — is rendered on the CPU for that layer (or
 //! the whole frame) and handed over as a pre-composited image, so the GPU path is always exact
 //! with respect to the CPU reference.
+//!
+//! A nested sequence is drawn the way the CPU draws it, as one picture placed by its clip: a
+//! [`PlanGroup`] holds the nested sequence's own layers, which the GPU composites onto a canvas of
+//! the size the CPU would render the nest at, before Motion, Opacity and the blend mode place that
+//! canvas. An untransformed, opaque nest blending Normal skips the canvas: its layers go straight
+//! into the plan around it.
 
 use std::sync::Arc;
 
@@ -34,6 +40,24 @@ pub struct PlanLayer {
     pub blend: Blend,
     /// Standard effects to run on the frame before it is placed (None: draw the frame directly).
     pub fx: Option<Arc<LayerFx>>,
+    /// A nested sequence's picture: these layers composited over transparent onto a canvas of
+    /// the group's size are what the matrix places (`frame` is then an empty placeholder).
+    pub group: Option<Arc<PlanGroup>>,
+}
+
+/// The layers of a nested sequence and the canvas they are composited on (see [`PlanLayer::group`]).
+#[derive(Clone)]
+pub struct PlanGroup {
+    pub width: usize,
+    pub height: usize,
+    pub layers: Vec<PlanLayer>,
+}
+
+impl PlanGroup {
+    /// The group's picture, composited on the CPU (the reference for the GPU's group texture).
+    pub fn execute_cpu(&self) -> crate::Image {
+        composite_cpu(self.width, self.height, &self.layers)
+    }
 }
 
 /// The GPU effect stage of a layer: the frame is decoded into a working image of `size` (the
@@ -49,11 +73,21 @@ pub struct LayerFx {
 impl PlanLayer {
     /// A layer drawing `frame` directly.
     pub fn new(frame: Arc<VideoFrame>, matrix: Affine, opacity: f32, blend: Blend) -> Self {
-        Self { frame, matrix, opacity, blend, fx: None }
+        Self { frame, matrix, opacity, blend, fx: None, group: None }
     }
 
-    /// Size of the picture the matrix places: the working image with effects, else the frame.
+    /// A layer drawing the composite of `group`'s layers.
+    pub fn group(group: PlanGroup, matrix: Affine, opacity: f32, blend: Blend) -> Self {
+        let placeholder = Arc::new(VideoFrame::rgba_f32(1, 1, vec![0.0; 4]));
+        Self { group: Some(Arc::new(group)), ..Self::new(placeholder, matrix, opacity, blend) }
+    }
+
+    /// Size of the picture the matrix places: the group's canvas, the working image with
+    /// effects, else the frame.
     pub fn size(&self) -> (u32, u32) {
+        if let Some(g) = &self.group {
+            return (g.width.max(1) as u32, g.height.max(1) as u32);
+        }
         match &self.fx {
             Some(fx) => fx.size,
             None => (self.frame.width, self.frame.height),
@@ -273,6 +307,39 @@ fn push_item(
         }
         return;
     }
+    // Any other nested sequence without standard effects or masks (scaled, moved, faded, blended,
+    // or holding clips that blend among themselves): its layers composited onto a canvas the size
+    // the CPU renders it at (`base_layer`), placed by Motion like any clip's picture.
+    if let Some(ItemKind::Sequence(nested)) = project.item(item.item).map(|p| &p.kind)
+        && nest < crate::MAX_NEST_DEPTH
+        && item.multicam_angle(nested).is_none()
+        && !(opts.effects && item.has_standard_effects())
+        && !item.has_opacity_masks()
+        && nested.settings.color == seq.settings.color
+        && layered_at(project, nested, ft)
+    {
+        let size = (nested.settings.width, nested.settings.height);
+        let motion = motion_matrix(seq, item, size, mt);
+        let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
+        let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
+        let sub = RenderOptions { scale: want, depth: opts.depth + 1, captions: false, working_output: true, ..opts };
+        let (gw, gh) = output_size(nested, want);
+        let mut layers = Vec::new();
+        push_tracks(project, nested, ft, sub, sources, nest + 1, &mut layers);
+        for o in crate::caption_overlays(nested, ft, gw, gh) {
+            layers.push(PlanLayer::new(
+                Arc::new(VideoFrame::rgba_f32(o.w as u32, o.h as u32, o.px)),
+                Affine::translate(o.x as f64, o.y as f64),
+                1.0,
+                Blend::Normal,
+            ));
+        }
+        // canvas px → nested sequence px → this sequence's px → output px
+        let px_scale = gw as f64 / size.0.max(1) as f64;
+        let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion).then_apply(&Affine::scale(1.0 / px_scale, 1.0 / px_scale));
+        out.push(PlanLayer::group(PlanGroup { width: gw, height: gh, layers }, m, op * extra_opacity, bl));
+        return;
+    }
     // Graphic clips without standard effects: the layers are rasterised (cached) into one tight
     // image the GPU places as a layer.
     if !(opts.effects && item.has_standard_effects())
@@ -322,7 +389,7 @@ fn push_item(
                     .then_apply(&motion)
                     .then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
                 let fx = LayerFx { size: (lw as u32, lh as u32), decimation: n as u32, ops };
-                out.push(PlanLayer { frame, matrix: m, opacity: op * extra_opacity, blend: bl, fx: Some(Arc::new(fx)) });
+                out.push(PlanLayer { frame, matrix: m, opacity: op * extra_opacity, blend: bl, fx: Some(Arc::new(fx)), group: None });
                 return;
             }
         } else if plain {
@@ -367,23 +434,27 @@ pub fn effect_image(frame: &VideoFrame, fx: &LayerFx) -> crate::Image {
 pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
     match plan {
         FramePlan::Image(img) => img.clone(),
-        FramePlan::Layers { width, height, layers } => {
-            let mut canvas = crate::Image::new(*width, *height);
-            for l in layers {
-                let src = match &l.fx {
-                    Some(fx) => effect_image(&l.frame, fx),
-                    None => crate::Image { w: l.frame.width as usize, h: l.frame.height as usize, px: l.frame.to_linear_f32() },
-                };
-                let placed = if l.matrix == Affine::scale(*width as f64, *height as f64) && src.w == 1 && src.h == 1 {
-                    crate::Image::filled(*width, *height, src.get(0, 0))
-                } else {
-                    src.transformed(*width, *height, &l.matrix)
-                };
-                crate::blend::composite(&mut canvas, &placed, l.opacity, l.blend);
-            }
-            canvas
-        }
+        FramePlan::Layers { width, height, layers } => composite_cpu(*width, *height, layers),
     }
+}
+
+/// `layers` composited over transparent onto a `width`×`height` canvas, on the CPU.
+fn composite_cpu(width: usize, height: usize, layers: &[PlanLayer]) -> crate::Image {
+    let mut canvas = crate::Image::new(width, height);
+    for l in layers {
+        let src = match (&l.group, &l.fx) {
+            (Some(g), _) => composite_cpu(g.width, g.height, &g.layers),
+            (None, Some(fx)) => effect_image(&l.frame, fx),
+            (None, None) => crate::Image { w: l.frame.width as usize, h: l.frame.height as usize, px: l.frame.to_linear_f32() },
+        };
+        let placed = if l.group.is_none() && l.matrix == Affine::scale(width as f64, height as f64) && src.w == 1 && src.h == 1 {
+            crate::Image::filled(width, height, src.get(0, 0))
+        } else {
+            src.transformed(width, height, &l.matrix)
+        };
+        crate::blend::composite(&mut canvas, &placed, l.opacity, l.blend);
+    }
+    canvas
 }
 
 /// Executes frame plans into finished pictures: straight sRGB RGBA8 over black, the same pixels

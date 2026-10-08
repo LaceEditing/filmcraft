@@ -20,6 +20,11 @@
 //! (`filmcraft_render::gpufx::FxOp::apply`), and the result is drawn like any RGBA layer. Layers
 //! without effects take the single draw above.
 //!
+//! A group layer ([`PlanGroup`], a nested sequence) is composited the same way into a texture of
+//! its own (pooled per frame), recorded before the layers around it are drawn; that texture is
+//! then drawn like a linear premultiplied RGBA layer with the group's matrix, opacity and blend
+//! mode, so a scaled or faded nest costs a second accumulator, not a CPU render.
+//!
 //! Layers that need converting before upload (linear f32 RGBA from CPU-rendered layers, 16-bit
 //! YUV such as ProRes) are converted to half floats by [`prepare`], which frame workers run off the
 //! UI thread; [`GpuCompositor::composite_prepared`] then only copies bytes into textures.
@@ -28,7 +33,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -36,7 +41,7 @@ use rayon::prelude::*;
 use filmcraft_color::{Matrix, Range, Transfer};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use filmcraft_render::Blend;
-use filmcraft_render::plan::{FramePlan, PlanLayer};
+use filmcraft_render::plan::{FramePlan, PlanGroup, PlanLayer};
 
 pub mod fx;
 #[cfg(all(feature = "headless", not(target_arch = "wasm32")))]
@@ -50,6 +55,12 @@ pub use mask::GpuMask;
 /// shader applies the sRGB encoding.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Groups nested deeper than this (plans never are: the planner stops at
+/// `filmcraft_render::MAX_NEST_DEPTH`) are composited on the CPU.
+const MAX_GROUP_DEPTH: u32 = filmcraft_render::MAX_NEST_DEPTH + 1;
+
+/// A render target and its size.
+type Target = (wgpu::Texture, wgpu::TextureView, (u32, u32));
 
 struct Uploaded {
     /// Y, Cb, Cr (or the RGBA texture) and the alpha plane (the dummy texture when there is none).
@@ -76,8 +87,14 @@ pub struct GpuCompositor {
     blend_bgl: wgpu::BindGroupLayout,
     final_bgl: wgpu::BindGroupLayout,
     accum: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
-    /// Copy of the accumulator under a blend-mode layer (allocated on first use).
-    backdrop: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
+    /// Copies of an accumulator under a blend-mode layer, per accumulator size (allocated on
+    /// first use, released when a frame no longer needs that size).
+    backdrops: HashMap<(u32, u32), Option<Target>>,
+    backdrops_used: HashSet<(u32, u32)>,
+    /// The accumulators nested sequences ([`PlanGroup`]) are composited into, in the order a
+    /// frame uses them (kept for the next frame).
+    group_targets: Vec<Option<Target>>,
+    groups_used: usize,
     output: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     uploads: HashMap<(usize, u32, u32), Uploaded>,
     clock: u64,
@@ -150,12 +167,41 @@ impl Prepared {
 #[derive(Clone, Debug, Default)]
 pub struct PreparedPlan {
     layers: Vec<Option<Prepared>>,
+    /// The layers of each group layer ([`PlanLayer::group`]), index-aligned with `layers`.
+    groups: Vec<Option<PreparedPlan>>,
     image: Option<Prepared>,
 }
 
 impl PreparedPlan {
     pub fn bytes(&self) -> usize {
-        self.layers.iter().flatten().chain(&self.image).map(Prepared::bytes).sum()
+        self.layers.iter().flatten().chain(&self.image).map(Prepared::bytes).sum::<usize>()
+            + self.groups.iter().flatten().map(PreparedPlan::bytes).sum::<usize>()
+    }
+}
+
+/// Where the converted texels of a list of layers are, if anywhere.
+#[derive(Clone, Copy)]
+enum Prep<'a> {
+    /// A plan's (or a group's) layers, index-aligned.
+    Layers(Option<&'a PreparedPlan>),
+    /// The one layer of a [`FramePlan::Image`].
+    Image(Option<&'a PreparedPlan>),
+}
+
+impl<'a> Prep<'a> {
+    fn layer(self, i: usize) -> Option<&'a Prepared> {
+        match self {
+            Prep::Layers(p) => p.and_then(|p| p.layers.get(i)).and_then(Option::as_ref),
+            Prep::Image(p) => p.and_then(|p| p.image.as_ref()),
+        }
+    }
+
+    /// The texels of group layer `i`'s own layers.
+    fn group(self, i: usize) -> Prep<'a> {
+        Prep::Layers(match self {
+            Prep::Layers(p) => p.and_then(|p| p.groups.get(i)).and_then(Option::as_ref),
+            Prep::Image(_) => None,
+        })
     }
 }
 
@@ -208,8 +254,16 @@ pub fn prepare_frame(f: &VideoFrame) -> Option<Prepared> {
 /// Convert every layer of a plan for upload. Thread-safe and GPU-free: run it on a worker.
 pub fn prepare(plan: &FramePlan) -> PreparedPlan {
     match plan {
-        FramePlan::Layers { layers, .. } => PreparedPlan { layers: layers.iter().map(|l| prepare_frame(&l.frame)).collect(), image: None },
-        FramePlan::Image(img) => PreparedPlan { layers: Vec::new(), image: Some(Prepared { planes: vec![f32_to_f16_bytes(&img.px)] }) },
+        FramePlan::Layers { layers, .. } => prepare_layers(layers),
+        FramePlan::Image(img) => PreparedPlan { image: Some(Prepared { planes: vec![f32_to_f16_bytes(&img.px)] }), ..Default::default() },
+    }
+}
+
+fn prepare_layers(layers: &[PlanLayer]) -> PreparedPlan {
+    PreparedPlan {
+        layers: layers.iter().map(|l| if l.group.is_some() { None } else { prepare_frame(&l.frame) }).collect(),
+        groups: layers.iter().map(|l| l.group.as_deref().map(|g: &PlanGroup| prepare_layers(&g.layers))).collect(),
+        image: None,
     }
 }
 
@@ -337,7 +391,10 @@ impl GpuCompositor {
             blend_bgl,
             final_bgl,
             accum: None,
-            backdrop: None,
+            backdrops: HashMap::new(),
+            backdrops_used: HashSet::new(),
+            group_targets: Vec::new(),
+            groups_used: 0,
             output: None,
             uploads: HashMap::new(),
             clock: 0,
@@ -355,8 +412,20 @@ impl GpuCompositor {
         format: wgpu::TextureFormat,
         extra: wgpu::TextureUsages,
     ) -> wgpu::TextureView {
+        Self::target_pair(device, slot, w, h, format, extra).1
+    }
+
+    /// A render target of `w`×`h` in `slot`, (re)created when the size changes.
+    fn target_pair(
+        device: &wgpu::Device,
+        slot: &mut Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
+        w: u32,
+        h: u32,
+        format: wgpu::TextureFormat,
+        extra: wgpu::TextureUsages,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         if let Some(s) = slot.as_ref().filter(|s| s.2 == (w, h)) {
-            return s.1.clone();
+            return (s.0.clone(), s.1.clone());
         }
         let t = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("filmcraft-target"),
@@ -369,8 +438,8 @@ impl GpuCompositor {
             view_formats: &[],
         });
         let v = t.create_view(&Default::default());
-        *slot = Some((t, v.clone(), (w, h)));
-        v
+        *slot = Some((t.clone(), v.clone(), (w, h)));
+        (t, v)
     }
 
     fn plane_texture(&mut self, w: u32, h: u32, format: wgpu::TextureFormat, bytes: &[u8], bpp: u32) -> wgpu::TextureView {
@@ -596,180 +665,40 @@ impl GpuCompositor {
                     },
                     None => VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px.clone()),
                 };
-                owned = [PlanLayer { frame: Arc::new(frame), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None }];
+                owned = [PlanLayer::new(Arc::new(frame), filmcraft_geom::Affine::IDENTITY, 1.0, Blend::Normal)];
                 (img.w as u32, img.h as u32, &owned[..])
             }
         };
         let (w, h) = (w.max(1), h.max(1));
         let accum_view = Self::target(&self.device, &mut self.accum, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_SRC);
-        let backdrop_view = if layers.iter().any(|l| l.blend.reads_destination()) {
-            Some(Self::target(&self.device, &mut self.backdrop, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_DST))
-        } else {
-            None
-        };
+        let accum_tex = self.accum.as_ref().map(|a| a.0.clone());
         let out_view = Self::target(&self.device, &mut self.output, w, h, OUTPUT_FORMAT, wgpu::TextureUsages::COPY_SRC);
-        // Layers whose effects the GPU stage can't run (no stage on this device, or a working image
-        // larger than a texture) are rendered on the CPU here and drawn as plain RGBA layers.
-        let max_side = self.device.limits().max_texture_dimension_2d;
-        let cpu_fx: Vec<Option<PlanLayer>> = layers
-            .iter()
-            .map(|l| {
-                let lfx = l.fx.as_ref()?;
-                if self.fx.is_some() && lfx.size.0.max(lfx.size.1) <= max_side {
-                    return None;
-                }
-                let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
-                Some(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend))
-            })
-            .collect();
-        let resolved: Vec<&PlanLayer> = layers.iter().zip(&cpu_fx).map(|(l, c)| c.as_ref().unwrap_or(l)).collect();
-        let layers = resolved;
-        let keys: Vec<(usize, u32, u32)> = layers
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let p = prep.and_then(|p| if matches!(plan, FramePlan::Image(_)) { p.image.as_ref() } else { p.layers.get(i).and_then(Option::as_ref) });
-                // (texels converted beforehand belong to the plan's own frame)
-                let p = if cpu_fx.get(i).is_some_and(Option::is_some) { None } else { p };
-                self.upload(&l.frame, p)
-            })
-            .collect();
-        // (bind group, None for a fixed-function layer or Some(region of the accumulator to copy
-        // into the backdrop) for a layer that reads the destination; Some(None): off the output)
-        let mut bind_groups = Vec::with_capacity(layers.len());
-        // the effect stage of each layer with effects (recorded right before its draw)
-        let mut jobs: Vec<Option<fx::FxJob>> = Vec::with_capacity(layers.len());
         if let Some(f) = self.fx.as_mut() {
             f.begin_frame();
         }
-        for (l, k) in layers.iter().zip(&keys) {
-            // (every frame was just uploaded; a missing upload draws transparent texels)
-            let src = self.src_info(&l.frame, *k).unwrap_or(SrcInfo {
-                kind: 1,
-                code_scale: 1.0,
-                alpha: 0.0,
-                chroma: (1, 1),
-                size: (l.frame.width, l.frame.height),
-                color: l.frame.color,
-            });
-            let views = self.uploads.get(k).map_or_else(|| std::array::from_fn(|_| self.dummy.clone()), |up| up.views.clone());
-            let job = match &l.fx {
-                Some(lfx) => {
-                    // the source drawn onto the working image (box-decimated by n, as the CPU decodes)
-                    let n = lfx.decimation.max(1) as f64;
-                    let su = Self::uniforms(&src, &filmcraft_geom::Affine::scale(1.0 / n, 1.0 / n), 1.0, Blend::Normal, (lfx.size.0.max(1), lfx.size.1.max(1)));
-                    let sbuf = self.uniform_buffer(&su);
-                    let sbg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("fx-source"),
-                        layout: &self.layer_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: sbuf.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[0]) },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
-                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[2]) },
-                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&views[3]) },
-                        ],
-                    });
-                    match self.fx.as_mut() {
-                        Some(f) => f.job(&self.device, &self.queue, lfx, sbg, &self.dummy),
-                        None => None,
-                    }
-                }
-                None => None,
+        self.groups_used = 0;
+        self.backdrops_used.clear();
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("filmcraft-composite") });
+        if let Some(accum_tex) = &accum_tex {
+            let src = match plan {
+                FramePlan::Image(_) => Prep::Image(prep),
+                FramePlan::Layers { .. } => Prep::Layers(prep),
             };
-            // what the layer draws: the effect result (linear premultiplied RGBA) or the frame
-            let (u, tex) = match &job {
-                Some(j) => {
-                    let s = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color };
-                    (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
-                }
-                None => {
-                    // (a layer with effects only gets here if its job failed, which the CPU
-                    // fallback above rules out; it is then drawn without them, where the working
-                    // image would be)
-                    let m = match &l.fx {
-                        Some(lfx) => {
-                            let n = 1.0 / lfx.decimation.max(1) as f64;
-                            l.matrix.then_apply(&filmcraft_geom::Affine::scale(n, n))
-                        }
-                        None => l.matrix,
-                    };
-                    (Self::uniforms(&src, &m, l.opacity, l.blend, (w, h)), views)
-                }
-            };
-            jobs.push(job);
-            let buf = self.uniform_buffer(&u);
-            let mut entries = vec![
-                wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex[0]) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&tex[1]) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&tex[2]) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&tex[3]) },
-            ];
-            let (layout, region) = match (&backdrop_view, l.blend.reads_destination()) {
-                (Some(b), true) => {
-                    entries.push(wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(b) });
-                    (&self.blend_bgl, Some(quad_bounds(l, w, h)))
-                }
-                _ => (&self.layer_bgl, None),
-            };
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("layer"), layout, entries: &entries });
-            bind_groups.push((bg, region));
+            self.draw_layers(&mut enc, accum_tex, &accum_view, (w, h), layers, src, 0);
         }
         if let Some(f) = self.fx.as_mut() {
             f.end_frame();
         }
+        // textures of groups and backdrops no longer drawn are released
+        self.group_targets.truncate(self.groups_used);
+        let used = std::mem::take(&mut self.backdrops_used);
+        self.backdrops.retain(|k, _| used.contains(k));
+        self.backdrops_used = used;
         let final_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("final"),
             layout: &self.final_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&accum_view) }],
         });
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("filmcraft-composite") });
-        // Runs of fixed-function layers draw in one pass. A layer that reads the destination
-        // ends it, copies the accumulator under its quad into the backdrop and draws on its own.
-        let accum_tex = self.accum.as_ref().map(|a| a.0.clone());
-        let backdrop_tex = self.backdrop.as_ref().map(|b| b.0.clone());
-        let mut cleared = false;
-        let mut i = 0;
-        while i < bind_groups.len() || !cleared {
-            // a layer's effects run right before it is drawn (pooled working textures are reused
-            // by the next layer with effects)
-            if let (Some(Some(job)), Some(f)) = (jobs.get(i), self.fx.as_ref()) {
-                f.record(&mut enc, job);
-            }
-            if let Some((bg, Some(region))) = bind_groups.get(i) {
-                i += 1;
-                let (Some(rect), Some(src), Some(dst)) = (region, &accum_tex, &backdrop_tex) else { continue };
-                if !cleared {
-                    accum_pass(&mut enc, &accum_view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
-                    cleared = true;
-                }
-                let origin = wgpu::Origin3d { x: rect.0, y: rect.1, z: 0 };
-                enc.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo { texture: src, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
-                    wgpu::TexelCopyTextureInfo { texture: dst, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
-                    wgpu::Extent3d { width: rect.2, height: rect.3, depth_or_array_layers: 1 },
-                );
-                let mut pass = accum_pass(&mut enc, &accum_view, wgpu::LoadOp::Load);
-                pass.set_pipeline(&self.blend_pipeline);
-                pass.set_bind_group(0, bg, &[]);
-                pass.draw(0..6, 0..1);
-                continue;
-            }
-            // a run of fixed-function layers, up to the next one that reads the destination or
-            // has effects to run first
-            let breaks = |j: &usize| bind_groups.get(*j).is_some_and(|(_, r)| r.is_some()) || jobs.get(*j).is_some_and(Option::is_some);
-            let end = (i + 1..bind_groups.len()).find(breaks).unwrap_or(bind_groups.len()).max(i);
-            let load = if cleared { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) };
-            let mut pass = accum_pass(&mut enc, &accum_view, load);
-            cleared = true;
-            pass.set_pipeline(&self.layer_pipeline);
-            for (bg, _) in bind_groups.get(i..end).unwrap_or_default() {
-                pass.set_bind_group(0, bg, &[]);
-                pass.draw(0..6, 0..1);
-            }
-            i = end;
-        }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("resolve"),
@@ -790,6 +719,219 @@ impl GpuCompositor {
         }
         self.queue.submit([enc.finish()]);
         (out_view, (w, h))
+    }
+
+    /// Record `layers` composited over transparent into `target` (an accumulator of `w`×`h`):
+    /// effect stages right before their layers, a backdrop copy before each layer that reads the
+    /// destination, and every group's own layers composited into a group texture first
+    /// (recursively, recorded before this target's passes), which its layer then draws.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layers(
+        &mut self,
+        enc: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        target_view: &wgpu::TextureView,
+        (w, h): (u32, u32),
+        layers: &[PlanLayer],
+        prep: Prep,
+        depth: u32,
+    ) {
+        let backdrop = if layers.iter().any(|l| l.blend.reads_destination()) { Some(self.backdrop(w, h)) } else { None };
+        // Layers whose effects the GPU stage can't run (no stage on this device, or a working image
+        // larger than a texture), and groups too large for a texture (or nested implausibly deep),
+        // are rendered on the CPU here and drawn as plain RGBA layers.
+        let max_side = self.device.limits().max_texture_dimension_2d;
+        let cpu: Vec<Option<PlanLayer>> = layers
+            .iter()
+            .map(|l| {
+                if let Some(g) = &l.group {
+                    if (g.width.max(g.height) as u32) <= max_side && depth < MAX_GROUP_DEPTH {
+                        return None;
+                    }
+                    let img = g.execute_cpu();
+                    return Some(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend));
+                }
+                let lfx = l.fx.as_ref()?;
+                if self.fx.is_some() && lfx.size.0.max(lfx.size.1) <= max_side {
+                    return None;
+                }
+                let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
+                Some(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend))
+            })
+            .collect();
+        let layers: Vec<&PlanLayer> = layers.iter().zip(&cpu).map(|(l, c)| c.as_ref().unwrap_or(l)).collect();
+        // uploads (none for a group: it draws its group texture)
+        let keys: Vec<Option<(usize, u32, u32)>> = layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if l.group.is_some() {
+                    return None;
+                }
+                // (texels converted beforehand belong to the plan's own frame)
+                let p = if cpu.get(i).is_some_and(Option::is_some) { None } else { prep.layer(i) };
+                Some(self.upload(&l.frame, p))
+            })
+            .collect();
+        // (bind group, None for a fixed-function layer or Some(region of the accumulator to copy
+        // into the backdrop) for a layer that reads the destination; Some(None): off the output)
+        let mut bind_groups = Vec::with_capacity(layers.len());
+        // the effect stage of each layer with effects (recorded right before its draw)
+        let mut jobs: Vec<Option<fx::FxJob>> = Vec::with_capacity(layers.len());
+        for (i, (l, k)) in layers.iter().zip(&keys).enumerate() {
+            let (u, tex) = if let Some(g) = &l.group {
+                // the nested sequence's picture: its layers composited into a texture of its own
+                let size = l.size();
+                let (gtex, gview) = self.group_target(size);
+                self.draw_layers(enc, &gtex, &gview, size, &g.layers, prep.group(i), depth + 1);
+                jobs.push(None);
+                let s = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: size, size, color: l.frame.color };
+                (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [gview, self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
+            } else {
+                let k = k.unwrap_or_default();
+                // (every frame was just uploaded; a missing upload draws transparent texels)
+                let src = self.src_info(&l.frame, k).unwrap_or(SrcInfo {
+                    kind: 1,
+                    code_scale: 1.0,
+                    alpha: 0.0,
+                    chroma: (1, 1),
+                    size: (l.frame.width, l.frame.height),
+                    color: l.frame.color,
+                });
+                let views = self.uploads.get(&k).map_or_else(|| std::array::from_fn(|_| self.dummy.clone()), |up| up.views.clone());
+                let job = match &l.fx {
+                    Some(lfx) => {
+                        // the source drawn onto the working image (box-decimated by n, as the CPU decodes)
+                        let n = lfx.decimation.max(1) as f64;
+                        let su =
+                            Self::uniforms(&src, &filmcraft_geom::Affine::scale(1.0 / n, 1.0 / n), 1.0, Blend::Normal, (lfx.size.0.max(1), lfx.size.1.max(1)));
+                        let sbuf = self.uniform_buffer(&su);
+                        let sbg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("fx-source"),
+                            layout: &self.layer_bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: sbuf.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[0]) },
+                                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
+                                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[2]) },
+                                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&views[3]) },
+                            ],
+                        });
+                        match self.fx.as_mut() {
+                            Some(f) => f.job(&self.device, &self.queue, lfx, sbg, &self.dummy),
+                            None => None,
+                        }
+                    }
+                    None => None,
+                };
+                // what the layer draws: the effect result (linear premultiplied RGBA) or the frame
+                let drawn = match &job {
+                    Some(j) => {
+                        let s = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color };
+                        (
+                            Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)),
+                            [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()],
+                        )
+                    }
+                    None => {
+                        // (a layer with effects only gets here if its job failed, which the CPU
+                        // fallback above rules out; it is then drawn without them, where the working
+                        // image would be)
+                        let m = match &l.fx {
+                            Some(lfx) => {
+                                let n = 1.0 / lfx.decimation.max(1) as f64;
+                                l.matrix.then_apply(&filmcraft_geom::Affine::scale(n, n))
+                            }
+                            None => l.matrix,
+                        };
+                        (Self::uniforms(&src, &m, l.opacity, l.blend, (w, h)), views)
+                    }
+                };
+                jobs.push(job);
+                drawn
+            };
+            let buf = self.uniform_buffer(&u);
+            let mut entries = vec![
+                wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex[0]) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&tex[1]) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&tex[2]) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&tex[3]) },
+            ];
+            let (layout, region) = match (&backdrop, l.blend.reads_destination()) {
+                (Some(b), true) => {
+                    entries.push(wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&b.1) });
+                    (&self.blend_bgl, Some(quad_bounds(l, w, h)))
+                }
+                _ => (&self.layer_bgl, None),
+            };
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("layer"), layout, entries: &entries });
+            bind_groups.push((bg, region));
+        }
+        // Runs of fixed-function layers draw in one pass. A layer that reads the destination
+        // ends it, copies the accumulator under its quad into the backdrop and draws on its own.
+        let backdrop_tex = backdrop.as_ref().map(|b| b.0.clone());
+        let mut cleared = false;
+        let mut i = 0;
+        while i < bind_groups.len() || !cleared {
+            // a layer's effects run right before it is drawn (pooled working textures are reused
+            // by the next layer with effects)
+            if let (Some(Some(job)), Some(f)) = (jobs.get(i), self.fx.as_ref()) {
+                f.record(enc, job);
+            }
+            if let Some((bg, Some(region))) = bind_groups.get(i) {
+                i += 1;
+                let (Some(rect), Some(dst)) = (region, &backdrop_tex) else { continue };
+                if !cleared {
+                    accum_pass(enc, target_view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
+                    cleared = true;
+                }
+                let origin = wgpu::Origin3d { x: rect.0, y: rect.1, z: 0 };
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: dst, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
+                    wgpu::Extent3d { width: rect.2, height: rect.3, depth_or_array_layers: 1 },
+                );
+                let mut pass = accum_pass(enc, target_view, wgpu::LoadOp::Load);
+                pass.set_pipeline(&self.blend_pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(0..6, 0..1);
+                continue;
+            }
+            // a run of fixed-function layers, up to the next one that reads the destination or
+            // has effects to run first
+            let breaks = |j: &usize| bind_groups.get(*j).is_some_and(|(_, r)| r.is_some()) || jobs.get(*j).is_some_and(Option::is_some);
+            let end = (i + 1..bind_groups.len()).find(breaks).unwrap_or(bind_groups.len()).max(i);
+            let load = if cleared { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) };
+            let mut pass = accum_pass(enc, target_view, load);
+            cleared = true;
+            pass.set_pipeline(&self.layer_pipeline);
+            for (bg, _) in bind_groups.get(i..end).unwrap_or_default() {
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            i = end;
+        }
+    }
+
+    /// The next group texture of this frame (an accumulator a nested sequence is composited
+    /// into), reused across frames while the size stays.
+    fn group_target(&mut self, (w, h): (u32, u32)) -> (wgpu::Texture, wgpu::TextureView) {
+        let k = self.groups_used;
+        self.groups_used += 1;
+        while self.group_targets.len() <= k {
+            self.group_targets.push(None);
+        }
+        let mut none = None;
+        let slot = self.group_targets.get_mut(k).unwrap_or(&mut none);
+        Self::target_pair(&self.device, slot, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_SRC)
+    }
+
+    /// The backdrop texture for blend-mode layers drawn into a `w`×`h` accumulator.
+    fn backdrop(&mut self, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        self.backdrops_used.insert((w, h));
+        let slot = self.backdrops.entry((w, h)).or_default();
+        Self::target_pair(&self.device, slot, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_DST)
     }
 
     /// Run the effect stage of a layer alone: `frame` decoded into its working image and `fx`

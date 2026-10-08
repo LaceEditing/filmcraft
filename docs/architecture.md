@@ -265,12 +265,15 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   the effects' parameters evaluated at that time: the source is drawn into an `Rgba32Float`
   working image at the size the CPU decodes it, each effect runs as compute passes with the CPU
   reference's math (effects, then Motion, then Opacity / blend, as on the CPU), and the result is
-  placed like any layer. Other standard effects, effect and opacity masks, adjustment layers,
-  nested sequences (except a plain one, whose own layers go into the plan: same frame size and
-  colour settings as its parent, nothing on the clip that changes the picture, every layer inside
-  blended normally) and non-dissolve transitions are rendered on the CPU for that layer or frame
-  and handed to the GPU as an image (a layer image keeps its clip's blend mode), so both paths
-  give the same picture. Setting `FILMCRAFT_CPU_COMPOSITE=1`
+  placed like any layer. A nested sequence is drawn as the CPU draws it, one picture placed by
+  its clip: a group layer (`PlanGroup`) holds the nest's own layers, which the GPU composites into
+  a texture of the size the CPU renders the nest at, and Motion, Opacity and the blend mode then
+  place that texture (a plain nest — same frame size and colour settings as its parent, nothing on
+  the clip that changes the picture, every layer inside blended normally — skips the texture: its
+  layers go straight into the plan). Other standard effects (including on a nest clip), effect
+  and opacity masks, adjustment layers and non-dissolve transitions (also inside a nest) are
+  rendered on the CPU for that layer or frame and handed to the GPU as an image (a layer image
+  keeps its clip's blend mode), so both paths give the same picture. Setting `FILMCRAFT_CPU_COMPOSITE=1`
   forces the CPU path in the desktop app.
 - **Frame scheduling.** `crates/ui-egui/src/frames.rs` runs a small pool of worker threads with
   prioritised jobs: the frame on screen first, then playback prefetch, then thumbnails. The UI never

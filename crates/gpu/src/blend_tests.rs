@@ -86,11 +86,27 @@ pub(crate) fn stats8(a: &[u8], b: &[u8], keep: &[bool]) -> (u32, f64, u32) {
     (d[d.len() * 99 / 100], d.iter().sum::<u32>() as f64 / d.len() as f64, d[d.len() - 1])
 }
 
+/// Every layer's quad as (output → layer matrix, layer size), the layers inside groups placed
+/// through their group's matrix.
+fn quads(layers: &[PlanLayer], outer: &Affine, out: &mut Vec<(Affine, f64, f64)>) {
+    for l in layers {
+        let m = outer.then_apply(&l.matrix);
+        if let Some(inv) = m.inverse() {
+            out.push((inv, l.size().0 as f64, l.size().1 as f64));
+        }
+        if let Some(g) = &l.group {
+            quads(&g.layers, &m, out);
+        }
+    }
+}
+
 /// Pixels at least 1.5 px away from every layer's quad outline (the CPU resampler fades a layer's
-/// edge over a pixel beyond it, the GPU rasterises the quad: compared separately).
+/// edge over a pixel beyond it, the GPU rasterises the quad: compared separately), the layers of
+/// groups included.
 pub(crate) fn interior(plan: &FramePlan) -> Vec<bool> {
     let FramePlan::Layers { width, height, layers } = plan else { return Vec::new() };
-    let inv: Vec<(Affine, f64, f64)> = layers.iter().filter_map(|l| Some((l.matrix.inverse()?, l.size().0 as f64, l.size().1 as f64))).collect();
+    let mut inv = Vec::new();
+    quads(layers, &Affine::IDENTITY, &mut inv);
     let mut keep = vec![true; width * height];
     for (i, k) in keep.iter_mut().enumerate() {
         let (x, y) = ((i % width) as f64 + 0.5, (i / width) as f64 + 0.5);
@@ -162,14 +178,15 @@ fn gpu_blend_modes_match_cpu() {
             layers: vec![
                 // opaque YUV on the left, a partially transparent ramp on the right; the top-right
                 // corner stays empty (destination alpha 0)
-                PlanLayer { frame: yuv_frame(640, 360), matrix: Affine::scale(0.35, 0.5), opacity: 1.0, blend: Blend::Normal, fx: None },
-                PlanLayer { frame: base.clone(), matrix: Affine::translate(200.0, 40.0), opacity: 0.9, blend: Blend::Normal, fx: None },
+                PlanLayer { frame: yuv_frame(640, 360), matrix: Affine::scale(0.35, 0.5), opacity: 1.0, blend: Blend::Normal, fx: None, group: None },
+                PlanLayer { frame: base.clone(), matrix: Affine::translate(200.0, 40.0), opacity: 0.9, blend: Blend::Normal, fx: None, group: None },
                 PlanLayer {
                     frame: top.clone(),
                     matrix: Affine::motion(Vec2::new(170.0, 95.0), Vec2::new(1.1, 1.1), 17.0, Vec2::new(80.0, 60.0)),
                     opacity: 0.8,
                     blend: mode,
                     fx: None,
+                    group: None,
                 },
                 PlanLayer {
                     frame: demo.clone(),
@@ -177,6 +194,7 @@ fn gpu_blend_modes_match_cpu() {
                     opacity: 0.6,
                     blend: mode,
                     fx: None,
+                    group: None,
                 },
             ],
         };
@@ -197,7 +215,7 @@ fn gpu_blend_modes_match_cpu() {
         eprintln!("{mode:?}: interior 8-bit p99 {p99} mean {mean:.3} max {max}; linear p99 {fp99:.2e} max {fmax:.2e}; with edges p99 {ap99} mean {amean:.3}");
         assert!(p99 <= 6 && mean < 1.5, "{mode:?}: p99 {p99}, mean {mean}");
     }
-    assert!(c.backdrop.is_some(), "blend modes use the backdrop copy");
+    assert!(!c.backdrops.is_empty(), "blend modes use the backdrop copy");
 }
 
 /// Formula edge cases on exact (half-float representable) values, drawn 1:1 so no resampling is
@@ -235,8 +253,8 @@ fn gpu_blend_edge_cases_match_cpu() {
                 width: n,
                 height: n,
                 layers: vec![
-                    PlanLayer { frame: back.clone(), matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None },
-                    PlanLayer { frame: src.clone(), matrix: Affine::IDENTITY, opacity, blend: mode, fx: None },
+                    PlanLayer { frame: back.clone(), matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None, group: None },
+                    PlanLayer { frame: src.clone(), matrix: Affine::IDENTITY, opacity, blend: mode, fx: None, group: None },
                 ],
             };
             let cpu = execute_cpu(&plan);
@@ -276,8 +294,8 @@ fn gpu_dissolve_pattern_is_exact() {
             width: w,
             height: h,
             layers: vec![
-                PlanLayer { frame: red.clone(), matrix: Affine::scale(w as f64, h as f64), opacity: 1.0, blend: Blend::Normal, fx: None },
-                PlanLayer { frame: white.clone(), matrix: Affine::scale(w as f64, h as f64), opacity: op, blend: Blend::Dissolve, fx: None },
+                PlanLayer { frame: red.clone(), matrix: Affine::scale(w as f64, h as f64), opacity: 1.0, blend: Blend::Normal, fx: None, group: None },
+                PlanLayer { frame: white.clone(), matrix: Affine::scale(w as f64, h as f64), opacity: op, blend: Blend::Dissolve, fx: None, group: None },
             ],
         };
         let cpu = execute_cpu(&plan).over_black_rgba8();
@@ -290,7 +308,7 @@ fn gpu_dissolve_pattern_is_exact() {
         assert!((kept - op).abs() < 0.02);
     }
     // fixed-function only: no backdrop copy
-    assert!(c.backdrop.is_none());
+    assert!(c.backdrops.is_empty());
 }
 
 /// Normal-only plans keep the single fixed-function pass (no backdrop texture), and blend-mode
@@ -303,10 +321,10 @@ fn normal_fast_path_and_blend_layers_off_output() {
     };
     let mut c = GpuCompositor::new(&dev, &q);
     let grey = Arc::new(VideoFrame::rgba_f32(4, 4, vec![0.2; 64]));
-    let layer = |m: Affine, blend: Blend| PlanLayer { frame: grey.clone(), matrix: m, opacity: 1.0, blend, fx: None };
+    let layer = |m: Affine, blend: Blend| PlanLayer { frame: grey.clone(), matrix: m, opacity: 1.0, blend, fx: None, group: None };
     let normal = FramePlan::Layers { width: 32, height: 16, layers: vec![layer(Affine::scale(8.0, 4.0), Blend::Normal)] };
     c.composite(&normal);
-    assert!(c.backdrop.is_none());
+    assert!(c.backdrops.is_empty());
     let (_, _, before) = c.read_output().expect("readback");
     let off = FramePlan::Layers {
         width: 32,
@@ -329,10 +347,110 @@ fn normal_fast_path_and_blend_layers_off_output() {
 
 #[test]
 fn quad_bounds_clamps_and_handles_non_finite() {
-    let l = |m: Affine| PlanLayer { frame: Arc::new(VideoFrame::rgba_f32(10, 10, vec![0.0; 400])), matrix: m, opacity: 1.0, blend: Blend::Screen, fx: None };
+    let l = |m: Affine| PlanLayer {
+        frame: Arc::new(VideoFrame::rgba_f32(10, 10, vec![0.0; 400])),
+        matrix: m,
+        opacity: 1.0,
+        blend: Blend::Screen,
+        fx: None,
+        group: None,
+    };
     assert_eq!(quad_bounds(&l(Affine::translate(5.0, 5.0)), 100, 100), Some((4, 4, 12, 12)));
     assert_eq!(quad_bounds(&l(Affine::translate(-5.0, 95.0)), 100, 100), Some((0, 94, 6, 6)));
     assert_eq!(quad_bounds(&l(Affine::translate(f64::NAN, 0.0)), 100, 100), Some((0, 0, 100, 100)));
     assert_eq!(quad_bounds(&l(Affine::scale(f64::INFINITY, 1.0)), 100, 100), Some((0, 0, 100, 100)));
     assert_eq!(quad_bounds(&l(Affine::translate(-50.0, 0.0)), 100, 100), None);
+}
+
+/// Nested sequences drawn as groups — each group's layers composited into a texture of the
+/// group's size, then placed with its matrix, opacity and blend mode — match the CPU plan
+/// executor: a small nest blown up to fill the frame, a nest rotated, faded and blending Multiply
+/// over a background, a blend mode among a group's own layers, and a group inside a group.
+#[test]
+fn gpu_groups_match_cpu() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (320usize, 180usize);
+    let pixels = filmcraft_media::generators::render(
+        &filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::Dunes),
+        320,
+        180,
+        1.0,
+        24,
+        filmcraft_time::FrameRate::FPS_24,
+    );
+    let demo = Arc::new(VideoFrame::rgba8(320, 180, pixels));
+    let inner = PlanGroup {
+        width: 160,
+        height: 90,
+        layers: vec![
+            PlanLayer::new(yuv_frame(320, 180), Affine::scale(0.5, 0.5), 1.0, Blend::Normal),
+            PlanLayer::new(ramp_layer(80, 60, 1), Affine::translate(30.0, 10.0), 0.8, Blend::Screen),
+        ],
+    };
+    let deeper = PlanGroup {
+        width: 160,
+        height: 90,
+        layers: vec![
+            PlanLayer::new(demo.clone(), Affine::scale(0.5, 0.5), 1.0, Blend::Normal),
+            PlanLayer::group(inner.clone(), Affine::motion(Vec2::new(80.0, 45.0), Vec2::new(0.6, 0.6), 10.0, Vec2::new(80.0, 45.0)), 0.9, Blend::Normal),
+        ],
+    };
+    let cases: [(&str, Vec<PlanLayer>, usize); 4] = [
+        ("blown up to fill", vec![PlanLayer::group(inner.clone(), Affine::scale(2.0, 2.0), 1.0, Blend::Normal)], 1),
+        (
+            "rotated, faded, Multiply over a background",
+            vec![
+                PlanLayer::new(yuv_frame(640, 360), Affine::scale(0.5, 0.5), 1.0, Blend::Normal),
+                PlanLayer::group(
+                    inner.clone(),
+                    Affine::motion(Vec2::new(160.0, 90.0), Vec2::new(1.3, 1.3), -12.0, Vec2::new(80.0, 45.0)),
+                    0.7,
+                    Blend::Multiply,
+                ),
+            ],
+            1,
+        ),
+        (
+            "a group in a group",
+            vec![
+                PlanLayer::new(ramp_layer(320, 180, 2), Affine::IDENTITY, 1.0, Blend::Normal),
+                PlanLayer::group(deeper.clone(), Affine::scale(2.0, 2.0), 0.85, Blend::Screen),
+            ],
+            2,
+        ),
+        (
+            "two groups side by side",
+            vec![
+                PlanLayer::group(inner.clone(), Affine::IDENTITY, 1.0, Blend::Normal),
+                PlanLayer::group(deeper.clone(), Affine::translate(160.0, 90.0), 1.0, Blend::Normal),
+            ],
+            3,
+        ),
+    ];
+    for (what, layers, groups) in cases {
+        let plan = FramePlan::Layers { width: w, height: h, layers };
+        let cpu = execute_cpu(&plan).over_black_rgba8();
+        for pass in 0..2 {
+            c.composite(&plan);
+            let (_, _, gpu) = c.read_output().expect("readback");
+            let keep = interior(&plan);
+            let (p99, mean, max) = stats8(&cpu, &gpu, &keep);
+            eprintln!("{what} (pass {pass}): interior 8-bit p99 {p99} mean {mean:.3} max {max}");
+            assert!(p99 <= 6 && mean < 1.5, "{what}: p99 {p99}, mean {mean}");
+            assert_eq!(c.group_targets.len(), groups, "{what}: one group texture per group, reused");
+        }
+        // prepared off the thread: the same picture
+        let prep = prepare(&plan);
+        c.composite_prepared(&plan, Some(&prep));
+        let (_, _, gpu) = c.read_output().expect("readback");
+        let (p99, mean, _) = stats8(&cpu, &gpu, &interior(&plan));
+        assert!(p99 <= 6 && mean < 1.5, "{what} (prepared): p99 {p99}, mean {mean}");
+    }
+    // a frame without groups releases their textures
+    c.composite(&FramePlan::Layers { width: w, height: h, layers: vec![PlanLayer::new(demo, Affine::IDENTITY, 1.0, Blend::Normal)] });
+    assert!(c.group_targets.is_empty());
 }

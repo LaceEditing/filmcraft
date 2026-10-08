@@ -318,31 +318,43 @@ fn a_plain_nest_is_planned_as_its_own_layers_and_looks_the_same() {
     assert!(worst(&r.planned(outermost, t), &r.frame(outermost, t)) < 0.01);
 }
 
+/// Whether layer `i` of the plan of `seq` at `t` is a nested sequence's group (None: no such layer).
+fn is_group(r: &Rig, seq: ItemId, t: Tick, i: usize) -> Option<bool> {
+    match plan::plan_frame(&r.p, seq, t, RenderOptions::default(), &r.map) {
+        plan::FramePlan::Layers { layers, .. } => layers.get(i).map(|l| l.group.is_some()),
+        _ => None,
+    }
+}
+
 #[test]
 fn a_nest_that_is_not_plain_is_still_drawn_right() {
     let t = FrameRate::FPS_24.tick_of(20);
-    // each of these keeps the nest one layer (rendered on the CPU), and the plan matches the reference
-    let cases: [(&str, fn(&mut Rig, ItemId, ItemId, ClipId)); 5] = [
-        ("half-transparent nest", |r, _, outer, nest| {
+    // each of these keeps the nest one layer — its layers composited as a group by the GPU, or
+    // (with a standard effect on the nest) rendered on the CPU — and the plan matches the reference
+    let cases: [(&str, bool, fn(&mut Rig, ItemId, ItemId, ClipId)); 6] = [
+        ("half-transparent nest", true, |r, _, outer, nest| {
             r.clip(outer, nest).effect_mut("opacity").unwrap().params.get_mut("opacity").unwrap().value = ParamValue::Float(50.0);
         }),
-        ("moved nest", |r, _, outer, nest| {
+        ("moved nest", true, |r, _, outer, nest| {
             r.clip(outer, nest).effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(60.0);
         }),
-        ("nest with an effect", |r, _, outer, nest| {
+        ("nest with an effect", false, |r, _, outer, nest| {
             let mut crop = filmcraft_project::effect::find_effect("crop").unwrap().instance();
             crop.params.get_mut("left").unwrap().value = ParamValue::Float(30.0);
             r.clip(outer, nest).effects.push(crop);
         }),
-        ("a blend mode inside the nest", |r, inner, _, _| {
+        ("a blend mode inside the nest", true, |r, inner, _, _| {
             let top = &mut r.p.sequence_mut(inner).unwrap().video_tracks[1].items[0];
             top.effect_mut("opacity").unwrap().params.get_mut("blend").unwrap().value = ParamValue::Choice(3);
         }),
-        ("a nest of another size", |r, inner, _, _| {
+        ("a nest of another size", true, |r, inner, _, _| {
             r.p.sequence_mut(inner).unwrap().settings.width /= 2;
         }),
+        ("a nest blending Screen", true, |r, _, outer, nest| {
+            r.clip(outer, nest).effect_mut("opacity").unwrap().params.get_mut("blend").unwrap().value = ParamValue::Choice(8);
+        }),
     ];
-    for (what, change) in cases {
+    for (what, group, change) in cases {
         let mut r = Rig::new();
         let (inner, outer, nest) = two_layer_nest(&mut r);
         // under the nest, so that blending the nest as a whole or layer by layer would differ
@@ -355,8 +367,56 @@ fn a_nest_that_is_not_plain_is_still_drawn_right() {
         s.video_tracks[0].items.push(below);
         s.video_tracks[1].items.push(nest_clip);
         change(&mut r, inner, outer, nest);
-        assert_eq!(layer_count(&r, outer, t), Some(2), "{what}: the matte and one image of the nest");
+        assert_eq!(layer_count(&r, outer, t), Some(2), "{what}: the matte and one picture of the nest");
+        assert_eq!(is_group(&r, outer, t, 1), Some(group), "{what}: drawn as a group on the GPU: {group}");
         let w = worst(&r.planned(outer, t), &r.frame(outer, t));
         assert!(w < 0.01, "{what}: plan and reference differ by {w}");
     }
+}
+
+/// A 4K sequence holding a 4K nest whose clip is a smaller picture centred at 100 %, the nest
+/// scaled 150 % to fill the frame (as an upscaled 1440p recording is edited in Premiere). The
+/// nest was rendered whole on the CPU for every frame — some 55 ms at 4K, so playback stuttered.
+/// Now its clip is a layer of a group the GPU composites, and the picture is the same, at full
+/// and at reduced playback resolution.
+#[test]
+fn an_upscaled_nest_is_composited_by_the_gpu() {
+    let mut r = Rig::new();
+    let ocean = r.add(GeneratorSource::demo(DemoScene::OceanSunset));
+    let (w, h) = {
+        let v = r.map.0[&ocean].info().video.clone().unwrap();
+        (v.width, v.height)
+    };
+    // the frame is 1.5 × the recording, like 3840×2160 around 2560×1440
+    let (fw, fh) = (w * 3 / 2, h * 3 / 2);
+    let inner = r.seq("Nested Sequence 01", fw, fh, FrameRate::FPS_24);
+    r.put(inner, ocean, 96);
+    let main = r.seq("Main", fw, fh, FrameRate::FPS_24);
+    let nest = r.put(main, inner, 96);
+    r.clip(main, nest).effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(150.0);
+    let t = FrameRate::FPS_24.tick_of(20);
+    let plan = plan::plan_frame(&r.p, main, t, RenderOptions::default(), &r.map);
+    let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("planned as a CPU image") };
+    let g = layers.first().and_then(|l| l.group.clone()).expect("the nest is a group");
+    assert_eq!((g.width, g.height, g.layers.len()), (fw as usize, fh as usize, 1), "the nest's canvas at full size, holding the recording");
+    assert!(
+        g.layers.iter().all(|l| l.group.is_none() && !matches!(l.frame.data, filmcraft_frame::PixelData::RgbaF32(_))),
+        "the recording is a decoded frame, not a CPU render"
+    );
+    let reference = r.frame(main, t);
+    assert!(worst(&plan::execute_cpu(&plan), &reference) < 0.01);
+    // the recording fills the frame
+    assert!(reference.get(2, 2)[3] > 0.99 && reference.get(reference.w - 3, reference.h - 3)[3] > 0.99);
+    // ½ resolution playback: the same picture at half size
+    let half = RenderOptions { scale: 0.5, ..Default::default() };
+    let planned = plan::execute_cpu(&plan::plan_frame(&r.p, main, t, half, &r.map));
+    let w = worst(&planned, &render_sequence(&r.p, main, t, half, &r.map));
+    assert!(w < 0.01, "½: plan and reference differ by {w}");
+    // shrunk to 40 %, the nest's canvas is only as large as it is drawn
+    r.clip(main, nest).effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(40.0);
+    let plan = plan::plan_frame(&r.p, main, t, RenderOptions::default(), &r.map);
+    let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("planned as a CPU image") };
+    let g = layers.first().and_then(|l| l.group.clone()).expect("the nest is a group");
+    assert_eq!((g.width, g.height), (output_size(r.p.sequence(inner).unwrap(), 0.4)), "at 40 %");
+    assert!(worst(&plan::execute_cpu(&plan), &r.frame(main, t)) < 0.01);
 }

@@ -395,6 +395,7 @@ fn gpu_effect_layers_match_cpu_plan() {
                     opacity: 1.0,
                     blend: Blend::Normal,
                     fx: Some(Arc::new(LayerFx { size: (320, 180), decimation: 2, ops: ops(&chain_c, 320, 180, 0.5) })),
+                    group: None,
                 },
                 PlanLayer {
                     frame: ramp.clone(),
@@ -402,6 +403,7 @@ fn gpu_effect_layers_match_cpu_plan() {
                     opacity: 0.8,
                     blend: mode,
                     fx: Some(Arc::new(LayerFx { size: (160, 120), decimation: 1, ops: ops(&chain_a, 160, 120, 1.0) })),
+                    group: None,
                 },
                 PlanLayer::new(ramp.clone(), Affine::translate(10.0, 20.0), 0.5, Blend::Normal),
                 PlanLayer {
@@ -410,6 +412,7 @@ fn gpu_effect_layers_match_cpu_plan() {
                     opacity: 0.7,
                     blend: mode,
                     fx: Some(Arc::new(LayerFx { size: (320, 180), decimation: 1, ops: ops(&chain_b, 320, 180, 1.0) })),
+                    group: None,
                 },
             ],
         };
@@ -422,6 +425,49 @@ fn gpu_effect_layers_match_cpu_plan() {
         eprintln!("{mode:?}: interior 8-bit p99 {p99} mean {mean:.3} max {max}; with edges p99 {ap99} mean {amean:.3}");
         assert!(p99 <= 6 && mean < 1.5, "{mode:?}: p99 {p99}, mean {mean}");
     }
+}
+
+/// Effects inside a nested group and on a layer of the plan around it, with working images of
+/// the same size (so they share the stage's pooled textures): the group is composited before the
+/// layers around it are drawn, and each job still runs right before its own layer.
+#[test]
+fn gpu_effects_inside_groups_match_cpu() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (320usize, 180usize);
+    let ops = |list: &[EffectInstance]| -> Vec<FxOp> { list.iter().filter_map(|e| FxOp::eval(e, &cx(Tick::ZERO, 1.0), 160, 120)).collect() };
+    let warm = [effect("tint", &[("amount", fl(60.0))]), effect("gaussian_blur", &[("blurriness", fl(4.0))])];
+    let cool = [effect("color_balance", &[("hi_b", fl(80.0)), ("shadow_r", fl(-40.0))]), effect("unsharp_mask", &[("amount", fl(90.0)), ("radius", fl(1.5))])];
+    let with = |frame: Arc<VideoFrame>, m: Affine, chain: &[EffectInstance]| PlanLayer {
+        fx: Some(Arc::new(LayerFx { size: (160, 120), decimation: 1, ops: ops(chain) })),
+        ..PlanLayer::new(frame, m, 1.0, Blend::Normal)
+    };
+    let group = filmcraft_render::plan::PlanGroup {
+        width: 160,
+        height: 120,
+        layers: vec![
+            with(ramp_layer(160, 120, 3), Affine::IDENTITY, &cool),
+            PlanLayer::new(yuv_frame(80, 60), Affine::translate(40.0, 30.0), 0.6, Blend::Normal),
+        ],
+    };
+    let plan = FramePlan::Layers {
+        width: w,
+        height: h,
+        layers: vec![
+            with(yuv_frame(160, 120), Affine::scale(2.0, 1.5), &warm),
+            PlanLayer::group(group, Affine::motion(Vec2::new(200.0, 90.0), Vec2::new(0.9, 0.9), 8.0, Vec2::new(80.0, 60.0)), 0.85, Blend::Screen),
+            with(ramp_layer(160, 120, 1), Affine::translate(10.0, 30.0), &warm),
+        ],
+    };
+    let cpu = execute_cpu(&plan).over_black_rgba8();
+    c.composite(&plan);
+    let (_, _, gpu) = c.read_output().expect("readback");
+    let (p99, mean, max) = stats8(&cpu, &gpu, &interior(&plan));
+    eprintln!("effects in a group: interior 8-bit p99 {p99} mean {mean:.3} max {max}");
+    assert!(p99 <= 6 && mean < 1.5, "p99 {p99}, mean {mean}");
 }
 
 /// Plans without effects never create working textures.
