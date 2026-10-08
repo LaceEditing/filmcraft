@@ -829,47 +829,67 @@ impl<'a, 'i> Writer<'a, 'i> {
                 }
                 let t = prproj_fx::encode(m.node, pr.as_ref(), &fc, &ctx);
                 let pi = self.inst_of(m.node, copies);
-                if let Some(sk) = child(m.node, "StartKeyframe") {
-                    self.set_text(pi, sk, &t.start_keyframe);
-                } else {
-                    self.insert(pi, m.node, &format!("<StartKeyframe>{}</StartKeyframe>", escape(&t.start_keyframe)));
-                }
-                match (&t.keyframes, child(m.node, "Keyframes")) {
-                    (Some(k), Some(n)) => self.set_text(pi, n, k),
-                    (Some(k), None) => self.insert(pi, m.node, &format!("<Keyframes>{}</Keyframes>", escape(k))),
-                    (None, Some(n)) => self.remove(pi, n),
-                    (None, None) => {}
-                }
-                let varying = if t.keyframes.is_some() { "true" } else { "false" };
-                match child(m.node, "IsTimeVarying") {
-                    Some(n) => self.set_text(pi, n, varying),
-                    None if t.keyframes.is_some() => self.insert(pi, m.node, "<IsTimeVarying>true</IsTimeVarying>"),
-                    None => {}
-                }
-                if let Some(n) = child(m.node, "CurrentValue") {
-                    self.set_text(pi, n, &t.current);
-                }
+                self.write_param(pi, m.node, &t);
             }
         }
-        // FilmCraft effects with no Premiere component yet
+        // effects added in FilmCraft: a copy of a component of the same effect elsewhere in the
+        // project (Premiere's own component layout), with FilmCraft's values
         let mut have: HashMap<&str, usize> = HashMap::new();
         for comp in &comps {
             if let Target::Effect(d) = comp.target() {
                 *have.entry(d.id).or_insert(0) += 1;
             }
         }
+        let mut next_component_id = comps
+            .iter()
+            .filter_map(|c| path_text(c.node, &["Component", "ID"]).or_else(|| path_text(c.node, &["AudioComponent", "Component", "ID"])))
+            .filter_map(parse_i64)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut added_refs: Vec<String> = Vec::new();
         let mut seen: HashMap<&str, usize> = HashMap::new();
         for e in &c.effects {
-            if filmcraft_project::find_effect(&e.effect).is_none_or(|d| d.intrinsic) {
-                continue;
-            }
+            let Some(def) = filmcraft_project::find_effect(&e.effect).filter(|d| !d.intrinsic) else { continue };
             let n = seen.entry(e.effect.as_str()).or_insert(0);
             *n += 1;
-            if *n > have.get(e.effect.as_str()).copied().unwrap_or(0) {
-                self.report.warn(format!("effect \"{}\" added in FilmCraft is not written to Premiere projects yet", e.effect));
+            if *n <= have.get(e.effect.as_str()).copied().unwrap_or(0) {
+                continue;
             }
+            let Some(model) = self.model_component(def, kind) else {
+                self.report.warn(format!(
+                    "effect \"{}\" added in FilmCraft was not written: the Premiere project has no {} to model it on (apply it once in Premiere)",
+                    def.name, def.name
+                ));
+                continue;
+            };
+            let model_copies = self.clone_owned(model.node, &[]);
+            let ci = self.inst_of(model.node, &model_copies);
+            if let Some(idn) = self.ix.at(model.node, &["Component", "ID"]).or_else(|| self.ix.at(model.node, &["AudioComponent", "Component", "ID"])) {
+                self.set_text(ci, idn, &next_component_id.to_string());
+            }
+            next_component_id += 1;
+            let (maps, _) = prproj_fx::mappings(&model, Target::Effect(def));
+            for m in maps {
+                let fc_param = e
+                    .params
+                    .get(m.param)
+                    .cloned()
+                    .or_else(|| def.params.iter().find(|p| p.id == m.param).map(|p| filmcraft_project::Param::new(p.default.clone())));
+                let Some(fc_param) = fc_param else { continue };
+                let Some(fc) = prproj_fx::from_param(&fc_param, m.conv, &ctx) else { continue };
+                let pr = prproj_fx::decode(m.node, m.conv);
+                if pr.as_ref().is_some_and(|pr| prproj_fx::same(pr, &fc, &ctx)) {
+                    continue;
+                }
+                let t = prproj_fx::encode(m.node, pr.as_ref(), &fc, &ctx);
+                let pi = self.inst_of(m.node, &model_copies);
+                self.write_param(pi, m.node, &t);
+            }
+            added_refs.push(self.id_of(ci));
+            self.report.info(format!("added \"{}\" to a clip (modelled on another one in the project)", def.name));
         }
-        if keep_refs.iter().any(|k| !k)
+        if (keep_refs.iter().any(|k| !k) || !added_refs.is_empty())
             && let Some(list) = self.ix.at(chain, &["ComponentChain", "Components"])
         {
             let mut refs = String::new();
@@ -887,8 +907,47 @@ impl<'a, 'i> Writer<'a, 'i> {
                 refs.push_str(&format!("<Component Index=\"{i}\" ObjectRef=\"{target}\" />"));
                 i += 1;
             }
+            for id in &added_refs {
+                refs.push_str(&format!("<Component Index=\"{i}\" ObjectRef=\"{id}\" />"));
+                i += 1;
+            }
             self.set_list(chain_inst, list, &refs);
         }
+    }
+
+    /// Write a parameter's new text (`StartKeyframe`, `Keyframes`, `IsTimeVarying`, `CurrentValue`).
+    fn write_param(&mut self, pi: usize, node: Node<'a, 'i>, t: &prproj_fx::ParamText) {
+        if let Some(sk) = child(node, "StartKeyframe") {
+            self.set_text(pi, sk, &t.start_keyframe);
+        } else {
+            self.insert(pi, node, &format!("<StartKeyframe>{}</StartKeyframe>", escape(&t.start_keyframe)));
+        }
+        match (&t.keyframes, child(node, "Keyframes")) {
+            (Some(k), Some(n)) => self.set_text(pi, n, k),
+            (Some(k), None) => self.insert(pi, node, &format!("<Keyframes>{}</Keyframes>", escape(k))),
+            (None, Some(n)) => self.remove(pi, n),
+            (None, None) => {}
+        }
+        let varying = if t.keyframes.is_some() { "true" } else { "false" };
+        match child(node, "IsTimeVarying") {
+            Some(n) => self.set_text(pi, n, varying),
+            None if t.keyframes.is_some() => self.insert(pi, node, "<IsTimeVarying>true</IsTimeVarying>"),
+            None => {}
+        }
+        if let Some(n) = child(node, "CurrentValue") {
+            self.set_text(pi, n, &t.current);
+        }
+    }
+
+    /// A component of effect `def` on any clip of this kind in the project, to copy for a clip
+    /// that gets the effect in FilmCraft.
+    fn model_component(&self, def: &'static filmcraft_project::effect::EffectDef, kind: TrackKind) -> Option<prproj_fx::Component<'a, 'i>> {
+        let tag = if kind == TrackKind::Video { "VideoFilterComponent" } else { "AudioFilterComponent" };
+        self.root
+            .children()
+            .filter(|n| n.has_tag_name(tag))
+            .filter_map(|n| prproj_fx::component(&self.ix, n))
+            .find(|c| matches!(c.target(), Target::Effect(d) if d.id == def.id))
     }
 
     // -----------------------------------------------------------------------------------------

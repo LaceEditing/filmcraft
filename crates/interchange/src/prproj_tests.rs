@@ -86,8 +86,12 @@ pub(crate) fn doc() -> String {
   </ClipTrackItem></VideoClipTrackItem>
   <SubClip ObjectID="51"><Clip ObjectRef="52"/><Name>backwards</Name></SubClip>
   <VideoClip ObjectID="52"><Clip><Source ObjectRef="11"/><InPoint>{s20}</InPoint><OutPoint>{s24}</OutPoint><PlaybackSpeed>-2</PlaybackSpeed></Clip></VideoClip>
-  <VideoComponentChain ObjectID="53"><ComponentChain><Components><Component Index="0" ObjectRef="54"/><Component Index="1" ObjectRef="56"/></Components></ComponentChain></VideoComponentChain>
-  <VideoFilterComponent ObjectID="56"><Component><Params><Param Index="0" ObjectRef="57"/><Param Index="1" ObjectRef="58"/><Param Index="2" ObjectRef="59"/></Params><DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName></VideoFilterComponent>
+  <VideoComponentChain ObjectID="53"><ComponentChain><Components><Component Index="0" ObjectRef="54"/><Component Index="1" ObjectRef="56"/><Component Index="2" ObjectRef="100"/></Components></ComponentChain></VideoComponentChain>
+  <VideoFilterComponent ObjectID="100"><Component><Params><Param Index="0" ObjectRef="101"/><Param Index="1" ObjectRef="102"/><Param Index="2" ObjectRef="103"/></Params><ID>3</ID><DisplayName>Tint</DisplayName></Component><MatchName>AE.ADBE Tint</MatchName></VideoFilterComponent>
+  <VideoComponentParam ObjectID="101"><Name>Map Black To</Name><StartKeyframe>-91445760000000000,18374686479671623680,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="102"><Name>Map White To</Name><StartKeyframe>-91445760000000000,18374966857753992192,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="103"><Name>Amount to Tint</Name><StartKeyframe>-91445760000000000,100.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoFilterComponent ObjectID="56"><Component><Params><Param Index="0" ObjectRef="57"/><Param Index="1" ObjectRef="58"/><Param Index="2" ObjectRef="59"/></Params><ID>2</ID><DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName></VideoFilterComponent>
   <VideoComponentParam ObjectID="57"><Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>{s20},0,5,0,0,0.33333333333333331,0,0.33333333333333331;{s22},40,5,2,0,0.25,0,0.5;</Keyframes></VideoComponentParam>
   <VideoComponentParam ObjectID="58"><Name>Blur Dimensions</Name><StartKeyframe>-91445760000000000,1,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoComponentParam ObjectID="59"><Name>Repeat Edge Pixels</Name><StartKeyframe>-91445760000000000,true,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
@@ -229,7 +233,15 @@ fn imports_bins_media_sequences_clips_and_effects() {
     assert_eq!((keys[0].interp, keys[1].interp), (Interpolation::Bezier, Interpolation::AutoBezier));
     assert_eq!((keys[1].in_influence, keys[1].out_influence), (0.25, 0.5));
     assert_eq!(blur.params["repeat_edge"].value, ParamValue::Bool(true));
-    assert!(report.mentions("Blur Dimensions"), "{report}");
+    assert_eq!(blur.params["dimensions"].value, ParamValue::Choice(1), "0-based popup index");
+    assert!(!report.mentions("Blur Dimensions"), "{report}");
+    let tint = b.effect("tint").expect("Tint imported");
+    assert_eq!(tint.params["black"].value, ParamValue::Color([0.0, 0.0, 0.0, 1.0]));
+    let white = tint.params["white"].value.as_color().unwrap();
+    assert!(
+        (white[0] - 1.0).abs() < 1e-6 && (white[1] - 156.0 / 255.0).abs() < 1e-6 && (white[2] - 156.0 / 255.0).abs() < 1e-6 && (white[3] - 1.0).abs() < 1e-6,
+        "{white:?}"
+    );
 
     // round-trip bookkeeping: origins and Premiere ids
     assert_eq!((a.origin.as_deref(), b.origin.as_deref(), a1.origin.as_deref()), (Some("40"), Some("50"), Some("70")));

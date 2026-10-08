@@ -350,3 +350,44 @@ fn the_first_marker_of_a_sequence_creates_its_marker_list() {
     let seq = back.sequences().next().and_then(|i| i.as_sequence()).unwrap();
     assert_eq!(seq.markers.iter().map(|m| (m.start.0, m.name.as_str())).collect::<Vec<_>>(), vec![(4 * S, "First")], "{report}");
 }
+
+#[test]
+fn effects_choices_and_colours_added_in_filmcraft_are_written() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let seq = p.sequence_mut(sid).unwrap();
+        let v1 = &mut seq.video_tracks[0];
+        // clip 1 gets a Gaussian Blur (vertical only) and a Tint, modelled on clip 2's
+        let a = &mut v1.items[0];
+        let mut blur = filmcraft_project::find_effect("gaussian_blur").unwrap().instance();
+        blur.params.insert("blurriness".into(), Param::new(ParamValue::Float(25.0)));
+        blur.params.insert("dimensions".into(), Param::new(ParamValue::Choice(2)));
+        let mut tint = filmcraft_project::find_effect("tint").unwrap().instance();
+        tint.params.insert("white".into(), Param::new(ParamValue::Color([1.0, 0.5, 0.0, 1.0])));
+        tint.params.insert("amount".into(), Param::new(ParamValue::Float(40.0)));
+        a.effects.push(blur);
+        a.effects.push(tint);
+        // clip 2's blur switches to horizontal
+        let b = &mut v1.items[1];
+        b.effect_mut("gaussian_blur").unwrap().params.insert("dimensions".into(), Param::new(ParamValue::Choice(1)));
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert!(report.mentions("added \"Gaussian Blur\"") && report.mentions("added \"Tint\""), "{report}");
+    let back = read(&out);
+    let seq = back.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    let (a, b) = (&seq.video_tracks[0].items[0], &seq.video_tracks[0].items[1]);
+    let blur = a.effect("gaussian_blur").expect("blur written");
+    assert_eq!(blur.params["blurriness"].value, ParamValue::Float(25.0));
+    assert_eq!(blur.params["dimensions"].value, ParamValue::Choice(2));
+    let tint = a.effect("tint").expect("tint written");
+    let w = tint.params["white"].value.as_color().unwrap();
+    assert!((w[0] - 1.0).abs() < 1e-6 && (w[1] - 0.5).abs() < 0.01 && w[2].abs() < 1e-6, "{w:?}");
+    assert_eq!(tint.params["amount"].value, ParamValue::Float(40.0));
+    assert_eq!(b.effect("gaussian_blur").unwrap().params["dimensions"].value, ParamValue::Choice(1));
+    // the model clip keeps its own values
+    assert_eq!(b.effect("tint").unwrap().params["amount"].value, ParamValue::Float(100.0));
+    assert_eq!(a.effects.iter().filter(|e| !filmcraft_project::find_effect(&e.effect).is_some_and(|d| d.intrinsic)).count(), 2, "{report}");
+}

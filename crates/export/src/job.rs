@@ -123,11 +123,13 @@ impl Exporter {
         let pipe = Pipeline::new(project.clone(), seq, &settings, hdr_out)?;
         let (f0, f1) = frame_span(pipe.rate, range);
         let nframes = (f1 - f0) as u64;
+        let venc = make_venc(&settings, pipe.w, pipe.h, pipe.rate)?;
+        // an encoder with its own analysis pass encodes once
+        let two_pass = two_pass && !venc.two_pass_internal();
         if !settings.part_of_batch {
             progress.total.store(nframes * if two_pass { 2 } else { 1 }, Ordering::Relaxed);
             progress.set_status(format!("Exporting {} frames ({})", nframes, settings.format.label()));
         }
-        let venc = make_venc(&settings, pipe.w, pipe.h, pipe.rate)?;
         let brand = if settings.format == Format::H264 && settings.multiplexer == Multiplexer::Mp4 { Brand::Mp4 } else { Brand::Mov };
         let audio = if settings.has_audio() { Some(AudioOut::new(project.clone(), seq, &settings, range)?) } else { None };
         let aenc: Option<Box<dyn AudioEncoder>> = match (&audio, settings.audio_codec()) {
@@ -297,6 +299,7 @@ impl Exporter {
         if self.next < self.f1 {
             let (f, end) = (self.next, (self.next + self.batch).min(self.f1));
             let pipe = &self.pipe;
+            crate::prefetch::warm(&self.project, self.seq, pipe.rate, f, end, sources);
             let frames: Vec<(Vec<u8>, Vec<f32>)> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources)).collect();
             if self.first_pass {
                 if filmcraft_media::pending::take() {

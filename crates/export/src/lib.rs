@@ -20,6 +20,7 @@ mod job;
 mod mxf_out;
 mod pcm;
 mod pipeline;
+pub mod prefetch;
 pub mod presets;
 pub mod settings;
 pub use audio_out::LoudnessReport;
@@ -527,6 +528,11 @@ pub trait VideoEncoder: Send {
     /// First-pass statistics of a two-pass encode (H.264).
     fn pass_stats(&self) -> Option<filmcraft_h264enc::PassStats> {
         None
+    }
+    /// The encoder runs its own analysis pass (hardware encoders): a two-pass export encodes
+    /// once, without an analysis pass driven by the exporter.
+    fn two_pass_internal(&self) -> bool {
+        false
     }
 }
 
@@ -1196,6 +1202,7 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
                     return Err(ExportError::Cancelled);
                 }
                 let end = (f + batch).min(f1);
+                prefetch::warm(project, seq, pipe.rate, f, end, sources);
                 if let Some(enc) = gif.as_mut() {
                     let frames: Vec<Vec<u8>> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources).0).collect();
                     for rgba in frames {

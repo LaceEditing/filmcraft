@@ -30,6 +30,7 @@ const MAX_KEYS: usize = 100_000;
 
 /// One component of a clip's component chain.
 pub(crate) struct Component<'a, 'i> {
+    pub node: Node<'a, 'i>,
     pub match_name: &'a str,
     pub display: Option<&'a str>,
     pub audio: bool,
@@ -45,7 +46,7 @@ pub(crate) fn component<'a, 'i>(ix: &Index<'a, 'i>, node: Node<'a, 'i>) -> Optio
     let body = body?;
     let match_name = child_text(node, "MatchName").or_else(|| child_text(node, "FilterMatchName")).unwrap_or("");
     let params = ix.list(body, &["Params"], "Param");
-    Some(Component { match_name, display: display.filter(|d| !d.trim().is_empty()), audio, params })
+    Some(Component { node, match_name, display: display.filter(|d| !d.trim().is_empty()), audio, params })
 }
 
 /// The chain's components, in order.
@@ -121,6 +122,12 @@ pub(crate) enum Conv {
     FramePoint,
     /// `x:y` normalised to the source frame ↔ pixels.
     SourcePoint,
+    /// A popup's 0-based index (observed: Blur Dimensions 0 = Horizontal and Vertical, Ultra Key
+    /// Setting 3 = Custom); the list length bounds it.
+    Choice(usize),
+    /// A colour as one integer: four 16-bit channels A, R, G, B, high byte first (observed:
+    /// `0xff00_4800_e000_0000` is Ultra Key's default green, `0xff00_0000_0000_0000` black).
+    Color,
 }
 
 /// One Premiere parameter mapped onto a FilmCraft parameter.
@@ -185,6 +192,10 @@ pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Ma
                     ParamKind::Float { .. } | ParamKind::Angle => Conv::Float,
                     ParamKind::Bool => Conv::Bool,
                     ParamKind::Point => Conv::SourcePoint,
+                    // blend-mode popups use an enumeration of Premiere's own (0 and 18 are both
+                    // common defaults in saved projects); every other popup is a 0-based index
+                    ParamKind::Choice(list) if !name.eq_ignore_ascii_case("Blend Mode") => Conv::Choice(list.len()),
+                    ParamKind::Color => Conv::Color,
                     _ => {
                         unmapped.push(name.to_string());
                         continue;
@@ -213,6 +224,8 @@ pub(crate) enum Val {
     /// Normalised point.
     P(f64, f64),
     B(bool),
+    /// Packed A, R, G, B, 16 bits each.
+    C(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -273,7 +286,27 @@ fn parse_val(s: &str, conv: Conv) -> Option<Val> {
             let (x, y) = (x.trim().parse::<f64>().ok()?, y.trim().parse::<f64>().ok()?);
             (x.is_finite() && y.is_finite()).then_some(Val::P(x, y))
         }
+        Conv::Choice(len) => {
+            let n = s.trim_end_matches('.').parse::<i64>().ok()?;
+            (n >= 0 && (n as usize) < len).then_some(Val::F(n as f64))
+        }
+        Conv::Color => s.parse::<u64>().ok().map(Val::C),
     }
+}
+
+/// Packed Premiere colour → RGBA 0..1. A channel whose low byte is clear is an 8-bit value in the
+/// high byte (`0xff00` = 1.0); anything else is read as 16-bit.
+fn unpack_color(c: u64) -> [f32; 4] {
+    let ch = |shift: u32| {
+        let field = ((c >> shift) & 0xFFFF) as u32;
+        if field & 0xFF == 0 { (field >> 8) as f32 / 255.0 } else { field as f32 / 65535.0 }
+    };
+    [ch(32), ch(16), ch(0), ch(48)]
+}
+
+fn pack_color(rgba: [f32; 4]) -> u64 {
+    let ch = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u64) << 8;
+    (ch(rgba[3]) << 48) | (ch(rgba[0]) << 32) | (ch(rgba[1]) << 16) | ch(rgba[2])
 }
 
 /// The value field of a parameter's `StartKeyframe`.
@@ -329,6 +362,8 @@ fn kind_of(i: Interpolation) -> (u8, u8) {
 fn to_value(v: &Val, conv: Conv, ctx: &Ctx) -> ParamValue {
     match (v, conv) {
         (Val::F(x), Conv::Db) => ParamValue::Float(if *x > 0.0 { (20.0 * (x / UNITY_LEVEL).log10()).max(-200.0) } else { -200.0 }),
+        (Val::F(x), Conv::Choice(_)) => ParamValue::Choice(x.round().max(0.0) as u32),
+        (Val::C(c), _) => ParamValue::Color(unpack_color(*c)),
         (Val::F(x), _) => ParamValue::Float(*x),
         (Val::B(b), _) => ParamValue::Bool(*b),
         (Val::P(x, y), Conv::FramePoint) => ParamValue::Vec2(Vec2::new(x * ctx.frame.0, y * ctx.frame.1)),
@@ -341,6 +376,8 @@ fn from_value(v: &ParamValue, conv: Conv, ctx: &Ctx) -> Option<Val> {
     Some(match (v, conv) {
         (ParamValue::Float(db), Conv::Db) => Val::F(UNITY_LEVEL * 10f64.powf(db / 20.0)),
         (ParamValue::Float(x), Conv::Float) => Val::F(*x),
+        (ParamValue::Choice(n), Conv::Choice(len)) if (*n as usize) < len => Val::F(*n as f64),
+        (ParamValue::Color(c), Conv::Color) => Val::C(pack_color(*c)),
         (ParamValue::Bool(b), Conv::Bool) => Val::B(*b),
         (ParamValue::Vec2(p), Conv::FramePoint) => Val::P(norm(p.x, ctx.frame.0), norm(p.y, ctx.frame.1)),
         (ParamValue::Vec2(p), Conv::SourcePoint) => Val::P(norm(p.x, ctx.src.0), norm(p.y, ctx.src.1)),
@@ -397,6 +434,7 @@ fn same_val(a: &Val, b: &Val) -> bool {
         (Val::F(x), Val::F(y)) => close(*x, *y),
         (Val::P(x1, y1), Val::P(x2, y2)) => close(*x1, *x2) && close(*y1, *y2),
         (Val::B(x), Val::B(y)) => x == y,
+        (Val::C(x), Val::C(y)) => x == y,
         _ => false,
     }
 }
@@ -441,6 +479,7 @@ fn fmt_val(v: &Val) -> String {
         Val::F(x) => num(*x),
         Val::P(x, y) => format!("{}:{}", num(*x), num(*y)),
         Val::B(b) => if *b { "true" } else { "false" }.to_string(),
+        Val::C(c) => c.to_string(),
     }
 }
 

@@ -23,11 +23,37 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod hybrid;
+#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+mod nvidia;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub mod videotoolbox;
 
 pub use hybrid::HybridDecoder;
+
+/// Whether exports may use a hardware H.264 encoder (NVENC on Linux); on by default.
+pub fn hardware_encoding() -> bool {
+    #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+    {
+        nvidia::nvenc::hardware_encoding()
+    }
+    #[cfg(not(all(target_os = "linux", not(target_arch = "wasm32"))))]
+    {
+        false
+    }
+}
+
+/// Turn hardware H.264 encoding for exports on or off (no effect where there is none).
+pub fn set_hardware_encoding(on: bool) {
+    #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+    {
+        nvidia::nvenc::set_hardware_encoding(on)
+    }
+    #[cfg(not(all(target_os = "linux", not(target_arch = "wasm32"))))]
+    {
+        let _ = on;
+    }
+}
 
 /// What [`register`] made available.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +73,21 @@ pub fn register() -> Availability {
         filmcraft_codecs::register_video_decoder(videotoolbox_factory);
         Availability::Available("VideoToolbox")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+    {
+        match nvidia::available() {
+            Ok(_) => {
+                filmcraft_codecs::register_video_decoder(nvidia::nvdec_factory);
+                filmcraft_export::register_encoder(nvidia::nvenc::nvenc_factory);
+                Availability::Available("NVDEC")
+            }
+            Err(why) => {
+                log::info!("no hardware video decoder: {why}");
+                Availability::Unavailable("no NVIDIA GPU with NVDEC (the NVIDIA driver is not installed or no GPU was found)")
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", not(target_arch = "wasm32")))))]
     {
         Availability::Unavailable("no hardware video decoder for this system yet")
     }
@@ -59,7 +99,11 @@ pub fn registered() -> bool {
     {
         filmcraft_codecs::video_decoder_registered(videotoolbox_factory)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+    {
+        filmcraft_codecs::video_decoder_registered(nvidia::nvdec_factory)
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", not(target_arch = "wasm32")))))]
     {
         false
     }
@@ -72,7 +116,11 @@ pub fn hardware_decoder_for(entry: &filmcraft_isobmff::SampleEntry) -> bool {
     {
         filmcraft_codecs::hw::NalStreamInfo::from_entry(entry).and_then(|r| r.ok()).is_some_and(|info| videotoolbox::VtDecoder::new(info).is_ok())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+    {
+        nvidia::decodes(entry)
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", not(target_arch = "wasm32")))))]
     {
         let _ = entry;
         false

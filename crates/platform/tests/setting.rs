@@ -36,7 +36,7 @@ fn off_uses_the_software_decoder() {
         assert_eq!(d.name(), "FilmCraft HEVC");
         return;
     }
-    assert_eq!(d.name(), "VideoToolbox HEVC");
+    assert!(matches!(d.name(), "VideoToolbox HEVC" | "NVDEC HEVC"), "{}", d.name());
     let h1 = filmcraft_codecs::hw::hw_stats();
     let src = filmcraft_codecs::open_bytes("hevc_main.mp4", bytes).unwrap();
     for i in 0..30 {

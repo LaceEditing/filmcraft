@@ -101,12 +101,12 @@ fn kit(path: &str, out_dir: &str) -> Result<String, String> {
     v1.transitions.retain(|t| t.from != Some(cd.id) && t.to != Some(cd.id));
     let _ = writeln!(log, "- {vname} clip \"{}\" at {}–{}: deleted (gap left; its audio stays)", cd.name, tc(cd.start.0, fps), tc(cd.end().0, fps));
     // audio: +3 dB on the first A1 clip
-    if let Some(a1) = seq.audio_tracks.first_mut().and_then(|t| t.items.iter_mut().min_by_key(|x| x.start)) {
-        if let Some(v) = a1.effects.iter_mut().find(|e| e.effect == "volume") {
-            let old = v.params.get("level").and_then(|p| p.value.as_f64()).unwrap_or(0.0);
-            v.params.insert("level".into(), Param::new(ParamValue::Float(old + 3.0)));
-            let _ = writeln!(log, "- A1 clip \"{}\" at {}: volume {old:+.1} dB → {:+.1} dB", a1.name, tc(a1.start.0, fps), old + 3.0);
-        }
+    if let Some(a1) = seq.audio_tracks.first_mut().and_then(|t| t.items.iter_mut().min_by_key(|x| x.start))
+        && let Some(v) = a1.effects.iter_mut().find(|e| e.effect == "volume")
+    {
+        let old = v.params.get("level").and_then(|p| p.value.as_f64()).unwrap_or(0.0);
+        v.params.insert("level".into(), Param::new(ParamValue::Float(old + 3.0)));
+        let _ = writeln!(log, "- A1 clip \"{}\" at {}: volume {old:+.1} dB → {:+.1} dB", a1.name, tc(a1.start.0, fps), old + 3.0);
     }
     // a marker at 5 s
     let mut m = seq.markers.first().cloned().unwrap_or(filmcraft_project::Marker {

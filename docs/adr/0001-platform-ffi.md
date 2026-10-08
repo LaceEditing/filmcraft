@@ -25,9 +25,10 @@ Containment rules:
 
 1. The crate does not use `lints.workspace = true`. Its own `[lints]` table copies the workspace
    lints except `unsafe_code = "deny"` (not `forbid`), and adds
-   `clippy::undocumented_unsafe_blocks = "deny"`. Only the FFI modules (`videotoolbox`) carry
+   `clippy::undocumented_unsafe_blocks = "deny"`. Only the FFI modules (`videotoolbox`, `nvidia::*`) carry
    `#[allow(unsafe_code)]`; the rest of the crate (the fallback logic in `hybrid`) has no `unsafe`.
-2. Every `unsafe` block has a `// SAFETY:` comment saying why it is sound.
+2. Every `unsafe` block has a `// SAFETY:` comment saying why it is sound (the one exception:
+   bindgen-generated declarations in `nvidia/sys.rs`, which are regenerated, never edited).
 3. The public API is safe: no `pub unsafe fn`, no raw pointers or FFI types in public signatures;
    failures are `Result`s. The crate keeps the never-crash `deny(clippy::unwrap_used, …)`
    attribute of every clean crate.

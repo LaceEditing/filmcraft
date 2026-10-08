@@ -8,7 +8,7 @@
 //! | token | macOS | Windows / Linux |
 //! |---|---|---|
 //! | `Cmd` | ⌘ Command | Ctrl |
-//! | `Ctrl` | ⌃ Control | Ctrl (folds into `Cmd`; conflicts are reported) |
+//! | `Ctrl` | ⌃ Control | Ctrl (folds into `Cmd`; where both spellings land on one key, the `Cmd` binding wins and the fold is not a conflict) |
 //! | `Alt` | ⌥ Option | Alt |
 //! | `Shift` | ⇧ Shift | Shift |
 //!
@@ -890,25 +890,33 @@ impl Shortcuts {
     pub fn resolve(&self, chord: &Chord, panel: Option<&str>, p: Platform) -> Option<&Binding> {
         let eff = chord.effective(p);
         let m = |b: &&Binding| b.chord().is_some_and(|c| c.effective(p) == eff);
+        // Where Ctrl folds into the primary modifier (Windows, Linux), a binding written with
+        // `Cmd` (Premiere's main shortcut) wins over one written with `Ctrl` (a macOS ⌃ extra),
+        // so Ctrl+T is New Text Layer and Ctrl+M is Export, as on Windows.
+        let rank = |b: &&Binding| b.chord().is_some_and(|c| !p.is_mac() && c.mods.ctrl) as u8;
         if let Some(pn) = panel
-            && let Some(b) = self.bindings.iter().filter(|b| b.panel.as_deref() == Some(pn)).find(m)
+            && let Some(b) = self.bindings.iter().filter(|b| b.panel.as_deref() == Some(pn)).filter(m).min_by_key(rank)
         {
             return Some(b);
         }
-        self.bindings.iter().filter(|b| b.panel.is_none()).find(m)
+        self.bindings.iter().filter(|b| b.panel.is_none()).filter(m).min_by_key(rank)
     }
 
     /// Groups of bindings that share a key in one context on platform `p`.
     pub fn conflicts(&self, p: Platform) -> Vec<(String, String, Vec<String>)> {
-        let mut map: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        // (context, effective chord) → commands, and how many of them are written with `Cmd`
+        let mut map: BTreeMap<(String, String), (Vec<String>, usize)> = BTreeMap::new();
         for b in &self.bindings {
             let Some(c) = b.chord() else { continue };
             let e = map.entry((b.context().to_string(), c.effective(p).canonical())).or_default();
-            if !e.contains(&b.command) {
-                e.push(b.command.clone());
+            if !e.0.contains(&b.command) {
+                e.0.push(b.command.clone());
+                e.1 += usize::from(!c.mods.ctrl);
             }
         }
-        map.into_iter().filter(|(_, v)| v.len() > 1).map(|((ctx, k), v)| (ctx, k, v)).collect()
+        // a Ctrl-spelled binding folded onto one Cmd-spelled binding is resolved (see `resolve`),
+        // not a conflict
+        map.into_iter().filter(|(_, (v, cmd))| v.len() > 1 && (p.is_mac() || *cmd != 1)).map(|((ctx, k), (v, _))| (ctx, k, v)).collect()
     }
 
     /// Panel shortcuts that shadow an application shortcut while their panel has focus.

@@ -1,6 +1,6 @@
 [package]
 name = "filmcraft-platform"
-description = "OS media integration: hardware video decoding through the operating system's codecs (VideoToolbox on macOS), with transparent fallback to the pure-Rust decoders"
+description = "OS media integration: hardware video decoding and encoding through the operating system's codecs (VideoToolbox on macOS, NVDEC/NVENC on Linux), with transparent fallback to the pure-Rust codecs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -33,6 +33,14 @@ objc2-core-foundation = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-video-toolbox = "0.3.2"
+
+[target.'cfg(all(target_os = "linux", not(target_arch = "wasm32")))'.dependencies]
+filmcraft-color = { workspace = true }
+filmcraft-frame = { workspace = true }
+filmcraft-time = { workspace = true }
+filmcraft-export = { workspace = true }
+filmcraft-h264enc = { workspace = true }
+libloading = { workspace = true }
 
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }
