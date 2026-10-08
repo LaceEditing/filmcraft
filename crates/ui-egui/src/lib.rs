@@ -1242,7 +1242,7 @@ impl FilmcraftApp {
         self.handle_drops(&ctx);
         if let Some(rx) = self.command_inbox.take() {
             while let Ok(id) = rx.try_recv() {
-                if let Err(e) = menus::invoke(self, &ctx, &id, json!({})) {
+                if let Err(e) = menus::invoke(self, &ctx, &id, menus::menu_params(&id)) {
                     self.ui.status = e;
                 }
             }

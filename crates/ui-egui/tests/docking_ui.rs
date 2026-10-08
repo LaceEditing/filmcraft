@@ -209,3 +209,33 @@ fn the_arrangement_reopens_until_reset() {
     assert_eq!(d.dock(), filmcraft_ui_egui::dock::workspace("Editing"), "and the reset sticks");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Panels without a tab (Tools, Audio Meters) close from their grip: right-click for the panel
+/// menu, or its ×. Window ▸ a ticked panel closes it; the same command from a shortcut only
+/// shows it.
+#[test]
+fn compact_panels_close_from_their_grip_and_the_window_menu_toggles() {
+    let dir = data_dir("compact");
+    let mut d = Driver::new(&dir);
+    // right-click the Tools grip: its panel menu ▸ Close Panel
+    d.ok("ui.click", json!({"id": "panel.grip.Tools", "button": "right"}));
+    d.frames(2);
+    assert!(d.has("panel.menu.Tools.close"), "the panel menu opened");
+    d.ok("ui.click", json!({"id": "panel.menu.Tools.close"}));
+    d.frames(2);
+    assert!(!d.app().panel_open(PanelKind::Tools));
+    // the meters' × on their grip
+    d.ok("ui.click", json!({"id": "panel.close.AudioMeters"}));
+    d.frames(2);
+    assert!(!d.app().panel_open(PanelKind::AudioMeters));
+    // Window ▸ Tools reopens it where it was; choosing it again from the menu closes it
+    d.ok("ui.menu.invoke", json!({"id": "window.panel.Tools", "params": {"fromMenu": true}}));
+    assert!(d.app().panel_open(PanelKind::Tools));
+    assert_eq!(d.group(PanelKind::Tools), [PanelKind::Tools], "in its own place again");
+    d.ok("ui.menu.invoke", json!({"id": "window.panel.Tools", "params": {"fromMenu": true}}));
+    assert!(!d.app().panel_open(PanelKind::Tools), "a ticked panel closes from the Window menu");
+    // a shortcut's (no fromMenu) only shows
+    d.exec("window.panel.Program", json!({}));
+    assert!(d.app().panel_open(PanelKind::Program));
+    let _ = std::fs::remove_dir_all(&dir);
+}

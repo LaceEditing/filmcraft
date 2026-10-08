@@ -122,3 +122,62 @@ fn export_needs_a_project_that_came_from_premiere() {
     s.execute("file.openDemoProject", json!({})).unwrap();
     assert!(s.execute("file.exportPrproj", json!({"path": "/nonexistent/x.prproj"})).is_err());
 }
+
+fn set_first_video_clip(s: &mut Session, secs: i64) {
+    s.edit("Trim", |p, _| {
+        let seq_id = p.sequences().next().map(|i| i.id).unwrap();
+        p.sequence_mut(seq_id).unwrap().video_tracks[0].items[0].duration = filmcraft_time::Tick(secs * S);
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Settings ▸ General ▸ Save a project opened from Premiere Pro: Save (Ctrl+S) writes a .prproj
+/// beside the original (the first Save asks where, later ones write there), over the original
+/// with a backup, or a FilmCraft project.
+#[test]
+fn save_writes_a_premiere_project_for_projects_opened_from_one() {
+    let dir = tmp_dir("prproj-save");
+    let src = dir.join("show.prproj");
+    std::fs::write(&src, prproj()).unwrap();
+    let mut s = session(&dir);
+    assert_eq!(s.prefs.general.save_premiere_projects, "premiereCopy", "the default");
+    s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
+    set_first_video_clip(&mut s, 4);
+    assert!(s.is_dirty());
+    // the first Save needs to know where (the app shows the Premiere Pro project dialog)
+    let e = s.execute("file.save", json!({})).unwrap_err().to_string();
+    assert!(e.contains("Premiere Pro project"), "{e}");
+    let out = dir.join("show (FilmCraft).prproj");
+    s.execute("file.save", json!({"path": out.to_string_lossy()})).unwrap();
+    assert!(std::fs::read_to_string(&out).unwrap().contains(&format!("<End>{}</End>", 4 * S)));
+    assert!(!s.is_dirty(), "saved");
+    assert!(s.path.is_none(), "still not a FilmCraft project");
+    // later Saves write there without asking
+    set_first_video_clip(&mut s, 3);
+    assert!(s.is_dirty());
+    s.execute("file.save", json!({})).unwrap();
+    assert!(std::fs::read_to_string(&out).unwrap().contains(&format!("<End>{}</End>", 3 * S)));
+    assert!(!s.is_dirty());
+    assert_eq!(std::fs::read_to_string(&src).unwrap(), prproj(), "the original is never touched");
+
+    // over the original: a backup is kept
+    let mut s = session(&dir);
+    s.prefs.general.save_premiere_projects = "premiereOriginal".into();
+    s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
+    set_first_video_clip(&mut s, 5);
+    s.execute("file.save", json!({})).unwrap();
+    assert!(std::fs::read_to_string(&src).unwrap().contains(&format!("<End>{}</End>", 5 * S)));
+    assert_eq!(std::fs::read_to_string(dir.join("show.prproj.before-filmcraft")).unwrap(), prproj());
+    assert!(!s.is_dirty());
+
+    // as a FilmCraft project: Save asks for a .fcproj, as before
+    let mut s = session(&dir);
+    s.prefs.general.save_premiere_projects = "filmcraft".into();
+    s.execute("file.open", json!({"path": out.to_string_lossy()})).unwrap();
+    let e = s.execute("file.save", json!({})).unwrap_err().to_string();
+    assert!(e.contains("Save As"), "{e}");
+    let fc = dir.join("show.fcproj");
+    s.execute("file.save", json!({"path": fc.to_string_lossy()})).unwrap();
+    assert!(filmcraft_format::decode(&std::fs::read(&fc).unwrap()).is_ok());
+}

@@ -59,7 +59,10 @@ it), or without `target` onto that outer edge of the dock area; `window.dock.und
 group?}` opens the panel (or its group) in a window of its own; `window.dock.redock {panel}` puts an
 undocked group back where it came from; `window.dock.close {panel, group?, others?}`;
 `window.dock.maximize {panel}` toggles Maximize Frame. `window.panel.<Panel>` opens or shows a
-panel (back where it was closed from); `ui.menu.list` ticks the open ones. Element ids:
+panel (back where it was closed from); with `{fromMenu: true}` (the menu bar) a ticked panel
+closes instead; `ui.menu.list` ticks the open ones. Panels without a tab (Tools, Audio Meters)
+open their panel menu with a right click on `panel.grip.<Panel>` and close with
+`panel.close.<Panel>` (the × at the right of the grip). Element ids:
 `panel.tab.<Panel>` (drag it to move the panel), `panel.grip.<Panel>` (the empty part of a tab
 strip, or a compact panel's grip: drag the group), `panel.close.<Panel>` (the tab's ×),
 `panel.menu.<Panel>` and its items `panel.menu.<Panel>.close|undock|groupSettings` (the Panel Group

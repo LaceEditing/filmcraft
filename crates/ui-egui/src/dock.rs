@@ -721,7 +721,8 @@ pub fn draw_group_chrome(
         // grip dots: drag the panel to a new place
         let c = pos2(g.rect.center().x, g.rect.min.y + 4.0);
         let grip = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), 8.0));
-        let gr = ui.interact(grip, egui::Id::new(("group-grip", g.path.clone())), Sense::drag());
+        let gr = ui.interact(grip, egui::Id::new(("group-grip", g.path.clone())), Sense::click_and_drag());
+        let gr = gr.on_hover_text("Drag to move this panel; right-click for its panel menu");
         reg.add(&format!("panel.grip.{}", g.panels.first().map(|p| p.id()).unwrap_or_default()), grip, "move panel");
         if gr.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -731,6 +732,26 @@ pub fn draw_group_chrome(
         }
         for dx in [-4.0, 0.0, 4.0] {
             painter.circle_filled(c + vec2(dx, 0.0), 1.0, if gr.hovered() { t.tab_text_active } else { t.text_faint });
+        }
+        if let Some(p) = g.panels.first().copied() {
+            // right-click: the panel menu (Close Panel, Undock Panel, …), as on a tab
+            if gr.secondary_clicked() {
+                actions.push(DockAction::Focus(p));
+                actions.push(DockAction::PanelMenu(p, gr.interact_pointer_pos().unwrap_or(grip.left_bottom())));
+            }
+            // × at the right end of the grip, shown while the pointer is over the panel's top
+            let cr = Rect::from_center_size(pos2(grip.max.x - 7.0, grip.center().y), vec2(6.0, 6.0));
+            let cresp = ui.interact(cr.expand(3.0), egui::Id::new(("grip-x", g.path.clone())), Sense::click());
+            reg.add(&format!("panel.close.{}", p.id()), cr.expand(3.0), "close panel");
+            let near = ui.rect_contains_pointer(Rect::from_min_max(g.rect.min, pos2(g.rect.max.x, g.rect.min.y + 24.0)));
+            if near || cresp.hovered() {
+                let cc = if cresp.hovered() { t.tab_text_active } else { t.tab_text };
+                painter.line_segment([cr.left_top(), cr.right_bottom()], Stroke::new(1.1, cc));
+                painter.line_segment([cr.right_top(), cr.left_bottom()], Stroke::new(1.1, cc));
+            }
+            if cresp.clicked() {
+                actions.push(DockAction::Close(p));
+            }
         }
     } else {
         let strip = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), t.tab_h));

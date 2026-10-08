@@ -177,6 +177,56 @@ fn stash_premiere_original(s: &Session, bytes: &[u8]) {
     let _ = s.services.write_file(&path.to_string_lossy(), bytes);
 }
 
+/// How Save treats a project opened from Premiere Pro.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PremiereSave {
+    /// A new .prproj beside the original (asks where the first time).
+    Copy,
+    /// Over the original (keeping `<file>.before-filmcraft`).
+    Original,
+}
+
+/// The Premiere Pro project the open project came from (None: not opened from one).
+pub fn premiere_source(s: &Session) -> Option<String> {
+    s.project.items.values().find(|i| i.metadata.contains_key(filmcraft_interchange::META_SEQUENCE)).and_then(|i| i.metadata.get(PREMIERE_SOURCE).cloned())
+}
+
+/// Whether Save writes a Premiere Pro project here: the project came from one, was not saved as
+/// a FilmCraft project, and Settings ▸ General says so.
+pub fn premiere_save_mode(s: &Session) -> Option<PremiereSave> {
+    if s.path.is_some() || premiere_source(s).is_none() {
+        return None;
+    }
+    match s.prefs.general.save_premiere_projects.as_str() {
+        "filmcraft" => None,
+        "premiereOriginal" => Some(PremiereSave::Original),
+        _ => Some(PremiereSave::Copy),
+    }
+}
+
+/// The .prproj Save would write now without asking (None: it has to ask where).
+pub fn premiere_save_target(s: &Session) -> Option<String> {
+    match premiere_save_mode(s)? {
+        PremiereSave::Original => premiere_source(s),
+        PremiereSave::Copy => s.premiere_save_path.clone(),
+    }
+}
+
+/// Save as a Premiere Pro project (see [`premiere_save_mode`]); None when Save writes a
+/// FilmCraft project instead. `path` overrides where it goes.
+pub fn save_as_premiere(s: &mut Session, path: Option<&str>) -> Option<Result<Value>> {
+    let mode = premiere_save_mode(s)?;
+    let target = path.map(str::to_string).or_else(|| premiere_save_target(s));
+    let Some(target) = target else {
+        return Some(Err(EngineError::Other(
+            "file.save: where should the Premiere Pro project go? (pass `path`, or use File ▸ Export ▸ Premiere Pro Project once)".into(),
+        )));
+    };
+    let source = premiere_source(s).unwrap_or_default();
+    let overwrite = mode == PremiereSave::Original && target == source;
+    Some(export_prproj(s, &json!({"path": target, "overwrite": overwrite})))
+}
+
 /// `file.exportPrproj {path, sequences?, force?, overwrite?}`: write sequences opened from a
 /// Premiere Pro project back into that project, as a new `.prproj` at `path`.
 pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
@@ -240,13 +290,23 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
     let (bytes, report) = filmcraft_interchange::export_prproj(&s.project, &base, &wanted, std::path::Path::new(&path).parent().and_then(|d| d.to_str()))
         .map_err(|e| bad(e.to_string()))?;
     s.services.write_file(&path, &bytes).map_err(|e| bad(format!("{path}: {e}")))?;
+    // Saving to Premiere Pro (Settings ▸ General): this is where Save writes from now on, and
+    // the project counts as saved
+    let saving = premiere_save_mode(s).is_some();
+    if saving {
+        if !same_file(&path, &source) {
+            s.premiere_save_path = Some(path.clone());
+        }
+        s.saved_revision = s.revision;
+    }
     let mut lines = report_json(&report);
     lines.extend(warnings);
     let n = lines.len();
+    let verb = if saving { "Saved" } else { "Exported" };
     s.toast(if n == 0 {
-        format!("Exported to Premiere Pro project {path}")
+        format!("{verb} to Premiere Pro project {path}")
     } else {
-        format!("Exported to Premiere Pro project {path} ({n} note(s) in the export report)")
+        format!("{verb} to Premiere Pro project {path} ({n} note(s) in the export report)")
     });
     Ok(json!({"path": path, "sequences": wanted.iter().map(|i| i.0).collect::<Vec<_>>(), "report": lines}))
 }

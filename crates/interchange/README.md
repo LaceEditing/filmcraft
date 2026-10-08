@@ -178,6 +178,13 @@ was opened is the one patched.
   `ObjectRef` / `ObjectURef` / `BinaryHash` the original resolved, and import back into exactly
   the clips FilmCraft wrote. Otherwise the export is an error, never a file.
 
+In the app the project is written by File ▸ Export ▸ Premiere Pro Project, and by File ▸ Save
+(Ctrl+S) on a project opened from Premiere that was not saved as a FilmCraft project: Settings ▸
+General ▸ Save a project opened from Premiere Pro chooses a `.prproj` beside the original (the
+default; the first Save asks where, later ones write there), over the original (keeping
+`<file>.before-filmcraft`), or a FilmCraft project (`file.save {path?}`; engine
+`interchange::save_as_premiere`). A Save there leaves the project saved (not dirty).
+
 ## Tests
 
 - `tests/aaf_omf.rs`: AAF round trips at 25, 29.97 DF, 23.976 and 59.94 DF (clips, gaps,

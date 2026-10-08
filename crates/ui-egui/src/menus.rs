@@ -173,8 +173,13 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
     }
     if let Some(rest) = id.strip_prefix("window.panel.") {
         let p = PanelKind::from_name(rest).ok_or_else(|| format!("unknown panel `{rest}`"))?;
+        // Window ▸ a ticked panel closes it; a shortcut (or an unticked one) shows it
+        if params.get("fromMenu").and_then(Value::as_bool).unwrap_or(false) && app.panel_open(p) {
+            app.close_panels(&[p]);
+            return Ok(json!({"closed": p.title()}));
+        }
         app.show_panel(p);
-        return Ok(Value::Null);
+        return Ok(json!({"shown": p.title()}));
     }
     if let Some(r) = crate::panels::workspaces::route(app, id, &params) {
         return r;
@@ -379,13 +384,22 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
         crate::panels::settings::set_theme(app, ctx, k);
         return Ok(Value::Null);
     }
+    // Save on a project opened from Premiere Pro (Settings ▸ General): straight to its .prproj,
+    // or, the first time, the Premiere Pro project dialog
+    if id == "file.save" && params.get("path").is_none() && app.session.path.is_none() {
+        use filmcraft_engine::interchange::{premiere_save_mode, premiere_save_target};
+        match (premiere_save_mode(&app.session), premiere_save_target(&app.session)) {
+            (Some(_), Some(_)) => {}
+            (Some(_), None) => return app.file_dialog("file.exportPrproj", &params),
+            (None, _) => return app.file_dialog("file.save", &params),
+        }
+    }
     // File dialogs for commands that need a path.
     if (id == "file.import" && params.get("paths").is_none() && params.get("path").is_none())
         || (id == "file.importImageSequence" && params.get("path").is_none())
         || (id == "file.saveAs" && params.get("path").is_none())
         || (id == "file.saveCopy" && params.get("path").is_none())
         || (id == "file.open" && params.get("path").is_none())
-        || (id == "file.save" && params.get("path").is_none() && app.session.path.is_none())
         || (matches!(id, "captions.import" | "captions.export") && params.get("path").is_none())
         || (id == "graphics.newFromFile" && params.get("path").is_none())
         || (id == "file.exportPrproj" && params.get("path").is_none())
@@ -584,8 +598,14 @@ pub fn menu_bar(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
         }
     });
     if let Some(id) = clicked {
-        let _ = invoke(app, &ctx, &id, json!({}));
+        let _ = invoke(app, &ctx, &id, menu_params(&id));
     }
+}
+
+/// Params of a command chosen from a menu: Window ▸ panel items toggle (a ticked panel closes,
+/// as in Premiere), where the same command from a shortcut only brings the panel forward.
+pub fn menu_params(id: &str) -> Value {
+    if id.starts_with("window.panel.") { json!({"fromMenu": true}) } else { json!({}) }
 }
 
 /// One menu level: items whose path ends here, and a submenu (at its first item's position) for

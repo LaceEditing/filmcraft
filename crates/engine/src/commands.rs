@@ -909,6 +909,13 @@ fn build() -> Vec<CommandSpec> {
         ),
         cmd!("file.importAaf", "Import AAF…", [], None, r#"{"path":str}"#, always, |s, p| crate::aaf_omf::import_document(s, p, "file.importAaf")),
         cmd!("file.save", "Save", ["File"], Some("Cmd+S"), r#"{"path":str?}"#, always, |s, p| {
+            // a project opened from Premiere Pro and not saved as a FilmCraft project: written
+            // back as a .prproj (Settings ▸ General ▸ Save a project opened from Premiere Pro)
+            if s.path.is_none()
+                && let Some(r) = crate::interchange::save_as_premiere(s, str_p(p, "path"))
+            {
+                return r;
+            }
             let path = str_p(p, "path").map(str::to_string).or_else(|| s.path.clone()).ok_or_else(|| bad("file.save", "no path (use Save As)"))?;
             write_project(s, &path, true)
         }),
@@ -3146,6 +3153,7 @@ fn schema_backup_path(path: &str, schema: u32) -> String {
 
 /// Make `proj` the session's project (fresh history, media pool and editor state).
 fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Option<String>, clean: bool) {
+    s.premiere_save_path = None;
     let proxies = s.media.use_proxies();
     s.media = std::sync::Arc::new(crate::MediaPool::default());
     s.media.set_use_proxies(proxies);
@@ -3215,7 +3223,12 @@ fn open_foreign(s: &mut Session, path: &str, bytes: &[u8], format: filmcraft_int
     }
     let warnings = imported["report"].as_array().map(Vec::len).unwrap_or(0);
     let offline = imported["offlineMedia"].as_array().map(Vec::len).unwrap_or(0);
-    let mut msg = format!("Opened {name} ({}). Save it as a FilmCraft project to keep your changes", format.name());
+    let save = match crate::interchange::premiere_save_mode(s) {
+        Some(crate::interchange::PremiereSave::Copy) => "Save writes a Premiere Pro project beside it (the first Save asks where)",
+        Some(crate::interchange::PremiereSave::Original) => "Save writes back into it (a backup of the original is kept)",
+        None => "Save it as a FilmCraft project to keep your changes",
+    };
+    let mut msg = format!("Opened {name} ({}). {save}", format.name());
     if offline > 0 {
         msg.push_str(&format!("; {offline} media file(s) are offline (File ▸ Link Media)"));
     }

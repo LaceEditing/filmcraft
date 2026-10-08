@@ -52,6 +52,10 @@ pub struct GeneralPrefs {
     pub show_compatibility_issues: bool,
     pub show_project_bin_in_tab: bool,
     pub show_mask_tracker_preview: bool,
+    /// "Save a project opened from Premiere Pro": `premiereCopy` (Save writes a Premiere Pro
+    /// project beside the original; the first Save asks where), `premiereOriginal` (over the
+    /// original, keeping `<file>.before-filmcraft`), or `filmcraft` (a FilmCraft project).
+    pub save_premiere_projects: String,
     /// Most recently opened / saved projects (newest first; not shown in the dialog).
     pub recent_projects: Vec<String>,
 }
@@ -74,6 +78,7 @@ impl Default for GeneralPrefs {
             show_compatibility_issues: true,
             show_project_bin_in_tab: true,
             show_mask_tracker_preview: true,
+            save_premiere_projects: "premiereCopy".into(),
             recent_projects: Vec::new(),
         }
     }
@@ -598,6 +603,11 @@ const fn float(min: f64, max: f64, decimals: usize, unit: &'static str) -> Kind 
 }
 
 const STARTUP: &[(&str, &str)] = &[("showHome", "Show Home"), ("openMostRecent", "Open Most Recent"), ("emptyProject", "Start with an Empty Project")];
+const SAVE_PREMIERE: &[(&str, &str)] = &[
+    ("premiereCopy", "As a Premiere Pro project, beside the original"),
+    ("premiereOriginal", "As a Premiere Pro project, over the original (a backup is kept)"),
+    ("filmcraft", "As a FilmCraft project (.fcproj)"),
+];
 const OPENING: &[(&str, &str)] = &[("showOpenDialog", "Show Open Dialog"), ("showHome", "Show Home")];
 const BIN_OPEN: &[(&str, &str)] = &[("openInPlace", "Open in place"), ("openNewTab", "Open new tab"), ("openNewWindow", "Open in new window")];
 const PROJECT_OPEN: &[(&str, &str)] = &[("openNewTab", "Open new tab"), ("openNewWindow", "Open in new window")];
@@ -674,6 +684,7 @@ static CATEGORIES: &[Category] = &[
         rows: &[
             f("general.atStartup", "At Startup", Kind::Choice(STARTUP), true),
             f("general.whenOpeningProject", "When Opening a Project", Kind::Choice(OPENING), false),
+            f("general.savePremiereProjects", "Save a project opened from Premiere Pro", Kind::Choice(SAVE_PREMIERE), true),
             Row::Group(
                 "Bins",
                 &[

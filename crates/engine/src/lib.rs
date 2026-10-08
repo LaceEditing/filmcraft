@@ -322,6 +322,9 @@ pub struct Session {
     pub history: History,
     pub revision: u64,
     pub saved_revision: u64,
+    /// Where Save writes the Premiere Pro project of a project opened from one (Settings ▸
+    /// General ▸ Save a project opened from Premiere Pro): set by the first Save / export.
+    pub premiere_save_path: Option<String>,
     pub path: Option<String>,
     pub state: EditorState,
     pub media: Arc<MediaPool>,
@@ -426,6 +429,7 @@ impl Session {
             history: History { limit: 200, ..Default::default() },
             revision: 1,
             saved_revision: 1,
+            premiere_save_path: None,
             path: None,
             state: EditorState {
                 snapping: true,

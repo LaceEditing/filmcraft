@@ -70,7 +70,13 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
     }
     // Save All on a never-saved project asks where to save, like Save
     if id == "file.saveAll" && app.session.path.is_none() {
-        return Some(app.file_dialog("file.save", params));
+        // (a project opened from Premiere Pro saves as its .prproj, as Save does)
+        use filmcraft_engine::interchange::{premiere_save_mode, premiere_save_target};
+        return Some(match (premiere_save_mode(&app.session), premiere_save_target(&app.session)) {
+            (Some(_), Some(_)) => app.session.execute("file.save", json!({})).map_err(|e| e.to_string()),
+            (Some(_), None) => app.file_dialog("file.exportPrproj", params),
+            (None, _) => app.file_dialog("file.save", params),
+        });
     }
     if id == "file.closeProject" && !app.session.is_dirty() {
         return None;
