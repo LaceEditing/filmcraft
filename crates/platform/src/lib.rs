@@ -31,7 +31,7 @@ pub mod videotoolbox;
 
 pub use hybrid::HybridDecoder;
 
-/// Whether exports may use a hardware H.264 encoder (NVENC on Linux); on by default.
+/// Whether exports may use hardware encoders (NVENC H.264 / HEVC on Linux); on by default.
 pub fn hardware_encoding() -> bool {
     #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
     {
@@ -43,7 +43,7 @@ pub fn hardware_encoding() -> bool {
     }
 }
 
-/// Turn hardware H.264 encoding for exports on or off (no effect where there is none).
+/// Turn hardware encoding for exports on or off (no effect where there is none).
 pub fn set_hardware_encoding(on: bool) {
     #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
     {
@@ -79,6 +79,7 @@ pub fn register() -> Availability {
             Ok(_) => {
                 filmcraft_codecs::register_video_decoder(nvidia::nvdec_factory);
                 filmcraft_export::register_encoder(nvidia::nvenc::nvenc_factory);
+                filmcraft_export::register_format_probe(nvidia::nvenc::nvenc_probe);
                 Availability::Available("NVDEC")
             }
             Err(why) => {

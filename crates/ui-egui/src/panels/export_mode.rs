@@ -22,8 +22,8 @@
 use egui::{Align2, Color32, Rect, Sense, pos2, vec2};
 use filmcraft_engine::export::presets::{DEFAULT_PRESET, preset_key};
 use filmcraft_engine::export::{
-    AudioCodec, BitrateMode, ExportSettings, FieldOrder, Format, H264Profile, Multiplexer, MxfVideoCodec, Placement, Scaling, TextOverlay, builtin_presets,
-    format_bytes,
+    AudioCodec, BitrateMode, EncodePerformance, ExportSettings, FieldOrder, Format, H264Profile, HevcProfile, Multiplexer, MxfVideoCodec, Placement, Scaling,
+    TextOverlay, builtin_presets, format_bytes,
 };
 use filmcraft_engine::time::{FrameRate, Tick};
 use serde::{Deserialize, Serialize};
@@ -461,7 +461,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         if (s.has_audio()
             || !s.has_video()
-            || s.format == Format::H264
+            || s.format.is_long_gop()
             || matches!(s.format, Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg)
             || s.format.is_mxf())
             && !s.is_image_sequence()
@@ -470,7 +470,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         {
             audio_section(ui, &mut reg, s, &t, seq_sr);
         }
-        if s.format == Format::H264 && section(ui, &mut reg, &mut ex.open_sections, "multiplexer", "Multiplexer", &t) {
+        if s.format.is_long_gop() && section(ui, &mut reg, &mut ex.open_sections, "multiplexer", "Multiplexer", &t) {
             row(ui, &t, "Multiplexer", |ui| {
                 let cur = if s.multiplexer == Multiplexer::Mp4 { "MP4" } else { "QuickTime" };
                 if let Some(i) = combo(ui, &mut reg, "export.multiplexer", cur, &opts(&["MP4", "QuickTime"]), 160.0) {
@@ -507,7 +507,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if section(ui, &mut reg, &mut ex.open_sections, "effects", "Effects", &t) {
             pick_overlay = effects_section(ui, &mut reg, s, &t);
         }
-        if matches!(s.format, Format::H264 | Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg)
+        if matches!(s.format, Format::H264 | Format::Hevc | Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg)
             && section(ui, &mut reg, &mut ex.open_sections, "metadata", "Metadata", &t)
         {
             let m = &mut s.metadata;
@@ -593,23 +593,45 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
         });
     }
     match s.video_format() {
-        Format::H264 => {
-            row(ui, t, "Profile", |ui| {
-                let o = [H264Profile::Baseline, H264Profile::Main, H264Profile::High];
-                let labels: Vec<(String, bool)> = o.iter().map(|p| (p.label().to_string(), true)).collect();
-                if let Some(i) = combo(ui, reg, "export.video.profile", s.h264_profile.label(), &labels, 120.0) {
-                    s.h264_profile = o[i];
+        f @ (Format::H264 | Format::Hevc) => {
+            // Encoding Settings ▸ Performance (Premiere): the GPU's encoder or FilmCraft's own
+            row(ui, t, "Performance", |ui| {
+                let o = [EncodePerformance::Hardware, EncodePerformance::Software];
+                // HEVC has no software encoder; MXF H.264 is always FilmCraft's own
+                let labels: Vec<(String, bool)> =
+                    o.iter().map(|p| (p.label().to_string(), !(f == Format::Hevc && *p == EncodePerformance::Software))).collect();
+                if let Some(i) = combo(ui, reg, "export.video.performance", s.performance.label(), &labels, 180.0) {
+                    s.performance = o[i];
                 }
             });
-            row(ui, t, "Level", |ui| {
-                let levels: [Option<u8>; 13] =
-                    [None, Some(30), Some(31), Some(32), Some(40), Some(41), Some(42), Some(50), Some(51), Some(52), Some(60), Some(61), Some(62)];
-                let lab = |l: &Option<u8>| l.map(|l| format!("{}.{}", l / 10, l % 10)).unwrap_or_else(|| "Auto".into());
-                let labels: Vec<(String, bool)> = levels.iter().map(|l| (lab(l), true)).collect();
-                if let Some(i) = combo(ui, reg, "export.video.level", &lab(&s.h264_level), &labels, 120.0) {
-                    s.h264_level = levels[i];
-                }
-            });
+            if f == Format::Hevc {
+                row(ui, t, "Profile", |ui| {
+                    let o = [HevcProfile::Main, HevcProfile::Main10];
+                    let labels: Vec<(String, bool)> = o.iter().map(|p| (p.label().to_string(), true)).collect();
+                    if let Some(i) = combo(ui, reg, "export.video.hevcProfile", s.hevc_profile.label(), &labels, 120.0) {
+                        s.hevc_profile = o[i];
+                    }
+                });
+            } else {
+                row(ui, t, "Profile", |ui| {
+                    let o = [H264Profile::Baseline, H264Profile::Main, H264Profile::High];
+                    let labels: Vec<(String, bool)> = o.iter().map(|p| (p.label().to_string(), true)).collect();
+                    if let Some(i) = combo(ui, reg, "export.video.profile", s.h264_profile.label(), &labels, 120.0) {
+                        s.h264_profile = o[i];
+                    }
+                });
+            }
+            if f == Format::H264 {
+                row(ui, t, "Level", |ui| {
+                    let levels: [Option<u8>; 13] =
+                        [None, Some(30), Some(31), Some(32), Some(40), Some(41), Some(42), Some(50), Some(51), Some(52), Some(60), Some(61), Some(62)];
+                    let lab = |l: &Option<u8>| l.map(|l| format!("{}.{}", l / 10, l % 10)).unwrap_or_else(|| "Auto".into());
+                    let labels: Vec<(String, bool)> = levels.iter().map(|l| (lab(l), true)).collect();
+                    if let Some(i) = combo(ui, reg, "export.video.level", &lab(&s.h264_level), &labels, 120.0) {
+                        s.h264_level = levels[i];
+                    }
+                });
+            }
             row(ui, t, "Bitrate Encoding", |ui| {
                 let o = [BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass];
                 let labels: Vec<(String, bool)> = o.iter().map(|m| (m.label().to_string(), true)).collect();
@@ -706,13 +728,12 @@ fn audio_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
         }
     }
     row(ui, t, "Audio Format", |ui| {
-        let fixed = s.format == Format::H264 && s.multiplexer == Multiplexer::Mp4 || audio_only || s.format.is_mxf();
+        let fixed = s.format.is_long_gop() && s.multiplexer == Multiplexer::Mp4 || audio_only || s.format.is_mxf();
         let cur = match s.audio_codec() {
             AudioCodec::Aac => "AAC",
             _ => "Uncompressed (PCM)",
         };
-        let labels =
-            vec![("AAC".to_string(), !audio_only), ("Uncompressed (PCM)".to_string(), !(s.format == Format::H264 && s.multiplexer == Multiplexer::Mp4))];
+        let labels = vec![("AAC".to_string(), !audio_only), ("Uncompressed (PCM)".to_string(), !(s.format.is_long_gop() && s.multiplexer == Multiplexer::Mp4))];
         if fixed {
             ui.label(cur);
         } else if let Some(i) = combo(ui, reg, "export.audio.codec", cur, &labels, 180.0) {

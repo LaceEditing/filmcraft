@@ -881,6 +881,7 @@ static CATEGORIES: &[Category] = &[
                 ],
             ),
             b("media.hardwareDecoding", "Enable hardware accelerated decoding (requires restart)", false),
+            b("media.hardwareEncoding", "Enable hardware accelerated encoding (H.264 and HEVC on the GPU), if available", true),
             b("media.proresHardwareEncoding", "Enable ProRes hardware accelerated encoding, if available", false),
         ],
     },
@@ -1129,8 +1130,11 @@ pub fn migrate(v: &mut Value) {
 impl crate::autosave::Preferences {
     /// Settings ▸ Playback ▸ Hardware decoding as the process-wide switch the hardware decoder
     /// factories consult (new decoders only).
+    /// Push the hardware codec switches (Playback ▸ Hardware decoding, Media ▸ hardware
+    /// accelerated encoding) to the codec and export crates.
     pub fn apply_hardware_decoding(&self) {
         filmcraft_codecs::hw::set_hardware_decoding(self.playback.hardware_decoding != "off");
+        filmcraft_export::set_hardware_encoding(self.media.hardware_encoding);
     }
 
     /// Values of one category as a JSON object.

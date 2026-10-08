@@ -62,6 +62,11 @@ pub enum Format {
     #[default]
     #[serde(rename = "h264", alias = "H264")]
     H264,
+    /// MPEG-4 (or QuickTime), HEVC / H.265 video + AAC audio. Encoded by the GPU (NVENC):
+    /// FilmCraft has no software HEVC encoder, so the format is offered only where a hardware
+    /// encoder is registered ([`available`]).
+    #[serde(rename = "hevc", alias = "Hevc", alias = "h265")]
+    Hevc,
     /// QuickTime, Apple ProRes 422 (HQ unless the settings pick another flavour) + PCM.
     #[serde(rename = "prores", alias = "ProRes")]
     ProRes,
@@ -103,6 +108,7 @@ impl Format {
     pub fn from_name(s: &str) -> Option<Format> {
         Some(match s.to_ascii_lowercase().replace([' ', '-', '_', '.'], "").as_str() {
             "h264" | "mp4" | "avc" | "m4v" => Format::H264,
+            "hevc" | "h265" | "hvc" | "hvc1" | "hev1" | "hevch265" | "h265hevc" => Format::Hevc,
             "prores" | "mov" | "appleprores" => Format::ProRes,
             "dnxhr" | "dnxhd" | "dnx" | "avid" | "aviddnxhr" | "aviddnxhd" | "vc3" => Format::DnxHr,
             "apv" | "apv1" => Format::Apv,
@@ -122,6 +128,7 @@ impl Format {
     pub fn id(self) -> &'static str {
         match self {
             Format::H264 => "h264",
+            Format::Hevc => "hevc",
             Format::ProRes => "prores",
             Format::DnxHr => "dnxhr",
             Format::Apv => "apv",
@@ -138,7 +145,7 @@ impl Format {
     }
     pub fn extension(self) -> &'static str {
         match self {
-            Format::H264 => "mp4",
+            Format::H264 | Format::Hevc => "mp4",
             Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg => "mov",
             Format::PngSequence => "png",
             Format::TiffSequence => "tif",
@@ -152,6 +159,7 @@ impl Format {
     pub fn label(self) -> &'static str {
         match self {
             Format::H264 => "H.264",
+            Format::Hevc => "HEVC (H.265)",
             Format::ProRes => "Apple ProRes",
             Format::DnxHr => "Avid DNxHR",
             Format::Apv => "APV",
@@ -170,8 +178,17 @@ impl Format {
     pub fn is_mxf(self) -> bool {
         matches!(self, Format::MxfOp1a | Format::MxfOpAtom)
     }
-    pub const ALL: [Format; 13] = [
+    /// A long-GOP format muxed like H.264 (MP4, or QuickTime with [`Multiplexer::Mov`]).
+    pub fn is_long_gop(self) -> bool {
+        matches!(self, Format::H264 | Format::Hevc)
+    }
+    /// Only a hardware encoder writes this format ([`available`] asks the registered probes).
+    pub fn needs_hardware(self) -> bool {
+        matches!(self, Format::Hevc)
+    }
+    pub const ALL: [Format; 14] = [
         Format::H264,
+        Format::Hevc,
         Format::ProRes,
         Format::DnxHr,
         Format::Apv,
@@ -245,6 +262,11 @@ pub struct ExportSettings {
     pub pixel_aspect: Option<(u32, u32)>,
     pub field_order: FieldOrder,
     pub h264_profile: H264Profile,
+    /// HEVC profile: Main (8-bit) or Main 10. HDR exports are always Main 10.
+    pub hevc_profile: HevcProfile,
+    /// Encoding Settings ▸ Performance: the GPU's encoder when it can take the export (falling
+    /// back to FilmCraft's own), or always FilmCraft's own.
+    pub performance: EncodePerformance,
     /// H.264 level × 10 (41 = 4.1); None = the lowest level that fits. A level below what the
     /// stream needs is raised.
     pub h264_level: Option<u8>,
@@ -428,6 +450,8 @@ impl Default for ExportSettings {
             pixel_aspect: None,
             field_order: FieldOrder::Progressive,
             h264_profile: H264Profile::High,
+            hevc_profile: HevcProfile::default(),
+            performance: EncodePerformance::default(),
             h264_level: None,
             bitrate_mode: BitrateMode::default(),
             max_bitrate_kbps: None,
@@ -452,6 +476,12 @@ impl ExportSettings {
     pub fn validate(&self) -> Result<()> {
         if self.field_order != FieldOrder::Progressive && self.has_video() {
             return Err(ExportError::Unsupported(format!("{} field order: FilmCraft's encoders write progressive frames", self.field_order.label())));
+        }
+        if self.video_format().needs_hardware() && self.performance == EncodePerformance::Software {
+            return Err(ExportError::Unsupported(format!(
+                "{} is encoded by the GPU only: set Video ▸ Performance to Hardware Encoding",
+                self.video_format().label()
+            )));
         }
         if self.effects.image_overlay.enabled && self.effects.image_overlay.path.trim().is_empty() {
             return Err(ExportError::Unsupported("image overlay: no image file chosen".into()));
@@ -569,7 +599,38 @@ pub fn register_audio_encoder(f: AudioEncoderFactory) {
 /// Whether a format can currently be exported. Every [`Format`] has a built-in encoder; this stays
 /// as the hook for formats whose encoders are registered at runtime.
 pub fn available(format: Format) -> bool {
+    if format.needs_hardware() {
+        return hardware_encoding() && format_probes().read().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p(format));
+    }
     Format::ALL.contains(&format)
+}
+
+/// Whether a registered (hardware) encoder can write a format right now.
+pub type FormatProbe = fn(Format) -> bool;
+
+fn format_probes() -> &'static RwLock<Vec<FormatProbe>> {
+    static P: OnceLock<RwLock<Vec<FormatProbe>>> = OnceLock::new();
+    P.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Register a probe for the formats only hardware encoders write ([`Format::needs_hardware`]).
+pub fn register_format_probe(p: FormatProbe) {
+    let mut g = format_probes().write().unwrap_or_else(|e| e.into_inner());
+    if !g.iter().any(|x| std::ptr::fn_addr_eq(*x, p)) {
+        g.push(p);
+    }
+}
+
+static HARDWARE_ENCODING: AtomicBool = AtomicBool::new(true);
+
+/// Settings ▸ Media ▸ Enable hardware accelerated encoding: whether exports may use the GPU's
+/// encoders at all (each export also has its own [`EncodePerformance`]).
+pub fn set_hardware_encoding(on: bool) {
+    HARDWARE_ENCODING.store(on, Ordering::Relaxed);
+}
+
+pub fn hardware_encoding() -> bool {
+    HARDWARE_ENCODING.load(Ordering::Relaxed)
 }
 
 struct MjpegEncoder {
@@ -1031,6 +1092,50 @@ pub fn rgbf_to_yuv420_8(rgb: &[f32], w: usize, h: usize, kr: f32, kb: f32, y: &m
     });
 }
 
+/// Limited-range 10-bit 4:2:0 (2×2 chroma average) from 8-bit straight RGBA (BT.709) or, with
+/// `rgb`, from encoded R'G'B' floats with matrix (Kr, Kb): the input of 10-bit hardware encoders.
+/// Same arithmetic as [`rgba_to_yuv420_8`] / [`rgbf_to_yuv420_8`] at four times the precision.
+#[allow(clippy::too_many_arguments)]
+pub fn to_yuv420_10(rgba: &[u8], rgb: Option<&[f32]>, w: usize, h: usize, kr: f32, kb: f32, y: &mut Vec<u16>, u: &mut Vec<u16>, v: &mut Vec<u16>) {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (kr, kb) = if rgb.is_some() { (kr, kb) } else { (0.2126, 0.0722) };
+    let kg = 1.0 - kr - kb;
+    let (sb, sr) = (2.0 * (1.0 - kb), 2.0 * (1.0 - kr));
+    y.resize(w * h, 0);
+    u.resize(cw * ch, 0);
+    v.resize(cw * ch, 0);
+    if w == 0 || h == 0 || rgb.map_or(rgba.len() < w * h * 4, |f| f.len() < w * h * 3) {
+        return;
+    }
+    let px = |i: usize| -> (f32, f32, f32) {
+        match rgb {
+            Some(f) => (f[i * 3], f[i * 3 + 1], f[i * 3 + 2]),
+            None => (rgba[i * 4] as f32 / 255.0, rgba[i * 4 + 1] as f32 / 255.0, rgba[i * 4 + 2] as f32 / 255.0),
+        }
+    };
+    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
+        let rows = yr.len() / w;
+        let mut us = vec![0f32; cw];
+        let mut vs = vec![0f32; cw];
+        let mut cnt = vec![0f32; cw];
+        for dy in 0..rows {
+            let row = cy * 2 + dy;
+            for x in 0..w {
+                let (r, g, b) = px(row * w + x);
+                let yy = kr * r + kg * g + kb * b;
+                yr[dy * w + x] = (64.0 + 876.0 * yy).round().clamp(4.0, 1019.0) as u16;
+                us[x / 2] += (b - yy) / sb;
+                vs[x / 2] += (r - yy) / sr;
+                cnt[x / 2] += 1.0;
+            }
+        }
+        for cx in 0..cw {
+            ur[cx] = (512.0 + 896.0 * us[cx] / cnt[cx]).round().clamp(4.0, 1019.0) as u16;
+            vr[cx] = (512.0 + 896.0 * vs[cx] / cnt[cx]).round().clamp(4.0, 1019.0) as u16;
+        }
+    });
+}
+
 /// Slices per H.264 picture: one per four macroblock rows. The encoder's default follows the core
 /// count, which would make the stream (and every decoded picture) depend on the machine; this is
 /// what it picks on a machine with enough cores.
@@ -1232,7 +1337,7 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
             }
             (total, count)
         }
-        Format::H264 | Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg | Format::MxfOp1a | Format::MxfOpAtom => {
+        Format::H264 | Format::Hevc | Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg | Format::MxfOp1a | Format::MxfOpAtom => {
             // Handled by the stepped exporter above; reaching here would be a dispatch bug.
             return Err(ExportError::Unsupported(format!("{:?} must run as a stepped export", settings.format)));
         }

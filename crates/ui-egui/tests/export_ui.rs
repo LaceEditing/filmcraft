@@ -309,3 +309,55 @@ fn export_button_and_quick_export_popup() {
     d.click("quickExport.close");
     assert!(!d.app().ui.export.quick_open);
 }
+
+/// HEVC (GPU encoded): offered where the machine has a hardware HEVC encoder; its Video section
+/// has Performance and Profile (Main / Main 10) and no H.264 Level; the summary names it.
+#[test]
+fn hevc_settings_and_hardware_performance() {
+    let _ = filmcraft_platform::register();
+    let mut d = Driver::new("hevc");
+    d.ok("ui.set", json!({"mode": "export"}));
+    d.frames(3);
+    let available = filmcraft_engine::export::available(filmcraft_engine::export::Format::Hevc);
+    let formats = d.exec("export.formats", json!({}));
+    let hevc = formats.as_array().and_then(|a| a.iter().find(|f| f["id"] == "hevc")).cloned().unwrap_or_else(|| panic!("no hevc in {formats}"));
+    assert_eq!(hevc["available"], json!(available), "{hevc}");
+    d.ok("ui.set", json!({"export": {"preset": "HEVC Match Source – 10-bit", "openSections": ["video"]}}));
+    d.frames(3);
+    let s = d.app().ui.export.settings.clone();
+    assert_eq!(s.format, filmcraft_engine::export::Format::Hevc);
+    assert_eq!(s.hevc_profile, filmcraft_engine::export::HevcProfile::Main10);
+    for id in ["export.video.performance", "export.video.hevcProfile", "export.video.bitrateMode", "export.video.keyframeOn"] {
+        assert!(d.has(id), "{id}");
+    }
+    assert!(!d.has("export.video.level"), "no H.264 level for HEVC");
+    let sum: Vec<String> =
+        d.ok("ui.elements", json!({"prefix": "export.summary"})).as_array().unwrap().iter().filter_map(|e| e["label"].as_str().map(String::from)).collect();
+    let all = sum.join(" | ");
+    assert!(all.contains("Main 10") && all.contains("hardware encoded"), "{all}");
+    // Software Encoding is offered for H.264, not for HEVC (it has no software encoder)
+    d.ok("ui.set", json!({"export": {"settings": {"performance": "software"}}}));
+    d.frames(2);
+    assert_eq!(d.app().ui.export.settings.performance, filmcraft_engine::export::EncodePerformance::Software);
+    let sum: Vec<String> =
+        d.ok("ui.elements", json!({"prefix": "export.summary"})).as_array().unwrap().iter().filter_map(|e| e["label"].as_str().map(String::from)).collect();
+    assert!(sum.join(" ").contains("needs Hardware Encoding"), "{sum:?}");
+    assert!(d.app().ui.export.settings.validate().is_err(), "HEVC with Software Encoding cannot export");
+    d.snapshot("export-hevc");
+    // where the GPU has the encoder: each HEVC preset exports, and ffmpeg (when installed) reads it
+    if !available {
+        eprintln!("SKIPPED (export half): no hardware HEVC encoder");
+        return;
+    }
+    for (preset, profile) in [("HEVC Match Source – Adaptive High Bitrate", "Main"), ("HEVC Match Source – 10-bit", "Main 10")] {
+        let path = d.path(&format!("hevc-{}", profile.replace(' ', "")));
+        let r = d.exec("file.exportMedia", json!({"preset": preset, "path": path, "range": "custom", "startSeconds": 1.0, "endSeconds": 1.5, "wait": true}));
+        let out = r["path"].as_str().unwrap().to_string();
+        assert!(out.ends_with(".mp4") && Path::new(&out).exists(), "{preset}: {r}");
+        let Ok(o) = std::process::Command::new("ffprobe").args(["-v", "error", "-of", "json", "-show_streams", &out]).output() else { continue };
+        let j: Value = serde_json::from_slice(&o.stdout).unwrap();
+        let v = j["streams"].as_array().unwrap().iter().find(|s| s["codec_type"] == "video").unwrap().clone();
+        assert_eq!((v["codec_name"].as_str(), v["codec_tag_string"].as_str(), v["profile"].as_str()), (Some("hevc"), Some("hvc1"), Some(profile)), "{preset}");
+        assert_eq!((v["width"].as_u64(), v["height"].as_u64()), (Some(1920), Some(1080)), "{preset}");
+    }
+}

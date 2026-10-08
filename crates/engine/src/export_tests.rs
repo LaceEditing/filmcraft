@@ -68,6 +68,13 @@ fn every_builtin_preset_exports_and_ffprobe_confirms() {
     let dir = Scratch::new("presets");
     for pr in &presets {
         let name = pr["name"].as_str().unwrap();
+        // formats only a hardware encoder writes (HEVC) are exported where one is registered
+        let format =
+            s.execute("export.presets.get", json!({"name": name})).unwrap()["settings"]["format"].as_str().and_then(filmcraft_export::Format::from_name);
+        if format.is_some_and(|f| !filmcraft_export::available(f)) {
+            eprintln!("{name}: skipped, its hardware encoder is not registered in engine tests (see the platform and UI tests)");
+            continue;
+        }
         let sub = dir.0.join(format!("p{}", filmcraft_export::presets::preset_key(name)));
         std::fs::create_dir_all(&sub).unwrap();
         let path = sub.join("Demo").to_string_lossy().to_string();
@@ -153,6 +160,13 @@ fn every_builtin_preset_exports_and_ffprobe_confirms() {
                 assert_eq!(v["profile"], "High", "{name}");
                 assert_eq!(a["codec_name"], "aac", "{name}");
                 assert!((num(&a["bit_rate"]) / 1000.0 - 320.0).abs() < 80.0, "{name}: AAC {}", a["bit_rate"]);
+            }
+            "hevc" => {
+                assert!(fmt_name.contains("mp4"), "{name}: {fmt_name}");
+                assert_eq!((v["codec_name"].as_str(), v["codec_tag_string"].as_str()), (Some("hevc"), Some("hvc1")), "{name}");
+                let main10 = settings["hevcProfile"] == "main10";
+                assert_eq!(v["profile"], if main10 { "Main 10" } else { "Main" }, "{name}");
+                assert_eq!(a["codec_name"], "aac", "{name}");
             }
             "prores" => {
                 assert!(fmt_name.contains("mov"), "{name}: {fmt_name}");

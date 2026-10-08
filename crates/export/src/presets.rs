@@ -5,7 +5,7 @@
 use filmcraft_time::FrameRate;
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{AudioCodec, AudioSettings, BitrateMode, MxfVideoCodec, Scaling};
+use crate::settings::{AudioCodec, AudioSettings, BitrateMode, HevcProfile, MxfVideoCodec, Scaling};
 use crate::{ExportSettings, Format};
 
 /// A named set of export settings (`path` and `range` are left empty).
@@ -44,6 +44,11 @@ fn h264(size: Option<(u32, u32)>, kbps: u32, max_kbps: u32) -> ExportSettings {
         audio: AudioSettings { codec: AudioCodec::Aac, sample_rate: Some(48_000), channels: 2, bitrate_kbps: 320, bits: 16 },
         ..Default::default()
     }
+}
+
+/// HEVC (GPU encoded; the format is offered where the machine has a hardware HEVC encoder).
+fn hevc(size: Option<(u32, u32)>, kbps: u32, max_kbps: u32, profile: HevcProfile) -> ExportSettings {
+    ExportSettings { format: Format::Hevc, hevc_profile: profile, ..h264(size, kbps, max_kbps) }
 }
 
 fn adaptive(bpp: f32) -> ExportSettings {
@@ -101,6 +106,24 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
         p(DEFAULT_PRESET, ms, "H.264 at the sequence's frame size and rate; bitrate adapts to the frame size (0.2 bits per pixel)", adaptive(0.2)),
         p("Match Source – Adaptive Medium Bitrate", ms, "H.264 at the sequence's frame size and rate; 0.1 bits per pixel", adaptive(0.1)),
         p("Match Source – Adaptive Low Bitrate", ms, "H.264 at the sequence's frame size and rate; 0.05 bits per pixel", adaptive(0.05)),
+        p(
+            "HEVC Match Source – Adaptive High Bitrate",
+            ms,
+            "HEVC (H.265, GPU encoded) at the sequence's frame size and rate; 0.1 bits per pixel, about the quality of the H.264 preset at half the size",
+            ExportSettings { adaptive_bitrate: Some(0.1), max_bitrate_kbps: None, ..hevc(None, 10_000, 0, HevcProfile::Main) },
+        ),
+        p(
+            "HEVC Match Source – 10-bit",
+            ms,
+            "HEVC Main 10 (GPU encoded) at the sequence's frame size and rate; 0.12 bits per pixel. HDR sequences export HDR10 / HLG",
+            ExportSettings { adaptive_bitrate: Some(0.12), max_bitrate_kbps: None, ..hevc(None, 10_000, 0, HevcProfile::Main10) },
+        ),
+        p(
+            "HEVC 2160p 4K",
+            web,
+            "HEVC (H.265, GPU encoded) 3840×2160, VBR 1 pass, 35 Mbps target, AAC 320 kbps",
+            hevc(Some((3840, 2160)), 35_000, 45_000, HevcProfile::Main),
+        ),
         p("High Quality 1080p HD", web, "H.264 1920×1080, VBR 1 pass, 20 Mbps target, AAC 320 kbps", h264(Some((1920, 1080)), 20_000, 24_000)),
         p("High Quality 2160p 4K", web, "H.264 3840×2160, VBR 1 pass, 60 Mbps target, AAC 320 kbps", h264(Some((3840, 2160)), 60_000, 72_000)),
         p("YouTube 1080p Full HD", web, "H.264 1920×1080 for video sharing sites, VBR 1 pass, 16 Mbps", h264(Some((1920, 1080)), 16_000, 20_000)),

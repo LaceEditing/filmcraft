@@ -250,6 +250,8 @@ pub struct MediaPrefs {
     pub resume_growing_playback: bool,
     pub growing_refresh_seconds: u32,
     pub hardware_decoding: bool,
+    /// Exports may use the GPU's H.264 / HEVC encoders.
+    pub hardware_encoding: bool,
     pub prores_hardware_encoding: bool,
 }
 
@@ -274,6 +276,7 @@ impl Default for MediaPrefs {
             resume_growing_playback: false,
             growing_refresh_seconds: 60,
             hardware_decoding: true,
+            hardware_encoding: true,
             prores_hardware_encoding: true,
         }
     }
