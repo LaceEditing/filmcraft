@@ -147,6 +147,9 @@ pub struct Playback {
     pub cadence: frames::Cadence,
 }
 
+/// Seconds without edits before sequence thumbnails show the newest version.
+const THUMBNAIL_SETTLE_S: f64 = 1.0;
+
 /// How long `ui.screenshot` waits for the window to present the frame.
 const SCREENSHOT_TIMEOUT_S: f64 = 10.0;
 /// How long `ui.screenshot` waits for the UI to settle (monitors showing their exact frames, the
@@ -207,6 +210,14 @@ pub struct FilmcraftApp {
     pub(crate) sections: perf::Sections,
     /// Panel dragging, undocked windows' menus, layout persistence.
     pub(crate) docking: docking::DockingState,
+    /// The project revision thumbnails of sequences show: it follows the session's revision once
+    /// edits have paused (a second, no button held), so dragging a value does not re-render
+    /// every sequence thumbnail (decoding their media) for each step. (revision, last change seen
+    /// (revision, egui time)).
+    settled_revision: u64,
+    revision_seen: (u64, f64),
+    /// Mouse presses so far: each press is one gesture ([`Session::merge_scope`]).
+    presses: u64,
     /// When the last UI pass ended (the gap to the next frame is egui's paint, the GPU submit,
     /// present and the wait for the display).
     ui_end: Option<web_time::Instant>,
@@ -406,6 +417,9 @@ impl FilmcraftApp {
             fps: 60.0,
             sections: Default::default(),
             docking: Default::default(),
+            settled_revision: 0,
+            revision_seen: (0, 0.0),
+            presses: 0,
             ui_end: None,
             frame_start: None,
             intervals_playing: [0; 5],
@@ -893,6 +907,36 @@ impl FilmcraftApp {
     /// Cache revision of a project item's own frames: media changes only when its file does
     /// (relink, Make Offline, proxies on/off), so its frames survive unrelated edits; other items
     /// (sequences) follow the project revision.
+    /// While a mouse button is held (and in the frame it is released, where drags commit), edits
+    /// belong to one gesture: the same kind of edit repeated during a drag is one undo step.
+    fn track_gesture(&mut self, ctx: &egui::Context) {
+        let (pressed, down, released) = ctx.input(|i| (i.pointer.any_pressed(), i.pointer.any_down(), i.pointer.any_released()));
+        if pressed || (down && self.session.merge_scope.is_none()) {
+            self.presses += 1;
+            self.session.merge_scope = Some(format!("press{}", self.presses));
+        } else if !down && !released {
+            self.session.merge_scope = None;
+        }
+    }
+
+    /// Advance [`Self::settled_revision`] once edits have paused.
+    fn settle_revision(&mut self, ctx: &egui::Context) {
+        let (rev, now) = (self.session.revision, ctx.input(|i| i.time));
+        if self.settled_revision == 0 {
+            self.settled_revision = rev;
+        }
+        if rev != self.revision_seen.0 {
+            self.revision_seen = (rev, now);
+        }
+        if rev != self.settled_revision {
+            if now - self.revision_seen.1 >= THUMBNAIL_SETTLE_S && !ctx.input(|i| i.pointer.any_down()) {
+                self.settled_revision = rev;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(THUMBNAIL_SETTLE_S));
+            }
+        }
+    }
+
     pub fn item_revision(&self, item: filmcraft_project::ItemId) -> u64 {
         let p = &self.session.project;
         let target = match p.item(item).map(|i| &i.kind) {
@@ -920,7 +964,8 @@ impl FilmcraftApp {
         };
         let rate = pi.frame_rate();
         let frame = rate.frame_at(t);
-        let rev = self.item_revision(item);
+        // a sequence's thumbnail follows edits once they pause (see `settled_revision`)
+        let rev = if matches!(pi.kind, filmcraft_project::ItemKind::Sequence(_)) { self.settled_revision } else { self.item_revision(item) };
         let key = FrameKey { target: Target::Item(item), frame, size: width, revision: rev, draft: false };
         let name = format!("thumb-{}-{}-{}", item.0, frame, width);
         if let Some(img) = self.frames.get(&key) {
@@ -1511,6 +1556,8 @@ impl eframe::App for FilmcraftApp {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t_logic = web_time::Instant::now();
+        self.settle_revision(ctx);
+        self.track_gesture(ctx);
         if let Some(prev) = self.frame_start.replace(t_logic)
             && self.playback.playing
         {

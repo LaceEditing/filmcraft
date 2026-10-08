@@ -322,6 +322,10 @@ pub struct Session {
     pub history: History,
     pub revision: u64,
     pub saved_revision: u64,
+    /// The gesture in progress (the UI sets it while a mouse button is held, through the frame it
+    /// is released): every edit with the same label inside one gesture folds into one undo step,
+    /// so a value dragged across a hundred frames undoes back to where the press started.
+    pub merge_scope: Option<String>,
     /// Where Save writes the Premiere Pro project of a project opened from one (Settings ▸
     /// General ▸ Save a project opened from Premiere Pro): set by the first Save / export.
     pub premiere_save_path: Option<String>,
@@ -429,6 +433,7 @@ impl Session {
             history: History { limit: 200, ..Default::default() },
             revision: 1,
             saved_revision: 1,
+            merge_scope: None,
             premiere_save_path: None,
             path: None,
             state: EditorState {
@@ -746,6 +751,15 @@ impl Session {
 
     /// Apply an undoable project edit. The closure gets a mutable copy; on error nothing changes.
     pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
+        // inside a gesture (a mouse press in the UI): edits of the same kind are one undo step
+        if let Some(scope) = self.merge_scope.clone() {
+            return self.edit_merged(label, &scope, f);
+        }
+        self.edit_step(label, f)
+    }
+
+    /// One undo step, whatever the gesture.
+    fn edit_step<R>(&mut self, label: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
@@ -767,7 +781,7 @@ impl Session {
     pub fn edit_merged<R>(&mut self, label: &str, key: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
         let merge = self.history.merge_key.as_deref() == Some(key) && self.history.undo.last().is_some_and(|u| u.0 == label);
         if !merge {
-            let r = self.edit(label, f)?;
+            let r = self.edit_step(label, f)?;
             self.history.merge_key = Some(key.to_string());
             return Ok(r);
         }

@@ -140,7 +140,15 @@ struct State {
     bytes: usize,
     /// When a frame was last asked of this cache.
     last_used: Instant,
+    /// The frames asked for most recently (pts, newest last): kept when decoding elsewhere in the
+    /// stream moves the cached window, so a paused monitor's frame survives thumbnails (or
+    /// another clip of the same file) being decoded in between, instead of decoding its whole
+    /// GOP again for every edit.
+    pinned: std::collections::VecDeque<i64>,
 }
+
+/// How many recently asked-for frames a cache keeps through window moves.
+const PINNED: usize = 8;
 
 impl State {
     /// Give up the decoder (and the spare intra decoders): the next request that has to decode
@@ -378,6 +386,7 @@ impl GopCache {
                 drafts: Default::default(),
                 bytes: 0,
                 last_used: Instant::now(),
+                pinned: Default::default(),
             }),
             pool: pool.clone(),
         });
@@ -418,10 +427,12 @@ impl GopCache {
             st.bytes -= old.byte_size();
             filmcraft_frame::pool::recycle(old);
         }
-        // evict frames far from the most recent (keep a window around the working position)
-        while st.bytes > budget && st.frames.len() > 2 {
-            let (Some(&first), Some(&last)) = (st.frames.keys().next(), st.frames.keys().next_back()) else { break };
-            let victim = if pts - first > last - pts { first } else { last };
+        // evict frames far from the most recent (keep a window around the working position),
+        // never the recently asked-for ones
+        while st.bytes > budget && st.frames.len() > 2 + st.pinned.len() {
+            let Some(victim) = st.frames.keys().copied().filter(|k| *k != pts && !st.pinned.contains(k)).max_by_key(|k| (k - pts).unsigned_abs()) else {
+                break;
+            };
             if let Some(v) = st.frames.remove(&victim) {
                 st.drafts.remove(&victim);
                 st.bytes -= v.byte_size();
@@ -482,6 +493,13 @@ impl GopCache {
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let _decoding = DecodingGuard::enter(me);
         st.last_used = Instant::now();
+        if st.pinned.back() != Some(&want_pts) {
+            st.pinned.retain(|p| *p != want_pts);
+            st.pinned.push_back(want_pts);
+            if st.pinned.len() > PINNED {
+                st.pinned.pop_front();
+            }
+        }
         if let Some(f) = st.cached(want_pts, draft) {
             HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(f.clone());
@@ -778,6 +796,29 @@ mod tests {
         }
         assert_eq!(s.resets.load(Ordering::Relaxed), 1, "only the first request seeks");
         assert!(s.decodes.load(Ordering::Relaxed) <= 60 + 24 + 1);
+    }
+
+    /// A paused monitor asks for the same frame after every edit while thumbnails of other
+    /// clips of the same file are decoded in between (another GOP each time): the monitor's
+    /// frame stays cached instead of being decoded from its sync sample again for every edit.
+    #[test]
+    fn a_frame_asked_for_again_survives_decoding_elsewhere() {
+        let s = samples(3000, 250, 2, false);
+        let mut c = GopCache::new(None);
+        c.budget = 0; // room for MIN_FRAMES pictures
+        assert_eq!(index_of(&c.frame(&s, 1_190_000).expect("frame")), 1190);
+        let resets = s.resets.load(Ordering::Relaxed);
+        let decodes = s.decodes.load(Ordering::Relaxed);
+        for (round, elsewhere) in [1_800usize, 2_600, 300, 2_100].into_iter().enumerate() {
+            // a thumbnail: its own GOP, far away, enough pictures to move the whole window
+            assert_eq!(index_of(&c.frame(&s, elsewhere as i64 * 1000).expect("frame")), elsewhere);
+            // the monitor again: answered from the cache
+            let before = s.decodes.load(Ordering::Relaxed);
+            assert_eq!(index_of(&c.frame(&s, 1_190_000).expect("frame")), 1190);
+            assert_eq!(s.decodes.load(Ordering::Relaxed), before, "round {round}: decoded again");
+        }
+        assert_eq!(s.resets.load(Ordering::Relaxed), resets + 4, "one seek per thumbnail, none for the monitor");
+        assert!(s.decodes.load(Ordering::Relaxed) > decodes);
     }
 
     #[test]

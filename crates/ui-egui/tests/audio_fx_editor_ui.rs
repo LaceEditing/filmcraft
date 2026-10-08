@@ -173,12 +173,17 @@ fn parametric_eq_editor_from_effect_controls() {
     // band toggle by id
     d.click("fxEditor.parametric_eq.toggle.hp_on");
     assert!(truthy(&d.clip_param(clip, "parametric_eq", "hp_on")));
-    // dragging band 3 up boosts it — one undo step for the whole drag
+    // dragging band 3 up boosts it — one undo step for the whole drag (frequency and gain are
+    // committed on release, in the same gesture)
     let undo0 = d.undo_len();
+    let g0 = num(&d.clip_param(clip, "parametric_eq", "mid_gain"));
     d.drag("fxEditor.parametric_eq.node.mid", 0.0, -60.0, 6);
     let g = num(&d.clip_param(clip, "parametric_eq", "mid_gain"));
     assert!(g > 3.0, "mid gain after drag: {g}");
-    assert_eq!(d.undo_len(), undo0 + 2, "frequency + gain committed on release");
+    assert_eq!(d.undo_len(), undo0 + 1, "the drag is one undo step");
+    d.exec("edit.undo", json!({}));
+    assert_eq!(num(&d.clip_param(clip, "parametric_eq", "mid_gain")), g0, "one undo takes the whole drag back");
+    d.exec("edit.redo", json!({}));
     d.snapshot("fx-editor-parametric-eq");
     d.click("fxEditor.parametric_eq.close");
     assert!(d.ids("fxEditor.parametric_eq.").is_empty(), "window closed");

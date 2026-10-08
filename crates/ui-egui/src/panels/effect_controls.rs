@@ -12,6 +12,50 @@ use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
 const ROW_H: f32 = 22.0;
+/// Height of the keyframe lane's time ruler.
+const RULER_H: f32 = 16.0;
+
+/// The keyframe lane's time ruler: ticks and sequence timecodes over the clip `start` +
+/// `duration`. Steps are whole frames or whole seconds of timecode (so labels read 00:00:02:00,
+/// not a rounded 00:00:01:23), spaced so the labels never crowd; a label that would run off the
+/// lane is left out.
+fn lane_ruler(ui: &egui::Ui, r: Rect, start: Tick, duration: Tick, rate: filmcraft_time::FrameRate, drop_frame: bool, t: &Tokens) {
+    let p = ui.painter().with_clip_rect(r);
+    p.rect_filled(r, 0.0, Color32::from_rgb(0x26, 0x26, 0x26));
+    p.line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, t.separator));
+    let span = duration.0.max(1) as f64;
+    let x_of = |tk: Tick| r.min.x + ((tk - start).0 as f64 / span) as f32 * r.width();
+    let nominal = rate.as_f64().round().max(1.0) as i64;
+    let total_frames = (rate.frame_at(start + duration) - rate.frame_at(start)).max(1);
+    let px_per_frame = r.width() as f64 / total_frames as f64;
+    // label every `step` frames: 1, 2, 5, 10 frames, then 1, 2, 5, 10, 15, 30 s, 1, 2, 5, 10, 15, 30 min, 1 h
+    let steps = [1, 2, 5, 10].into_iter().chain([1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600].into_iter().map(|s| s * nominal));
+    let step = steps.clone().find(|s| *s as f64 * px_per_frame >= 90.0).unwrap_or(3600 * nominal);
+    let minor = match step {
+        s if s >= 5 && s % 5 == 0 => s / 5,
+        s if s % 2 == 0 => s / 2,
+        s => s,
+    }
+    .max(1);
+    let (f0, f1) = (rate.frame_at(start), rate.frame_at(start + duration));
+    let mut f = (f0 + minor - 1).div_euclid(minor) * minor;
+    let mut n = 0;
+    while f <= f1 && n < 4000 {
+        let x = x_of(rate.tick_of(f));
+        let major = f % step == 0;
+        let h = if major { 7.0 } else { 3.0 };
+        p.line_segment([pos2(x, r.max.y - h), pos2(x, r.max.y)], Stroke::new(1.0, if major { t.text_dim } else { t.text_faint }));
+        if major {
+            let tc = filmcraft_time::format_time(rate.tick_of(f), rate, drop_frame, filmcraft_time::TimeDisplay::Timecode, 48000);
+            let g = p.layout_no_wrap(tc, Tokens::ui(9.5), t.text_dim);
+            if x + 3.0 + g.size().x <= r.max.x {
+                p.galley(pos2(x + 3.0, r.min.y + 1.0), g, t.text_dim);
+            }
+        }
+        f += minor;
+        n += 1;
+    }
+}
 
 fn selected_clip(app: &FilmcraftApp) -> Option<(ClipId, TrackItem, filmcraft_project::TrackKind)> {
     let seq = app.session.active_sequence()?;
@@ -58,9 +102,14 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ph = app.session.playhead();
     let dur = it.duration.0.max(1) as f64;
     let lx = |tk: Tick| -> f32 { lane.min.x + (((tk - it.start).0 as f64 / dur) as f32).clamp(0.0, 1.0) * lane.width() };
-    ui.painter().rect_filled(Rect::from_min_max(pos2(lane.min.x, lane.min.y + 2.0), pos2(lane.max.x, lane.min.y + 16.0)), 2.0, Color32::from_rgb(58, 58, 70));
-    ui.painter().text(pos2(lane.min.x + 4.0, lane.min.y + 9.0), Align2::LEFT_CENTER, &it.name, Tokens::ui(10.0), t.text);
-    let scrub = Rect::from_min_max(lane.min, pos2(lane.max.x, lane.min.y + 18.0));
+    // time ruler over the clip (sequence timecode), then the clip bar
+    let rate = seq.settings.frame_rate;
+    let ruler = Rect::from_min_max(lane.min, pos2(lane.max.x, lane.min.y + RULER_H));
+    lane_ruler(ui, ruler, it.start, it.duration, rate, seq.settings.drop_frame, &t);
+    let bar = Rect::from_min_max(pos2(lane.min.x, ruler.max.y + 1.0), pos2(lane.max.x, ruler.max.y + 13.0));
+    ui.painter().rect_filled(bar, 2.0, Color32::from_rgb(58, 58, 70));
+    ui.painter().with_clip_rect(bar).text(pos2(bar.min.x + 4.0, bar.center().y), Align2::LEFT_CENTER, &it.name, Tokens::ui(10.0), t.text);
+    let scrub = Rect::from_min_max(lane.min, pos2(lane.max.x, bar.max.y));
     let sresp = ui.interact(scrub, egui::Id::new(("ec-scrub", clip.0)), Sense::click_and_drag());
     app.auto.add("effectControls.lane", lane, "keyframe lane");
     if (sresp.dragged() || sresp.clicked())
@@ -117,6 +166,22 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 actions.push(("effects.reset".into(), json!({"clip": clip.0, "index": idx})));
             }
             app.auto.add(&format!("effectControls.effect.{}", e.effect), r, def.name);
+            // summary keyframes: every time any parameter of the effect has one
+            let mut times: Vec<Tick> = e.params.values().flat_map(|p| p.keyframes.iter().map(|k| k.time)).collect();
+            times.sort_unstable();
+            times.dedup();
+            for mt in times {
+                let tl = it.start + Tick(((mt - it.source_in).0 as f64 / it.speed.abs().max(1e-6)) as i64);
+                if tl < it.start || tl > it.end() {
+                    continue;
+                }
+                let c = pos2(lx(tl), r.center().y);
+                bui.painter().add(egui::Shape::convex_polygon(
+                    vec![c + vec2(0.0, -3.5), c + vec2(3.5, 0.0), c + vec2(0.0, 3.5), c + vec2(-3.5, 0.0)],
+                    t.text_faint,
+                    Stroke::NONE,
+                ));
+            }
             if resp.clicked() && !fxresp.clicked() && !rresp.clicked() {
                 if open {
                     app.ui.collapsed_fx.push(key.clone());
@@ -163,9 +228,14 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     });
     let _ = scroll_out;
-    // playhead in lane
-    let px = lx(ph);
-    ui.painter().line_segment([pos2(px, lane.min.y), pos2(px, lane.max.y)], Stroke::new(1.0, t.playhead));
+    // playhead in lane, with its head on the ruler (only while it is over the clip)
+    if ph >= it.start && ph < it.end() {
+        let px = lx(ph);
+        ui.painter().line_segment([pos2(px, lane.min.y + 6.0), pos2(px, lane.max.y)], Stroke::new(1.0, t.playhead));
+        let y0 = lane.min.y + 1.0;
+        let head = vec![pos2(px - 5.0, y0), pos2(px + 5.0, y0), pos2(px + 5.0, y0 + 7.0), pos2(px, y0 + 12.0), pos2(px - 5.0, y0 + 7.0)];
+        ui.painter().add(egui::Shape::convex_polygon(head, t.playhead, Stroke::NONE));
+    }
     // footer timecode
     let tc = filmcraft_time::format_time(ph, seq.settings.frame_rate, seq.settings.drop_frame, filmcraft_time::TimeDisplay::Timecode, 48000);
     ui.painter().text(pos2(rect.min.x + 10.0, rect.max.y - 13.0), Align2::LEFT_CENTER, tc, Tokens::mono(13.0), t.timecode);
@@ -272,20 +342,24 @@ pub(crate) fn param_row(
     match (&pd.kind, &value) {
         (ParamKind::Float { min, max, soft_min, soft_max, unit, decimals }, ParamValue::Float(v)) => {
             let speed = ((soft_max - soft_min) / 400.0).max(0.01);
-            let (_, nv) = crate::widgets::hot_number(&mut vui, id, *v, speed, (*min, *max), *decimals as usize, unit, &t);
+            let (vr, nv) = crate::widgets::hot_number(&mut vui, id, *v, speed, (*min, *max), *decimals as usize, unit, &t);
+            app.auto.add(&format!("effectControls.{}.{}.value", e.effect, pkey), vr.rect, pd.label);
             if let Some(nv) = nv {
                 set = Some(json!(nv));
             }
         }
         (ParamKind::Angle, ParamValue::Float(v)) => {
-            let (_, nv) = crate::widgets::hot_number(&mut vui, id, *v, 0.5, (-36000.0, 36000.0), 1, "°", &t);
+            let (vr, nv) = crate::widgets::hot_number(&mut vui, id, *v, 0.5, (-36000.0, 36000.0), 1, "°", &t);
+            app.auto.add(&format!("effectControls.{}.{}.value", e.effect, pkey), vr.rect, pd.label);
             if let Some(nv) = nv {
                 set = Some(json!(nv));
             }
         }
         (ParamKind::Point, ParamValue::Vec2(p)) => {
-            let (_, nx) = crate::widgets::hot_number(&mut vui, id.with("x"), p.x, 1.0, (-100_000.0, 100_000.0), 1, "", &t);
-            let (_, ny) = crate::widgets::hot_number(&mut vui, id.with("y"), p.y, 1.0, (-100_000.0, 100_000.0), 1, "", &t);
+            let (xr, nx) = crate::widgets::hot_number(&mut vui, id.with("x"), p.x, 1.0, (-100_000.0, 100_000.0), 1, "", &t);
+            let (yr, ny) = crate::widgets::hot_number(&mut vui, id.with("y"), p.y, 1.0, (-100_000.0, 100_000.0), 1, "", &t);
+            app.auto.add(&format!("effectControls.{}.{}.x", e.effect, pkey), xr.rect, pd.label);
+            app.auto.add(&format!("effectControls.{}.{}.y", e.effect, pkey), yr.rect, pd.label);
             if nx.is_some() || ny.is_some() {
                 set = Some(json!([nx.unwrap_or(p.x), ny.unwrap_or(p.y)]));
             }
@@ -382,6 +456,25 @@ pub(crate) fn param_row(
         let y = r.center().y;
         let dur = it.duration.0.max(1) as f64;
         let rate = app.session.sequence_rate();
+        // the animated spans: a line from each keyframe to the next (dashed after a Hold key,
+        // whose value does not change until the next one)
+        let kx = |k: Tick| {
+            lane.min.x + (((it.start + Tick(((k - it.source_in).0 as f64 / it.speed.abs().max(1e-6)) as i64) - it.start).0 as f64 / dur) as f32) * lane.width()
+        };
+        let span = ui.painter().with_clip_rect(lane.intersect(ui.clip_rect()));
+        for w in param.keyframes.windows(2) {
+            let (a, b) = (kx(w[0].time), kx(w[1].time));
+            let (a, b) = (a.max(lane.min.x), b.min(lane.max.x));
+            if b - a < 12.0 {
+                continue;
+            }
+            let col = Color32::from_rgb(0x6a, 0x6a, 0x72);
+            if w[0].interp == filmcraft_project::Interpolation::Hold {
+                span.add(egui::Shape::dashed_line(&[pos2(a + 6.0, y), pos2(b - 6.0, y)], Stroke::new(1.0, col), 4.0, 3.0));
+            } else {
+                span.line_segment([pos2(a + 6.0, y), pos2(b - 6.0, y)], Stroke::new(1.0, col));
+            }
+        }
         for k in &param.keyframes {
             let tl = it.start + Tick(((k.time - it.source_in).0 as f64 / it.speed.abs().max(1e-6)) as i64);
             let f = ((tl - it.start).0 as f64 / dur) as f32;
@@ -393,6 +486,12 @@ pub(crate) fn param_row(
             let kx = lane.min.x + f * lane.width() + drag_off.unwrap_or(0.0);
             let kr = Rect::from_center_size(pos2(kx, y), vec2(11.0, 11.0));
             let resp = ui.interact(kr.expand(2.0), id, Sense::click_and_drag());
+            let resp = resp.on_hover_text(format!(
+                "{}  ·  {}  ·  {}",
+                filmcraft_time::format_time(tl, rate, false, filmcraft_time::TimeDisplay::Timecode, 48000),
+                value_text(pd, &k.value),
+                k.interp.label()
+            ));
             app.auto.add(&format!("effectControls.{}.{}.keyframe.{}", e.effect, pkey, k.time.0), kr, "keyframe");
             let sel = k.time == mt || resp.dragged();
             let col = if sel { t.hot_text } else { Color32::from_rgb(0xb0, 0xb0, 0xb0) };
@@ -618,9 +717,11 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 );
                 match val("motion", p) {
                     Some(ParamValue::Vec2(v)) => {
-                        let (_, nx) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp", p, "x", clip.0)), v.x, speed, range, 0, " X", &t);
+                        let (xr, nx) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp", p, "x", clip.0)), v.x, speed, range, 0, " X", &t);
                         vui.add_space(10.0);
-                        let (_, ny) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp", p, "y", clip.0)), v.y, speed, range, 0, " Y", &t);
+                        let (yr, ny) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp", p, "y", clip.0)), v.y, speed, range, 0, " Y", &t);
+                        app.auto.add(&format!("properties.motion.{p}.x"), xr.rect, label);
+                        app.auto.add(&format!("properties.motion.{p}.y"), yr.rect, label);
                         if nx.is_some() || ny.is_some() {
                             actions.push((
                                 "effects.setParam".into(),
@@ -629,8 +730,9 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                     }
                     Some(ParamValue::Float(v)) => {
-                        let (_, nv) =
+                        let (vr, nv) =
                             crate::widgets::hot_number(&mut vui, egui::Id::new(("pp", p, clip.0)), v, speed, range, if p == "scale" { 0 } else { 1 }, unit, &t);
+                        app.auto.add(&format!("properties.motion.{p}.value"), vr.rect, label);
                         if let Some(nv) = nv {
                             actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": "motion", "param": p, "value": nv})));
                         }
@@ -648,7 +750,8 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
             if let Some(ParamValue::Float(v)) = val("opacity", "opacity") {
-                let (_, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp-op", clip.0)), v, 0.5, (0.0, 100.0), 0, " %", &t);
+                let (vr, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp-op", clip.0)), v, 0.5, (0.0, 100.0), 0, " %", &t);
+                app.auto.add("properties.opacity.opacity.value", vr.rect, "Opacity");
                 if let Some(nv) = nv {
                     actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": "opacity", "param": "opacity", "value": nv})));
                 }
@@ -853,6 +956,19 @@ pub(crate) fn graph_rows(
             let nv = if let ParamKind::Float { min, max, .. } = pd.kind { nv.clamp(min, max) } else { nv };
             actions.push(("effects.setKeyframe".into(), with_mask(json!({"clip": clip.0, "effect": idx, "param": pd.id, "mediaTime": k.time.0, "value": nv}))));
         }
+    }
+}
+
+/// A keyframe's value as the panel shows it (tooltips).
+fn value_text(pd: &filmcraft_project::ParamDef, v: &ParamValue) -> String {
+    match (&pd.kind, v) {
+        (ParamKind::Float { decimals, unit, .. }, ParamValue::Float(x)) => format!("{x:.prec$}{unit}", prec = *decimals as usize),
+        (ParamKind::Angle, ParamValue::Float(x)) => format!("{x:.1}°"),
+        (_, ParamValue::Float(x)) => format!("{x:.2}"),
+        (_, ParamValue::Vec2(p)) => format!("{:.1}, {:.1}", p.x, p.y),
+        (_, ParamValue::Bool(b)) => if *b { "On" } else { "Off" }.to_string(),
+        (ParamKind::Choice(opts), ParamValue::Choice(c)) => opts.get(*c as usize).copied().unwrap_or("").to_string(),
+        (_, other) => format!("{other:?}"),
     }
 }
 

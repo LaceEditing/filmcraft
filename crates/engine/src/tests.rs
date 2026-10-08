@@ -415,3 +415,50 @@ fn fps_validation_keeps_real_rates_and_refuses_degenerate_ones() {
     assert_eq!(s.sequence_rate(), before);
     assert_eq!(s.execute("project.inspect", json!({})).unwrap().to_string().len(), n, "no sequence was created");
 }
+
+/// A gesture (the UI holds `merge_scope` while a mouse button is down): a value dragged through
+/// many steps is one undo step back to where the press started; the next press is a new step,
+/// and another kind of edit inside the same press is a step of its own.
+#[test]
+fn edits_inside_one_gesture_undo_together() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", serde_json::json!({})).unwrap();
+    let seq = s.active_sequence().unwrap();
+    let clip = seq.video_tracks[0].items[0].id.0;
+    let scale = |s: &Session| s.active_sequence().unwrap().video_tracks[0].items[0].effect("motion").unwrap().f64_at("scale", Tick::ZERO);
+    let set =
+        |s: &mut Session, v: f64| s.execute("effects.setParam", serde_json::json!({"clip": clip, "effect": "motion", "param": "scale", "value": v})).unwrap();
+    assert_eq!(scale(&s), 100.0);
+    let steps = s.history.undo.len();
+    s.merge_scope = Some("press1".into());
+    for v in [101.0, 110.0, 150.0, 240.0] {
+        set(&mut s, v);
+    }
+    assert_eq!(s.history.undo.len(), steps + 1, "one undo step for the drag");
+    // a second press on the same control: a step of its own
+    s.merge_scope = Some("press2".into());
+    set(&mut s, 260.0);
+    set(&mut s, 280.0);
+    // another kind of edit during that press: not folded into the parameter change
+    s.execute("effects.toggleAnimation", serde_json::json!({"clip": clip, "effect": "motion", "param": "rotation"})).unwrap();
+    s.merge_scope = None;
+    assert_eq!(s.history.undo.len(), steps + 3);
+    s.undo();
+    assert_eq!(scale(&s), 280.0);
+    s.undo();
+    assert_eq!(scale(&s), 240.0, "the second drag undone as a whole");
+    s.undo();
+    assert_eq!(scale(&s), 100.0, "the first drag undone back to before the press");
+    // undo / redo never fold the next edit into an older step
+    s.redo();
+    s.merge_scope = Some("press1".into());
+    set(&mut s, 120.0);
+    s.merge_scope = None;
+    s.undo();
+    assert_eq!(scale(&s), 240.0);
+    // without a gesture every change is a step (keyboard, agents)
+    set(&mut s, 130.0);
+    set(&mut s, 140.0);
+    s.undo();
+    assert_eq!(scale(&s), 130.0);
+}
