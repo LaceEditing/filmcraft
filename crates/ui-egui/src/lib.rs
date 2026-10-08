@@ -936,6 +936,34 @@ impl FilmcraftApp {
                 let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
                 self.session.execute("captions.import", json!({"path": path})).map_err(|e| e.to_string())
             }
+            // File ▸ Export ▸ Premiere Pro Project…: next to the original, never over it by default
+            "file.exportPrproj" => {
+                let source = self
+                    .session
+                    .project
+                    .items
+                    .values()
+                    .find_map(|i| i.metadata.get(filmcraft_engine::interchange::PREMIERE_SOURCE).cloned())
+                    .unwrap_or_default();
+                let stem =
+                    std::path::Path::new(&source).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.session.project.name.clone());
+                let suggested = format!("{stem} (FilmCraft).prproj");
+                let Some(path) = self.hooks.pick_save_as.as_mut().and_then(|f| f("Premiere Pro Project", &["prproj"], &suggested)) else {
+                    return Ok(Value::Null);
+                };
+                let mut p = params.clone();
+                p["path"] = json!(path);
+                let r = self.session.execute("file.exportPrproj", p).map_err(|e| e.to_string());
+                match &r {
+                    Ok(v) => {
+                        let notes: Vec<String> =
+                            v["report"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                        self.ui.status = if notes.is_empty() { format!("Exported {path}") } else { format!("Exported {path}: {}", notes.join("; ")) };
+                    }
+                    Err(e) => self.ui.status = e.clone(),
+                }
+                r
+            }
             "captions.export" => {
                 let name = self.session.state.active_sequence.and_then(|s| self.session.project.item(s)).map(|i| i.name.clone()).unwrap_or_default();
                 let suggested = format!("{}.srt", name.replace(' ', "_"));

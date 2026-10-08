@@ -3,7 +3,7 @@
 //! There is no published specification for this format. Everything here is derived from
 //! observing project files saved by Premiere Pro (gzip-compressed XML, root `<PremiereData
 //! Version="3">`); no application internals were inspected. The observations are recorded in this
-//! crate's README (`prproj` section). Import is one-way: FilmCraft never writes `.prproj`.
+//! crate's README (`prproj` section). Writing back into the same project is [`crate::prproj_write`].
 //!
 //! The document is a flat list of objects under the root, each with an `ObjectID` (integer) or
 //! `ObjectUID` (UUID). Objects point at each other with `ObjectRef` / `ObjectURef` attributes; only
@@ -12,47 +12,48 @@
 //!
 //! Mapped: the bin tree, media (path, picture size, frame rate, sample rate, channels), sequences
 //! (frame size, rate, sample rate, track names), clips (position, source in point, speed,
-//! reverse), nested sequences, video/audio links, transitions, Motion (position, scale, scale
-//! width, uniform scale, rotation, anchor point, anti-flicker) and Opacity with keyframes, clip
-//! volume, and markers on media and sequences. Everything else (third-party and most native
-//! effects, titles made with the legacy Text effect, masks, Essential Sound) is listed in the
-//! [`Report`].
+//! reverse, frame holds), nested sequences, video/audio links, transitions, Motion, Opacity and
+//! clip volume with keyframes and easing, effects FilmCraft has under the same name (their numeric,
+//! boolean and point parameters), and markers on media and sequences. Everything else is listed
+//! in the [`Report`].
+//!
+//! For round trips, every clip remembers the Premiere track item it came from
+//! ([`filmcraft_project::TrackItem::origin`]), media items and sequences their Premiere UIDs in
+//! their metadata ([`META_MEDIA`], [`META_SEQUENCE`]), and sequences the source document
+//! ([`META_SOURCE`], [`META_FINGERPRINT`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use filmcraft_geom::Vec2;
 use filmcraft_media::MediaKind;
-use filmcraft_project::{
-    BinId, ClipId, Interpolation, ItemId, Keyframe, Label, Marker, MarkerId, MarkerKind, Param, ParamValue, Sequence, TrackKind, Transition, TransitionAlign,
-    TransitionId,
-};
+use filmcraft_project::{BinId, ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, Sequence, TrackKind, Transition, TransitionAlign, TransitionId};
 use filmcraft_time::{FrameRate, Tick};
 use roxmltree::Node;
 
-use crate::common::{
-    Builder, MediaSpec, empty_sequence, file_name, gain_to_db, is_absolute, kind_from_ext, resolve_path, set_param, settings_for, transition_effect,
-};
+use crate::common::{Builder, MediaSpec, empty_sequence, file_name, is_absolute, kind_from_ext, resolve_path, set_param, settings_for, transition_effect};
+use crate::prproj_fx::{self, Ctx, MAX_TIME, Target};
+use crate::prproj_graph::{self, Index, TICKS_PER_SECOND};
 use crate::xml::{child, child_text, path_text};
 use crate::{Error, Format, ImportOptions, Imported, Report, Result};
 
-/// Premiere ticks per second (identical to FilmCraft's [`Tick`] resolution).
-const TICKS_PER_SECOND: i64 = 254_016_000_000;
-/// Inflated documents larger than this are refused (a 2-hour, 5 000-clip project is ~100 MB).
-const MAX_XML_BYTES: usize = 1 << 30;
-/// Stored clip volume of a clip at 0 dB (observed: every untouched clip carries this value, i.e. the
-/// stored value is linear gain with +15 dB of headroom above 1.0).
-const UNITY_LEVEL: f64 = 0.177_827_941_003_892_3;
-/// `StartKeyframe` time meaning "before the start of time" (a static value).
-const STATIC_TIME: i64 = -91_445_760_000_000_000;
+/// Item metadata: the Premiere `Media` UID(s) behind a media item (comma-separated when Premiere
+/// holds several media objects for one file).
+pub const META_MEDIA: &str = "premiere.media";
+/// Item metadata: the Premiere `Sequence` UID behind a sequence item.
+pub const META_SEQUENCE: &str = "premiere.sequence";
+/// Sequence item metadata: the `.prproj` the sequence was imported from.
+pub const META_SOURCE: &str = "premiere.source";
+/// Sequence item metadata: the fingerprint of that document when it was imported.
+pub const META_FINGERPRINT: &str = "premiere.fingerprint";
+
 /// Nested bins deeper than this are not followed.
 const MAX_DEPTH: usize = 64;
-/// Times from the document are clamped to 48 hours, speeds to 0.1 %–10 000 %, so that no
-/// position, duration or source range can overflow [`Tick`] arithmetic.
-const MAX_TIME: i64 = 48 * 3600 * TICKS_PER_SECOND;
-const SPEED_RANGE: (f64, f64) = (0.001, 100.0);
+/// Speeds are clamped to 0.1 %–10 000 % so no source range can overflow [`Tick`] arithmetic.
+pub(crate) const SPEED_RANGE: (f64, f64) = (0.001, 100.0);
+/// Premiere's `FrameHold` value for "hold on the frame at `FrameHoldStart`".
+pub(crate) const FRAME_HOLD_AT: &str = "4";
 
 /// A time read from the document, clamped to `0..=MAX_TIME`.
-fn time(s: Option<&str>) -> Option<i64> {
+pub(crate) fn time(s: Option<&str>) -> Option<i64> {
     s.and_then(parse_i64).map(|t| t.clamp(0, MAX_TIME))
 }
 
@@ -67,69 +68,28 @@ pub(crate) fn sniff(bytes: &[u8], extension: Option<&str>) -> bool {
     head.contains("<PremiereData")
 }
 
-/// Undo the gzip wrapper (RFC 1952) if there is one.
-fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
-    if !bytes.starts_with(&[0x1f, 0x8b]) {
-        return Ok(bytes.to_vec());
-    }
-    let bad = |m: &str| Error::parse(Format::Prproj, m.to_string());
-    let header = bytes.get(..10).ok_or_else(|| bad("truncated gzip header"))?;
-    if header.get(2) != Some(&8) {
-        return Err(bad("unsupported gzip compression method"));
-    }
-    let flags = header.get(3).copied().unwrap_or(0);
-    let mut pos = 10usize;
-    if flags & 0x04 != 0 {
-        // FEXTRA: two-byte little-endian length, then the field
-        let len = bytes.get(pos..pos + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or_else(|| bad("truncated gzip extra field"))?;
-        pos = pos.saturating_add(2).saturating_add(len);
-    }
-    for flag in [0x08u8, 0x10] {
-        // FNAME, FCOMMENT: zero-terminated strings
-        if flags & flag != 0 {
-            let rest = bytes.get(pos..).ok_or_else(|| bad("truncated gzip header"))?;
-            let end = rest.iter().position(|&b| b == 0).ok_or_else(|| bad("unterminated gzip header string"))?;
-            pos = pos.saturating_add(end + 1);
-        }
-    }
-    if flags & 0x02 != 0 {
-        pos = pos.saturating_add(2); // FHCRC
-    }
-    let body = bytes.get(pos..).ok_or_else(|| bad("truncated gzip stream"))?;
-    miniz_oxide::inflate::decompress_to_vec_with_limit(body, MAX_XML_BYTES).map_err(|e| bad(&format!("gzip data is damaged or too large ({:?})", e.status)))
-}
-
 /// Import a Premiere project.
 pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) -> Result<Imported> {
-    let raw = decompress(bytes)?;
+    let (raw, _) = prproj_graph::decompress(bytes)?;
     let text = String::from_utf8_lossy(&raw);
     let doc = crate::xml::parse(&text).map_err(|e| Error::parse(Format::Prproj, e))?;
     let root = doc.root_element();
     if root.tag_name().name() != "PremiereData" {
         return Err(Error::parse(Format::Prproj, "root element is not <PremiereData>"));
     }
-    let mut ids = HashMap::new();
-    let mut uids = HashMap::new();
-    for n in root.children().filter(Node::is_element) {
-        if let Some(id) = n.attribute("ObjectID") {
-            ids.insert(id, n);
-        }
-        if let Some(uid) = n.attribute("ObjectUID") {
-            uids.insert(uid, n);
-        }
-    }
     let name = opts.name.clone().unwrap_or_else(|| "Premiere Project".to_string());
     let mut imp = Imp {
         b: Builder::new(&name),
+        ix: Index::new(root),
         opts,
         report,
-        ids,
-        uids,
+        fingerprint: prproj_graph::fingerprint(bytes),
         seq_items: HashMap::new(),
         seq_nodes: Vec::new(),
         seq_markers: HashMap::new(),
         links: HashMap::new(),
         nested: HashSet::new(),
+        unmapped: BTreeMap::new(),
     };
     imp.collect_links(root);
     match root.children().find(|n| n.has_tag_name("RootProjectItem")) {
@@ -147,6 +107,10 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
     let seqs = std::mem::take(&mut imp.seq_nodes);
     for (node, id) in &seqs {
         imp.fill_sequence(*node, *id);
+    }
+    for (effect, params) in std::mem::take(&mut imp.unmapped) {
+        let list: Vec<&str> = params.iter().map(String::as_str).collect();
+        imp.report.warn(format!("effect \"{effect}\": parameter(s) {} not carried over (kept as they are when exporting back to Premiere)", list.join(", ")));
     }
     let mut top: Vec<ItemId> = seqs.iter().map(|(_, id)| *id).filter(|id| !imp.nested.contains(id)).collect();
     if top.is_empty() {
@@ -171,10 +135,10 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
 
 struct Imp<'a, 'i, 'r> {
     b: Builder,
+    ix: Index<'a, 'i>,
     opts: &'r ImportOptions,
     report: &'r mut Report,
-    ids: HashMap<&'a str, Node<'a, 'i>>,
-    uids: HashMap<&'a str, Node<'a, 'i>>,
+    fingerprint: String,
     /// Sequence `ObjectUID` → its item.
     seq_items: HashMap<&'a str, ItemId>,
     /// Sequences to fill, in document (bin) order.
@@ -185,33 +149,14 @@ struct Imp<'a, 'i, 'r> {
     links: HashMap<&'a str, u64>,
     /// Sequences used as clips inside other sequences.
     nested: HashSet<ItemId>,
+    /// Effect → parameters that could not be mapped (reported once per effect).
+    unmapped: BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
-    /// The object an `ObjectRef` / `ObjectURef` element points at.
-    fn resolve(&self, r: Option<Node<'a, 'i>>) -> Option<Node<'a, 'i>> {
-        let r = r?;
-        if let Some(id) = r.attribute("ObjectRef") {
-            return self.ids.get(id).copied();
-        }
-        r.attribute("ObjectURef").and_then(|u| self.uids.get(u).copied())
-    }
-
-    fn at(&self, n: Node<'a, 'i>, path: &[&str]) -> Option<Node<'a, 'i>> {
-        let mut cur = n;
-        for p in path {
-            cur = child(cur, p)?;
-        }
-        Some(cur)
-    }
-
-    fn follow(&self, n: Node<'a, 'i>, path: &[&str]) -> Option<Node<'a, 'i>> {
-        self.resolve(self.at(n, path))
-    }
-
     fn collect_links(&mut self, root: Node<'a, 'i>) {
         for l in root.children().filter(|n| n.has_tag_name("Link")) {
-            let Some(items) = self.at(l, &["TrackItemGroup", "TrackItems"]) else { continue };
+            let Some(items) = self.ix.at(l, &["TrackItemGroup", "TrackItems"]) else { continue };
             let members: Vec<&'a str> = items.children().filter(|n| n.has_tag_name("TrackItem")).filter_map(|n| n.attribute("ObjectRef")).collect();
             if members.len() < 2 {
                 continue;
@@ -232,9 +177,9 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             self.report.warn("bins nested too deeply; the rest were not imported");
             return;
         }
-        let Some(items) = self.at(container, &["ProjectItemContainer", "Items"]) else { return };
+        let Some(items) = self.ix.at(container, &["ProjectItemContainer", "Items"]) else { return };
         for r in items.children().filter(|n| n.has_tag_name("Item")) {
-            let Some(item) = self.resolve(Some(r)) else { continue };
+            let Some(item) = self.ix.resolve(Some(r)) else { continue };
             let name = path_text(item, &["ProjectItem", "Name"]).unwrap_or("Untitled");
             match item.tag_name().name() {
                 "BinProjectItem" => {
@@ -249,12 +194,10 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
 
     /// A Project panel clip: media or a sequence.
     fn project_clip(&mut self, item: Node<'a, 'i>, name: &str, bin: Option<BinId>) {
-        let Some(master) = self.follow(item, &["MasterClip"]) else { return };
+        let Some(master) = self.ix.follow(item, &["MasterClip"]) else { return };
         let markers = self.master_markers(master);
-        for c in self.at(master, &["Clips"]).into_iter().flat_map(|c| c.children().filter(|n| n.has_tag_name("Clip"))) {
-            let Some(clip) = self.resolve(Some(c)) else { continue };
-            let Some(source) = self.follow(clip, &["Clip", "Source"]) else { continue };
-            if let Some(seq) = self.follow(source, &["SequenceSource", "Sequence"]) {
+        for clip in self.ix.list(master, &["Clips"], "Clip") {
+            if let Some(seq) = prproj_graph::clip_sequence(&self.ix, clip) {
                 if let Some(uid) = seq.attribute("ObjectUID") {
                     if !self.seq_items.contains_key(uid) {
                         self.reserve_sequence(seq, name, bin);
@@ -263,7 +206,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 }
                 return;
             }
-            if let Some(media) = self.follow(source, &["MediaSource", "Media"]) {
+            if let Some(media) = prproj_graph::clip_media(&self.ix, clip) {
                 if let Some(id) = self.media(media, Some(name), bin)
                     && let Some(m) = self.b.p.item_mut(id).and_then(|i| i.as_media_mut())
                     && m.markers.is_empty()
@@ -277,10 +220,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
 
     /// Markers on a master clip (shared by its video and audio clips).
     fn master_markers(&mut self, master: Node<'a, 'i>) -> Vec<Marker> {
-        let clips: Vec<Node> = self.at(master, &["Clips"]).into_iter().flat_map(|c| c.children().filter(|n| n.has_tag_name("Clip"))).collect();
-        for c in clips {
-            let Some(clip) = self.resolve(Some(c)) else { continue };
-            if let Some(markers) = self.follow(clip, &["Clip", "MarkerOwner", "Markers"]) {
+        for clip in self.ix.list(master, &["Clips"], "Clip") {
+            if let Some(markers) = self.ix.follow(clip, &["Clip", "MarkerOwner", "Markers"]) {
                 let out = self.markers(markers);
                 if !out.is_empty() {
                     return out;
@@ -292,9 +233,9 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
 
     fn markers(&mut self, owner: Node<'a, 'i>) -> Vec<Marker> {
         let mut out = Vec::new();
-        let Some(list) = self.at(owner, &["Markers"]) else { return out };
+        let Some(list) = self.ix.at(owner, &["Markers"]) else { return out };
         for m in list.children().filter(|n| n.has_tag_name("Marker")) {
-            let Some(obj) = self.follow(m, &["Second"]) else { continue };
+            let Some(obj) = self.ix.follow(m, &["Second"]) else { continue };
             let Some(json) = child_text(obj, "DVAMarker") else { continue };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
                 self.report.warn("a marker could not be read and was skipped");
@@ -325,7 +266,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         out
     }
 
-    /// The media item for a `<Media>` object (deduplicated by its UID).
+    /// The media item for a `<Media>` object (deduplicated by its UID and by its file).
     fn media(&mut self, media: Node<'a, 'i>, name: Option<&str>, bin: Option<BinId>) -> Option<ItemId> {
         let key = media.attribute("ObjectUID").or_else(|| media.attribute("ObjectID"))?;
         if let Some(id) = self.b.find_media(key) {
@@ -340,17 +281,29 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let path_key = format!("path:{path}");
         if let Some(id) = self.b.find_media(&path_key) {
             self.b.register_media(key, id);
+            // remember every Premiere media object behind the item, for writing back
+            if let Some(uid) = media.attribute("ObjectUID")
+                && let Some(it) = self.b.p.item_mut(id)
+            {
+                let list = it.metadata.entry(META_MEDIA.to_string()).or_default();
+                if !list.split(',').any(|u| u == uid) {
+                    if !list.is_empty() {
+                        list.push(',');
+                    }
+                    list.push_str(uid);
+                }
+            }
             return Some(id);
         }
         let title = name.or_else(|| child_text(media, "Title")).unwrap_or_else(|| file_name(&path)).to_string();
         let mut spec = MediaSpec::default();
-        if let Some(v) = self.follow(media, &["VideoStream"]) {
+        if let Some(v) = self.ix.follow(media, &["VideoStream"]) {
             let (w, h) = frame_rect(child_text(v, "FrameRect")).unwrap_or((1920, 1080));
             let rate = child_text(v, "FrameRate").and_then(parse_i64).and_then(rate_of).unwrap_or(FrameRate::FPS_24);
             spec.video = Some((w, h, rate));
             spec.duration = time(child_text(v, "Duration")).filter(|d| *d > 0).map(Tick);
         }
-        if let Some(a) = self.follow(media, &["AudioStream"]) {
+        if let Some(a) = self.ix.follow(media, &["AudioStream"]) {
             let sr = child_text(a, "FrameRate").and_then(parse_i64).filter(|t| *t > 0).map(|t| (TICKS_PER_SECOND / t) as u32).unwrap_or(48_000);
             let ch =
                 child_text(a, "AudioChannelLayout").and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok()).and_then(|v| v.as_array().map(Vec::len));
@@ -367,6 +320,11 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         }
         let id = self.b.file_media(key, &title, &path, &spec, bin);
         self.b.register_media(&path_key, id);
+        if let Some(uid) = media.attribute("ObjectUID")
+            && let Some(it) = self.b.p.item_mut(id)
+        {
+            it.metadata.insert(META_MEDIA.to_string(), uid.to_string());
+        }
         Some(id)
     }
 
@@ -385,24 +343,28 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     // Sequences
     // -----------------------------------------------------------------------------------------
 
-    fn video_group(&self, seq: Node<'a, 'i>, tag: &str) -> Option<Node<'a, 'i>> {
-        let groups = self.at(seq, &["TrackGroups"])?;
-        groups.children().filter(|n| n.has_tag_name("TrackGroup")).filter_map(|g| self.follow(g, &["Second"])).find(|g| g.has_tag_name(tag))
-    }
-
     fn reserve_sequence(&mut self, seq: Node<'a, 'i>, name: &str, bin: Option<BinId>) {
         let Some(uid) = seq.attribute("ObjectUID") else { return };
-        let vg = self.video_group(seq, "VideoTrackGroup");
+        let vg = prproj_graph::track_group(&self.ix, seq, "VideoTrackGroup");
         let (w, h) = vg.and_then(|g| frame_rect(child_text(g, "FrameRect"))).unwrap_or((1920, 1080));
         let rate = vg.and_then(|g| path_text(g, &["TrackGroup", "FrameRate"])).and_then(parse_i64).and_then(rate_of).unwrap_or(FrameRate::FPS_24);
         let mut settings = settings_for(rate, w, h, false);
-        if let Some(t) =
-            self.video_group(seq, "AudioTrackGroup").and_then(|g| path_text(g, &["TrackGroup", "FrameRate"])).and_then(parse_i64).filter(|t| *t > 0)
+        if let Some(t) = prproj_graph::track_group(&self.ix, seq, "AudioTrackGroup")
+            .and_then(|g| path_text(g, &["TrackGroup", "FrameRate"]))
+            .and_then(parse_i64)
+            .filter(|t| *t > 0)
         {
             settings.sample_rate = (TICKS_PER_SECOND / t) as u32;
         }
         let name = child_text(seq, "Name").unwrap_or(name);
         let id = self.b.reserve_sequence(name, settings, bin);
+        if let Some(it) = self.b.p.item_mut(id) {
+            it.metadata.insert(META_SEQUENCE.to_string(), uid.to_string());
+            it.metadata.insert(META_FINGERPRINT.to_string(), self.fingerprint.clone());
+            if let Some(src) = &self.opts.source_path {
+                it.metadata.insert(META_SOURCE.to_string(), src.clone());
+            }
+        }
         self.seq_items.insert(uid, id);
         self.seq_nodes.push((seq, id));
     }
@@ -412,13 +374,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let mut seq: Sequence = empty_sequence(settings.clone());
         let frame = (settings.width as f64, settings.height as f64);
         for (kind, tag) in [(TrackKind::Video, "VideoTrackGroup"), (TrackKind::Audio, "AudioTrackGroup")] {
-            let Some(group) = self.video_group(node, tag) else { continue };
-            let Some(tracks) = self.at(group, &["TrackGroup", "Tracks"]) else { continue };
-            let mut refs: Vec<(i64, Node)> =
-                tracks.children().filter(|n| n.has_tag_name("Track")).map(|n| (n.attribute("Index").and_then(parse_i64).unwrap_or(i64::MAX), n)).collect();
-            refs.sort_by_key(|(i, _)| *i);
-            for (ti, (_, r)) in refs.into_iter().enumerate() {
-                let Some(track) = self.resolve(Some(r)) else { continue };
+            let Some(group) = prproj_graph::track_group(&self.ix, node, tag) else { continue };
+            for (ti, track) in prproj_graph::tracks(&self.ix, group).into_iter().enumerate() {
                 self.b.ensure_tracks(&mut seq, kind, ti + 1);
                 if let Some(name) = path_text(track, &["ClipTrack", "Track", "Name"]).filter(|n| !n.trim().is_empty())
                     && let Some(t) = seq.tracks_mut(kind).get_mut(ti)
@@ -443,11 +400,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     }
 
     fn track(&mut self, seq: &mut Sequence, kind: TrackKind, ti: usize, track: Node<'a, 'i>, frame: (f64, f64)) {
-        let refs = |path: &[&str]| -> Vec<Node<'a, 'i>> {
-            self.at(track, path).into_iter().flat_map(|n| n.children().filter(|c| c.has_tag_name("TrackItem"))).filter_map(|r| self.resolve(Some(r))).collect()
-        };
-        let items = refs(&["ClipTrack", "ClipItems", "TrackItems"]);
-        let transitions = refs(&["ClipTrack", "TransitionItems", "TrackItems"]);
+        let items = self.ix.list(track, &["ClipTrack", "ClipItems", "TrackItems"], "TrackItem");
+        let transitions = self.ix.list(track, &["ClipTrack", "TransitionItems", "TrackItems"], "TrackItem");
         for item in items {
             if let Some(clip) = self.clip(item, kind, frame) {
                 let placed = self.b.place(seq, kind, ti, clip);
@@ -467,31 +421,25 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             self.report.info(format!("track item type {tag} is not supported"));
             return None;
         }
-        let ti_node = self.at(item, &["ClipTrackItem", "TrackItem"])?;
+        let ti_node = self.ix.at(item, &["ClipTrackItem", "TrackItem"])?;
         let start = time(child_text(ti_node, "Start")).unwrap_or(0);
         let end = time(child_text(ti_node, "End"))?;
         if end <= start {
             return None;
         }
-        let sub = self.follow(item, &["ClipTrackItem", "SubClip"])?;
-        let clip = self.follow(sub, &["Clip"])?;
+        let sub = self.ix.follow(item, &["ClipTrackItem", "SubClip"])?;
+        let clip = self.ix.follow(sub, &["Clip"])?;
         let name = child_text(sub, "Name").unwrap_or("Clip").to_string();
-        let source = self.follow(clip, &["Clip", "Source"]);
-        let target = match source {
-            Some(src) => {
-                if let Some(seq) = self.follow(src, &["SequenceSource", "Sequence"]) {
-                    let id = seq.attribute("ObjectUID").and_then(|u| self.seq_items.get(u).copied());
-                    if let Some(id) = id {
-                        self.nested.insert(id);
-                    }
-                    id
-                } else if let Some(media) = self.follow(src, &["MediaSource", "Media"]) {
-                    self.media(media, None, None)
-                } else {
-                    None
-                }
+        let target = if let Some(seq) = prproj_graph::clip_sequence(&self.ix, clip) {
+            let id = seq.attribute("ObjectUID").and_then(|u| self.seq_items.get(u).copied());
+            if let Some(id) = id {
+                self.nested.insert(id);
             }
-            None => None,
+            id
+        } else if let Some(media) = prproj_graph::clip_media(&self.ix, clip) {
+            self.media(media, None, None)
+        } else {
+            None
         };
         let Some(target) = target else {
             self.report.warn(format!("clip \"{name}\" has no media or sequence the importer understands; skipped"));
@@ -507,85 +455,62 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let mut ti = self.b.clip(target, kind, &name, Tick(start), Tick(duration), Tick(source_in));
         ti.speed = raw_speed.abs().clamp(SPEED_RANGE.0, SPEED_RANGE.1);
         ti.reverse = raw_speed < 0.0;
+        ti.origin = item.attribute("ObjectID").map(str::to_string);
+        if child_text(clip, "FrameHold") == Some(FRAME_HOLD_AT)
+            && let Some(at) = time(child_text(clip, "FrameHoldStart"))
+        {
+            ti.frame_hold = Some(Tick(at));
+        }
         if let Some(id) = item.attribute("ObjectID")
             && let Some(g) = self.links.get(id)
         {
             ti.link = Some(*g);
         }
-        let src_frame = self.source_frame(target).unwrap_or(frame);
-        let timing = KeyTiming { source_in, speed: ti.speed };
-        if let Some(chain) = self.follow(item, &["ClipTrackItem", "ComponentOwner", "Components"]) {
-            self.components(&mut ti, chain, timing, frame, src_frame);
+        let ctx = Ctx { source_in, speed: ti.speed, frame, src: self.source_frame(target).unwrap_or(frame) };
+        if let Some(chain) = self.ix.follow(item, &["ClipTrackItem", "ComponentOwner", "Components"]) {
+            self.components(&mut ti, chain, &ctx);
         }
         Some(ti)
     }
 
     fn source_frame(&self, item: ItemId) -> Option<(f64, f64)> {
-        match &self.b.p.item(item)?.kind {
-            filmcraft_project::ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width as f64, v.height as f64)),
-            filmcraft_project::ItemKind::Sequence(s) => Some((s.settings.width as f64, s.settings.height as f64)),
-            _ => None,
-        }
+        source_frame(&self.b.p, item)
     }
 
     // -----------------------------------------------------------------------------------------
     // Effects
     // -----------------------------------------------------------------------------------------
 
-    fn components(&mut self, ti: &mut filmcraft_project::TrackItem, chain: Node<'a, 'i>, timing: KeyTiming, frame: (f64, f64), src: (f64, f64)) {
-        let Some(list) = self.at(chain, &["ComponentChain", "Components"]) else { return };
-        let comps: Vec<Node> = list.children().filter(|n| n.has_tag_name("Component")).filter_map(|r| self.resolve(Some(r))).collect();
-        for comp in comps {
-            let (body, display) = match child(comp, "AudioComponent") {
-                Some(a) => (child(a, "Component"), child_text(comp, "FilterMatchName")),
-                None => (child(comp, "Component"), path_text(comp, &["Component", "DisplayName"])),
-            };
-            let Some(body) = body else { continue };
-            let match_name = child_text(comp, "MatchName").or_else(|| child_text(comp, "FilterMatchName")).unwrap_or("");
-            let params: Vec<Node> = self
-                .at(body, &["Params"])
-                .into_iter()
-                .flat_map(|p| p.children().filter(|n| n.has_tag_name("Param")))
-                .filter_map(|r| self.resolve(Some(r)))
-                .collect();
-            let named = |n: &str| params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|x| x.trim().eq_ignore_ascii_case(n)));
-            if match_name == "AE.ADBE Motion" {
-                if let Some(p) = named("Position").and_then(|p| point_param(p, timing, |x, y| Vec2::new(x * frame.0, y * frame.1))) {
-                    let centred = p.value.as_vec2().is_some_and(|v| (v.x - frame.0 / 2.0).abs() < 1e-6 && (v.y - frame.1 / 2.0).abs() < 1e-6);
-                    if p.is_animated() || !centred {
-                        set_param(ti, "motion", "position", p);
+    fn components(&mut self, ti: &mut filmcraft_project::TrackItem, chain: Node<'a, 'i>, ctx: &Ctx) {
+        let comps = prproj_fx::chain(&self.ix, chain);
+        let targets = prproj_fx::targets(&comps);
+        for (c, target) in comps.iter().zip(targets) {
+            match target {
+                Target::Ignore => continue,
+                Target::Unsupported => {
+                    self.report.warn(format!("effect \"{}\" is not supported and was skipped (kept as it is when exporting back to Premiere)", c.label()));
+                    continue;
+                }
+                Target::Effect(def) => {
+                    // an effect FilmCraft has: one instance per Premiere component, in order
+                    ti.effects.push(def.instance());
+                }
+                Target::Motion | Target::Opacity | Target::Volume => {}
+            }
+            let (maps, unmapped) = prproj_fx::mappings(c, target);
+            if !unmapped.is_empty() {
+                self.unmapped.entry(c.label().to_string()).or_default().extend(unmapped);
+            }
+            for m in maps {
+                let Some(p) = prproj_fx::import_param(&m, ctx) else { continue };
+                if let Target::Effect(_) = target {
+                    // the instance just pushed is the last one with this id
+                    if let Some(e) = ti.effects.iter_mut().rev().find(|e| e.effect == m.effect) {
+                        e.params.insert(m.param.to_string(), p);
                     }
+                } else {
+                    set_param(ti, m.effect, m.param, p);
                 }
-                if let Some(p) = named("Anchor Point").and_then(|p| point_param(p, timing, |x, y| Vec2::new(x * src.0, y * src.1))) {
-                    let centred = p.value.as_vec2().is_some_and(|v| (v.x - src.0 / 2.0).abs() < 1e-6 && (v.y - src.1 / 2.0).abs() < 1e-6);
-                    if p.is_animated() || !centred {
-                        set_param(ti, "motion", "anchor", p);
-                    }
-                }
-                for (pname, id) in [("Scale", "scale"), ("Scale Width", "scale_width"), ("Rotation", "rotation"), ("Anti-flicker Filter", "anti_flicker")] {
-                    if let Some(p) = named(pname).and_then(|p| float_param(p, timing, |v| v)) {
-                        set_param(ti, "motion", id, p);
-                    }
-                }
-                // Uniform Scale is the one boolean parameter of Motion; it is saved without a name.
-                if let Some(v) = params.iter().find_map(|p| static_value(*p).filter(|v| *v == "true" || *v == "false")) {
-                    set_param(ti, "motion", "uniform_scale", Param::new(ParamValue::Bool(v == "true")));
-                }
-            } else if match_name == "AE.ADBE Opacity" {
-                if let Some(p) = named("Opacity").and_then(|p| float_param(p, timing, |v| v)) {
-                    set_param(ti, "opacity", "opacity", p);
-                }
-            } else if match_name.starts_with("Internal Volume") {
-                if let Some(p) = named("Level").and_then(|p| float_param(p, timing, |v| gain_to_db(v / UNITY_LEVEL)))
-                    && (p.is_animated() || p.value.as_f64().is_some_and(|v| v.abs() > 1e-6))
-                {
-                    set_param(ti, "volume", "level", p);
-                }
-            } else if match_name.starts_with("Internal") || display.is_none() && match_name.is_empty() {
-                // channel volume, panner, Essential Sound state: FilmCraft's own defaults apply
-            } else {
-                let label = display.filter(|d| !d.trim().is_empty()).unwrap_or(match_name);
-                self.report.warn(format!("effect \"{label}\" is not supported and was skipped"));
             }
         }
     }
@@ -629,30 +554,42 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Parameter values
-// ---------------------------------------------------------------------------------------------
-
-/// How keyframe times (source-media ticks in Premiere) map to clip time.
-#[derive(Clone, Copy)]
-struct KeyTiming {
-    source_in: i64,
-    speed: f64,
+/// Whether the importer brings a Premiere track item into FilmCraft. The writer keeps every item
+/// that it does not (FilmCraft never showed it, so it cannot have been edited away).
+pub(crate) fn importable(ix: &Index<'_, '_>, item: Node<'_, '_>) -> bool {
+    if !matches!(item.tag_name().name(), "VideoClipTrackItem" | "AudioClipTrackItem") {
+        return false;
+    }
+    let Some(ti) = ix.at(item, &["ClipTrackItem", "TrackItem"]) else { return false };
+    let (start, Some(end)) = (time(child_text(ti, "Start")).unwrap_or(0), time(child_text(ti, "End"))) else { return false };
+    if end <= start {
+        return false;
+    }
+    let Some(clip) = ix.follow(item, &["ClipTrackItem", "SubClip"]).and_then(|sub| ix.follow(sub, &["Clip"])) else { return false };
+    if let Some(seq) = prproj_graph::clip_sequence(ix, clip) {
+        return seq.attribute("ObjectUID").is_some();
+    }
+    prproj_graph::clip_media(ix, clip).is_some_and(|m| {
+        (m.attribute("ObjectUID").is_some() || m.attribute("ObjectID").is_some())
+            && ["ActualMediaFilePath", "FilePath", "RelativePath"].iter().any(|t| child_text(m, t).is_some_and(|v| !v.trim().is_empty()))
+    })
 }
 
-impl KeyTiming {
-    fn clip_time(self, source_time: i64) -> Tick {
-        let d = source_time.saturating_sub(self.source_in).clamp(0, MAX_TIME);
-        if self.speed == 1.0 { Tick(d) } else { Tick(((d as f64 / self.speed).round() as i64).clamp(0, MAX_TIME)) }
+/// The picture size of a clip's source (media or nested sequence).
+pub(crate) fn source_frame(p: &filmcraft_project::Project, item: ItemId) -> Option<(f64, f64)> {
+    match &p.item(item)?.kind {
+        filmcraft_project::ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width as f64, v.height as f64)),
+        filmcraft_project::ItemKind::Sequence(s) => Some((s.settings.width as f64, s.settings.height as f64)),
+        _ => None,
     }
 }
 
-fn parse_i64(s: &str) -> Option<i64> {
+pub(crate) fn parse_i64(s: &str) -> Option<i64> {
     s.trim().parse().ok()
 }
 
 /// `"l,t,r,b"` → (width, height).
-fn frame_rect(s: Option<&str>) -> Option<(u32, u32)> {
+pub(crate) fn frame_rect(s: Option<&str>) -> Option<(u32, u32)> {
     let v: Vec<i64> = s?.split(',').filter_map(parse_i64).collect();
     let (l, t, r, b) = (*v.first()?, *v.get(1)?, *v.get(2)?, *v.get(3)?);
     let (w, h) = (r.checked_sub(l)?, b.checked_sub(t)?);
@@ -660,71 +597,10 @@ fn frame_rect(s: Option<&str>) -> Option<(u32, u32)> {
 }
 
 /// Ticks per frame → frame rate (exact: 8 467 200 000 → 30, 10 594 584 000 → 24000/1001).
-fn rate_of(ticks_per_frame: i64) -> Option<FrameRate> {
+pub(crate) fn rate_of(ticks_per_frame: i64) -> Option<FrameRate> {
     (ticks_per_frame > 0 && TICKS_PER_SECOND / ticks_per_frame <= 1000).then(|| FrameRate::new(TICKS_PER_SECOND, ticks_per_frame))
-}
-
-/// The value field of a parameter's `StartKeyframe` (`time,value,…`).
-fn static_value<'a>(p: Node<'a, '_>) -> Option<&'a str> {
-    child_text(p, "StartKeyframe").and_then(|s| s.split(',').nth(1)).map(str::trim).or_else(|| child_text(p, "CurrentValue").map(str::trim))
-}
-
-/// `time,value,…;time,value,…;` → (time, value) pairs.
-fn keyframes(p: Node<'_, '_>) -> Vec<(i64, String)> {
-    let Some(k) = child_text(p, "Keyframes") else { return Vec::new() };
-    k.split(';')
-        .filter_map(|e| {
-            let mut f = e.split(',');
-            let t = parse_i64(f.next()?)?;
-            let v = f.next()?.trim().to_string();
-            (t != STATIC_TIME).then_some((t, v))
-        })
-        .take(100_000)
-        .collect()
-}
-
-fn float_param(p: Node<'_, '_>, timing: KeyTiming, map: impl Fn(f64) -> f64) -> Option<Param> {
-    let parse = |s: &str| s.trim().parse::<f64>().ok().filter(|v| v.is_finite());
-    let keys = keyframes(p);
-    let first = keys.first().and_then(|(_, v)| parse(v));
-    let value = static_value(p).and_then(parse).or(first)?;
-    let mut param = Param::new(ParamValue::Float(map(value)));
-    for (t, v) in keys {
-        if let Some(v) = parse(&v) {
-            let mut kf = Keyframe::new(timing.clip_time(t), ParamValue::Float(map(v)));
-            kf.interp = Interpolation::Linear;
-            param.keyframes.push(kf);
-        }
-    }
-    finish_param(param)
-}
-
-fn point_param(p: Node<'_, '_>, timing: KeyTiming, map: impl Fn(f64, f64) -> Vec2) -> Option<Param> {
-    let parse = |s: &str| {
-        let (x, y) = s.split_once(':')?;
-        let (x, y) = (x.trim().parse::<f64>().ok()?, y.trim().parse::<f64>().ok()?);
-        (x.is_finite() && y.is_finite()).then_some((x, y))
-    };
-    let keys = keyframes(p);
-    let (x, y) = static_value(p).and_then(parse).or_else(|| keys.first().and_then(|(_, v)| parse(v)))?;
-    let mut param = Param::new(ParamValue::Vec2(map(x, y)));
-    for (t, v) in keys {
-        if let Some((x, y)) = parse(&v) {
-            param.keyframes.push(Keyframe::new(timing.clip_time(t), ParamValue::Vec2(map(x, y))));
-        }
-    }
-    finish_param(param)
-}
-
-fn finish_param(mut p: Param) -> Option<Param> {
-    p.keyframes.sort_by_key(|k| k.time);
-    p.keyframes.dedup_by_key(|k| k.time);
-    if let Some(k) = p.keyframes.first() {
-        p.value = k.value.clone();
-    }
-    Some(p)
 }
 
 #[cfg(test)]
 #[path = "prproj_tests.rs"]
-mod tests;
+pub(crate) mod tests;

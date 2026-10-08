@@ -930,6 +930,19 @@ fn build() -> Vec<CommandSpec> {
             }
             Ok(r)
         }),
+        cmd!(
+            "file.exportPrproj",
+            "Premiere Pro Project…",
+            ["File", "Export"],
+            None,
+            r#"{"path":str,"sequences":[seqId]?,"force":bool?,"overwrite":bool?} (sequences opened from a .prproj, written back into it as a new .prproj)"#,
+            |s| if s.project.items.values().any(|i| i.metadata.contains_key(filmcraft_interchange::META_SEQUENCE)) {
+                Ok(())
+            } else {
+                Err("Open a Premiere Pro project (.prproj) first".into())
+            },
+            |s, p| crate::interchange::export_prproj(s, p)
+        ),
         cmd!("file.open", "Open Project…", ["File"], Some("Cmd+O"), r#"{"path":str}"#, always, |s, p| {
             let path = str_p(p, "path").ok_or_else(|| bad("file.open", "need `path`"))?.to_string();
             open_project(s, &path)

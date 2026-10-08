@@ -551,6 +551,13 @@ pub struct TrackItem {
     /// ([`GraphicMeta`]). Schema v12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphic: Option<Box<GraphicMeta>>,
+    /// The object this clip came from in another application's project (a Premiere Pro track
+    /// item's `ObjectID`), so that exporting back to that project updates the same clip, with
+    /// every setting FilmCraft does not model intact. Split halves and copies keep it (and become
+    /// copies of that object on export). Optional data, not a schema bump: builds that do not
+    /// know it ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// Time interpolation for speed-changed clips (Clip ▸ Video Options ▸ Time Interpolation).
@@ -1447,6 +1454,7 @@ impl Project {
             field_options: None,
             source_channels,
             graphic: source_graphic.and_then(|sg| sg.meta.map(Box::new)),
+            origin: None,
         })
     }
 

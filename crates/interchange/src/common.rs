@@ -444,6 +444,7 @@ impl Builder {
             field_options: None,
             source_channels: Vec::new(),
             graphic: None,
+            origin: None,
         }
     }
 

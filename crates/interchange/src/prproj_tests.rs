@@ -1,11 +1,13 @@
 use super::*;
+use crate::prproj_fx::UNITY_LEVEL;
 use crate::{detect, import_with};
+use filmcraft_project::{Interpolation, ParamValue};
 use filmcraft_project::{ItemKind, MediaRef};
 
-const S: i64 = TICKS_PER_SECOND;
+pub(crate) const S: i64 = TICKS_PER_SECOND;
 
 /// A small project in the observed `.prproj` shape (original test data, written by hand).
-fn doc() -> String {
+pub(crate) fn doc() -> String {
     let unity = UNITY_LEVEL;
     let minus6 = unity * 10f64.powf(-6.0 / 20.0);
     format!(
@@ -21,7 +23,8 @@ fn doc() -> String {
     <ProjectItemContainer><Items><Item Index="0" ObjectURef="mpi"/></Items></ProjectItemContainer>
   </BinProjectItem>
   <ClipProjectItem ObjectUID="mpi"><ProjectItem><Name>interview.mov</Name></ProjectItem><MasterClip ObjectURef="mmc"/></ClipProjectItem>
-  <MasterClip ObjectUID="mmc"><Clips><Clip Index="0" ObjectRef="10"/></Clips></MasterClip>
+  <MasterClip ObjectUID="mmc"><Clips><Clip Index="0" ObjectRef="10"/><Clip Index="1" ObjectRef="16"/></Clips></MasterClip>
+  <AudioClip ObjectID="16"><Clip><Source ObjectRef="76"/></Clip></AudioClip>
   <VideoClip ObjectID="10"><Clip><Source ObjectRef="11"/><MarkerOwner><Markers ObjectRef="12"/></MarkerOwner></Clip></VideoClip>
   <VideoMediaSource ObjectID="11"><MediaSource><Media ObjectURef="media1"/></MediaSource></VideoMediaSource>
   <Markers ObjectID="12"><Markers><Marker Index="0"><First>m1</First><Second ObjectRef="13"/></Marker></Markers></Markers>
@@ -48,6 +51,7 @@ fn doc() -> String {
       <TrackGroup><Second ObjectRef="30"/></TrackGroup>
       <TrackGroup><Second ObjectRef="31"/></TrackGroup>
     </TrackGroups>
+    <PersistentGroupContainer Version="1"><LinkContainer Version="1"><Links Version="1"><Link Index="0" ObjectRef="80" /></Links></LinkContainer></PersistentGroupContainer>
   </Sequence>
   <VideoTrackGroup ObjectID="30"><TrackGroup><Tracks><Track Index="0" ObjectURef="vt1"/></Tracks><FrameRate>8467200000</FrameRate></TrackGroup><FrameRect>0,0,1920,1080</FrameRect></VideoTrackGroup>
   <AudioTrackGroup ObjectID="31"><TrackGroup><Tracks><Track Index="0" ObjectURef="at1"/></Tracks><FrameRate>5292000</FrameRate></TrackGroup></AudioTrackGroup>
@@ -73,7 +77,7 @@ fn doc() -> String {
   <VideoComponentParam ObjectID="45"><Name>Scale</Name><StartKeyframe>-91445760000000000,100,0,0,0,0,0,0</StartKeyframe><Keyframes>{s10},100,0,0,0,0.1,1.5,0.1;{s12},120,0,0,1.5,0.1,0,0.1;</Keyframes></VideoComponentParam>
   <PointComponentParam ObjectID="46"><Name>Position</Name><StartKeyframe>-91445760000000000,0.25:0.5,0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe></PointComponentParam>
   <VideoComponentParam ObjectID="47"><Name> </Name><StartKeyframe>-91445760000000000,false,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
-  <VideoFilterComponent ObjectID="48"><Component><Params/><DisplayName>Ultra Key</DisplayName></Component><MatchName>AE.ADBE Ultra Key</MatchName></VideoFilterComponent>
+  <VideoFilterComponent ObjectID="48"><Component><Params/><DisplayName>RSMB Pro</DisplayName></Component><MatchName>RE:Vision RSMB Pro</MatchName></VideoFilterComponent>
 
   <VideoClipTrackItem ObjectID="50"><ClipTrackItem>
     <ComponentOwner><Components ObjectRef="53"/></ComponentOwner>
@@ -82,7 +86,11 @@ fn doc() -> String {
   </ClipTrackItem></VideoClipTrackItem>
   <SubClip ObjectID="51"><Clip ObjectRef="52"/><Name>backwards</Name></SubClip>
   <VideoClip ObjectID="52"><Clip><Source ObjectRef="11"/><InPoint>{s20}</InPoint><OutPoint>{s24}</OutPoint><PlaybackSpeed>-2</PlaybackSpeed></Clip></VideoClip>
-  <VideoComponentChain ObjectID="53"><ComponentChain><Components><Component Index="0" ObjectRef="54"/></Components></ComponentChain></VideoComponentChain>
+  <VideoComponentChain ObjectID="53"><ComponentChain><Components><Component Index="0" ObjectRef="54"/><Component Index="1" ObjectRef="56"/></Components></ComponentChain></VideoComponentChain>
+  <VideoFilterComponent ObjectID="56"><Component><Params><Param Index="0" ObjectRef="57"/><Param Index="1" ObjectRef="58"/><Param Index="2" ObjectRef="59"/></Params><DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName></VideoFilterComponent>
+  <VideoComponentParam ObjectID="57"><Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>{s20},0,5,0,0,0.33333333333333331,0,0.33333333333333331;{s22},40,5,2,0,0.25,0,0.5;</Keyframes></VideoComponentParam>
+  <VideoComponentParam ObjectID="58"><Name>Blur Dimensions</Name><StartKeyframe>-91445760000000000,1,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="59"><Name>Repeat Edge Pixels</Name><StartKeyframe>-91445760000000000,true,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoFilterComponent ObjectID="54"><Component><Params><Param Index="0" ObjectRef="55"/></Params><DisplayName>Opacity</DisplayName></Component><MatchName>AE.ADBE Opacity</MatchName></VideoFilterComponent>
   <VideoComponentParam ObjectID="55"><Name>Opacity</Name><StartKeyframe>-91445760000000000,50,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
 
@@ -118,6 +126,7 @@ fn doc() -> String {
         s12 = 12 * S,
         s15 = 15 * S,
         s20 = 20 * S,
+        s22 = 22 * S,
         s24 = 24 * S,
         s60 = 60 * S,
         s4_5 = 9 * S / 2,
@@ -126,7 +135,7 @@ fn doc() -> String {
 }
 
 /// Wrap `data` in a gzip member (RFC 1952) with a file name field, as `.prproj` files are.
-fn gzip(data: &[u8]) -> Vec<u8> {
+pub(crate) fn gzip(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 0xff];
     out.extend_from_slice(b"project.xml\0");
     out.extend(miniz_oxide::deflate::compress_to_vec(data, 6));
@@ -134,7 +143,7 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn import(bytes: &[u8], base: Option<&str>) -> (Imported, Report) {
+pub(crate) fn import(bytes: &[u8], base: Option<&str>) -> (Imported, Report) {
     let opts = ImportOptions { base_dir: base.map(str::to_string), name: Some("Test".into()), ..Default::default() };
     import_with(bytes, Format::Prproj, &opts).unwrap()
 }
@@ -210,7 +219,23 @@ fn imports_bins_media_sequences_clips_and_effects() {
     let level = a1.effect("volume").and_then(|e| e.params.get("level")).and_then(|p| p.value.as_f64()).unwrap();
     assert!((level + 6.0).abs() < 1e-6, "level {level}");
 
-    assert!(report.mentions("Ultra Key"), "{report}");
+    assert!(report.mentions("RSMB Pro"), "{report}");
+
+    // a FilmCraft effect with the same name: eased keyframes in clip time (the clip plays its
+    // source at 2x, so source 20 s / 22 s are clip 0 s / 1 s), a boolean, and the choice reported
+    let blur = b.effect("gaussian_blur").expect("Gaussian Blur imported");
+    let keys = &blur.params["blurriness"].keyframes;
+    assert_eq!(keys.iter().map(|k| (k.time, k.value.as_f64().unwrap())).collect::<Vec<_>>(), vec![(Tick(0), 0.0), (Tick(S), 40.0)]);
+    assert_eq!((keys[0].interp, keys[1].interp), (Interpolation::Bezier, Interpolation::AutoBezier));
+    assert_eq!((keys[1].in_influence, keys[1].out_influence), (0.25, 0.5));
+    assert_eq!(blur.params["repeat_edge"].value, ParamValue::Bool(true));
+    assert!(report.mentions("Blur Dimensions"), "{report}");
+
+    // round-trip bookkeeping: origins and Premiere ids
+    assert_eq!((a.origin.as_deref(), b.origin.as_deref(), a1.origin.as_deref()), (Some("40"), Some("50"), Some("70")));
+    assert_eq!(seq_item.metadata.get(META_SEQUENCE).map(String::as_str), Some("seq1"));
+    assert!(seq_item.metadata.contains_key(META_FINGERPRINT));
+    assert_eq!(media.metadata.get(META_MEDIA).map(String::as_str), Some("media1"));
 }
 
 #[test]

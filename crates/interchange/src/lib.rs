@@ -35,6 +35,9 @@ pub mod fcpxml;
 pub mod omf;
 pub mod otio;
 mod prproj;
+mod prproj_fx;
+mod prproj_graph;
+mod prproj_write;
 
 mod common;
 mod comp;
@@ -49,6 +52,7 @@ use serde::{Deserialize, Serialize};
 
 pub use common::{file_url_to_path, path_to_file_url, resolve_path};
 pub use comp::ExtractedMedia;
+pub use prproj::{META_FINGERPRINT, META_MEDIA, META_SEQUENCE, META_SOURCE};
 
 /// An interchange format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -259,6 +263,10 @@ pub struct ImportOptions {
     pub edl_frame_rate: Option<FrameRate>,
     /// Name for documents without a title (EDL without `TITLE:`).
     pub name: Option<String>,
+    /// The document's own path, recorded where a format can be written back into its source
+    /// (Premiere Pro projects).
+    #[serde(default)]
+    pub source_path: Option<String>,
 }
 
 /// Import a document. `base_dir` resolves relative media paths.
@@ -410,6 +418,21 @@ pub fn export(project: &Project, sequence: ItemId, format: Format, opts: &Export
         Format::Prproj => return Err(Error::Other("FilmCraft reads Premiere Pro projects but does not write them".into())),
     };
     Ok((text.into_bytes(), report))
+}
+
+/// Write sequences back into the Premiere Pro project they were imported from (`original` is that
+/// `.prproj` file's bytes). `sequences` empty = every sequence that came from a Premiere project.
+/// The original document is patched, not regenerated: what FilmCraft did not change keeps its
+/// exact bytes. The result is verified (references, binary payloads, and a re-import that must
+/// give back exactly the written clips) before it is returned.
+/// The fingerprint recorded in [`META_FINGERPRINT`] when a Premiere project is imported.
+pub fn prproj_fingerprint(bytes: &[u8]) -> String {
+    prproj_graph::fingerprint(bytes)
+}
+
+/// `dest_dir` is the folder the new project goes to (for media paths relative to it).
+pub fn export_prproj(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir: Option<&str>) -> Result<(Vec<u8>, Report)> {
+    prproj_write::export(project, original, sequences, dest_dir)
 }
 
 /// Premiere's "Export ▸ EDL" with one list per video track: returns `(suggested suffix, document)`
