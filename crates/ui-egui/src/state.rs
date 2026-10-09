@@ -422,6 +422,14 @@ pub struct UiState {
     /// Audio Track Mixer ▸ Meter Input(s) Only: record-armed track meters show the recording input.
     #[serde(default)]
     pub mixer_meter_input_only: bool,
+    /// Audio Track Mixer: the selected effect or send slot of each strip (strip id → slot); the
+    /// knob under the rack shows its parameter.
+    #[serde(default)]
+    pub mixer_rack: std::collections::BTreeMap<u64, RackSel>,
+    /// The parameter a rack knob shows ("strip/slot/effect" → parameter id), chosen in the
+    /// effect slot's menu; the effect's first adjustable parameter otherwise.
+    #[serde(default)]
+    pub mixer_knob_param: std::collections::BTreeMap<String, String>,
     /// Audio Gain dialog draft (mode, dB values).
     #[serde(default)]
     pub audio_gain: AudioGainDraft,
@@ -799,6 +807,8 @@ impl Default for UiState {
             mixer_fx_open: false,
             mixer_hidden: Vec::new(),
             mixer_meter_input_only: false,
+            mixer_rack: Default::default(),
+            mixer_knob_param: Default::default(),
             settings: None,
             audio_gain: AudioGainDraft::default(),
             add_tracks: AddTracksDraft::default(),
@@ -827,4 +837,11 @@ impl Default for UiState {
             media_browser: Default::default(),
         }
     }
+}
+
+/// A selected slot of a mixer strip's rack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RackSel {
+    Effect(usize),
+    Send(usize),
 }

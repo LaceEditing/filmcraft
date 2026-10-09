@@ -783,6 +783,101 @@ fn remove_insert(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// Drag an effect from one rack slot to another (Premiere's Audio Track Mixer): it ends up at
+/// `toSlot` of `to` (the same strip when omitted; past the last effect it goes last), moving with
+/// its settings and automation, or a copy goes there with `copy` (Alt-drag) and the original stays.
+fn move_insert(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "mixer.moveInsert";
+    let from = strip_p(s, p, CMD)?;
+    let slot = slot_p(p, CMD)?;
+    let seq = active_seq(s)?;
+    let to = match p.get("to").or_else(|| p.get("toStrip")) {
+        Some(v) => strip_ref(seq, v).ok_or_else(|| bad(CMD, format!("no strip {v}")))?,
+        None => from,
+    };
+    let copy = bool_p(p, "copy").unwrap_or(false);
+    let src = seq.strip(from).ok_or_else(|| bad(CMD, "no such strip"))?;
+    let inst = src.effects.get(slot).cloned().ok_or_else(|| bad(CMD, "no effect in that slot"))?;
+    let dest_len = seq.strip(to).map(|t| t.effects.len()).ok_or_else(|| bad(CMD, "no such strip"))?;
+    if (copy || to != from) && dest_len >= pm::MAX_INSERTS {
+        return Err(bad(CMD, format!("all {} effect slots of that track are in use", pm::MAX_INSERTS)));
+    }
+    let want = u64_p(p, "toSlot").map_or(usize::MAX, |v| usize::try_from(v).unwrap_or(usize::MAX));
+    if !copy && to == from && want.min(dest_len.saturating_sub(1)) == slot {
+        return Ok(json!({"slot": slot}));
+    }
+    let name = inst.def().map(|d| d.name).unwrap_or("Effect");
+    let label = if copy { format!("Copy Track Effect {name}") } else { format!("Move Track Effect {name}") };
+    let at = s.edit_sequence(&label, move |q, _, _| {
+        if !copy {
+            q.with_strip_mut(from, |t| t.remove_insert(slot)).ok_or_else(|| EngineError::Other("no such strip".into()))?;
+        }
+        q.with_strip_mut(to, |t| {
+            let at = want.min(t.effects.len());
+            t.effects.insert(at, inst);
+            at
+        })
+        .ok_or_else(|| EngineError::Other("no such strip".into()))
+    })?;
+    Ok(json!({"slot": at}))
+}
+
+/// The effect-slot menu on a filled slot: another effect takes the slot (fresh settings), or
+/// `"none"` empties it.
+fn replace_insert(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "mixer.replaceInsert";
+    let id = strip_p(s, p, CMD)?;
+    let slot = slot_p(p, CMD)?;
+    let eid = str_p(p, "effect").ok_or_else(|| bad(CMD, "need `effect` (an audio effect id, or \"none\")"))?;
+    if active_seq(s)?.strip(id).is_none_or(|t| slot >= t.effects.len()) {
+        return Err(bad(CMD, "no effect in that slot"));
+    }
+    if eid.eq_ignore_ascii_case("none") {
+        return remove_insert(s, p);
+    }
+    let def = find_effect(eid)
+        .filter(|d| d.kind == filmcraft_project::EffectKind::Audio && !d.intrinsic)
+        .ok_or_else(|| bad(CMD, format!("`{eid}` is not an audio effect")))?;
+    let inst = def.instance();
+    s.edit_sequence(&format!("Replace Track Effect with {}", def.name), move |q, _, _| {
+        q.with_strip_mut(id, |t| {
+            if let Some(e) = t.effects.get_mut(slot) {
+                let post = e.post_fader;
+                *e = inst;
+                e.post_fader = post;
+            }
+        })
+        .ok_or_else(|| EngineError::Other("no such strip".into()))
+    })?;
+    Ok(json!({"slot": slot}))
+}
+
+/// Copy Track Effects: the strip's whole effect rack, for Paste Track Effects.
+fn copy_inserts(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = strip_p(s, p, "mixer.copyInserts")?;
+    let fx = active_seq(s)?.strip(id).map(|t| t.effects.clone()).ok_or_else(|| bad("mixer.copyInserts", "no such strip"))?;
+    let n = fx.len();
+    s.state.rack_clipboard = Some(fx);
+    Ok(json!({"copied": n}))
+}
+
+/// Paste Track Effects: the copied rack replaces the strip's effects (Premiere replaces, it does
+/// not merge).
+fn paste_inserts(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = strip_p(s, p, "mixer.pasteInserts")?;
+    let fx = s.state.rack_clipboard.clone().ok_or_else(|| bad("mixer.pasteInserts", "no track effects were copied"))?;
+    let n = fx.len().min(pm::MAX_INSERTS);
+    s.edit_sequence("Paste Track Effects", move |q, _, _| {
+        q.with_strip_mut(id, |t| t.effects = fx.into_iter().take(pm::MAX_INSERTS).collect()).ok_or_else(|| EngineError::Other("no such strip".into()))
+    })?;
+    Ok(json!({"pasted": n}))
+}
+
+fn has_rack_clipboard(s: &Session) -> std::result::Result<(), String> {
+    has_seq(s)?;
+    if s.state.rack_clipboard.is_some() { Ok(()) } else { Err("no track effects were copied".into()) }
+}
+
 fn set_insert(s: &mut Session, p: &Value) -> Result<Value> {
     let id = strip_p(s, p, "mixer.setInsert")?;
     let slot = slot_p(p, "mixer.setInsert")?;
@@ -1349,6 +1444,28 @@ pub fn commands() -> Vec<CommandSpec> {
             true,
         ),
         spec("mixer.removeInsert", "Remove Track Effect", &[], None, r#"{"strip":"A1"|"S1"|"Mix"|id,"slot":n}"#, has_seq, remove_insert, true),
+        spec(
+            "mixer.moveInsert",
+            "Move Track Effect",
+            &[],
+            None,
+            r#"{"strip":"A1"|"S1"|"Mix"|id,"slot":n,"to":"A2"|id?,"toSlot":n?,"copy":bool?}"#,
+            has_seq,
+            move_insert,
+            true,
+        ),
+        spec(
+            "mixer.replaceInsert",
+            "Replace Track Effect",
+            &[],
+            None,
+            r#"{"strip":"A1"|"S1"|"Mix"|id,"slot":n,"effect":str|"none"}"#,
+            has_seq,
+            replace_insert,
+            true,
+        ),
+        spec("mixer.copyInserts", "Copy Track Effects", &[], None, r#"{"strip":"A1"|"S1"|"Mix"|id}"#, has_seq, copy_inserts, false),
+        spec("mixer.pasteInserts", "Paste Track Effects", &[], None, r#"{"strip":"A1"|"S1"|"Mix"|id}"#, has_rack_clipboard, paste_inserts, true),
         spec(
             "mixer.setInsert",
             "Track Effect Settings",

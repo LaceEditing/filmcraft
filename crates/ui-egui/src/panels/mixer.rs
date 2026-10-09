@@ -1,14 +1,17 @@
 //! Audio Track Mixer and Audio Clip Mixer.
 //!
 //! Track Mixer strips (audio tracks, submixes, Mix): effect and send slots (behind the ▸
-//! disclosure), input mapping, output assignment, pan knob, automation mode, M / S / R, fader with
+//! disclosure) with the knob of the selected slot's parameter under them (see [`rack`]: drag
+//! effects between slots and strips to move them, Alt-drag to copy, double-click to edit), input mapping, output assignment, pan knob, automation mode, M / S / R, fader with
 //! a dB scale, stereo meters fed by the playing mix, the fader value and the strip name. Every
 //! control goes through `mixer.*` commands: fader and knob drags are `mixer.touch` while held and
 //! `mixer.release` when let go, so they are heard live during playback and recorded as automation
 //! in Latch / Touch / Write mode.
 //!
 //! Automation ids: `mixer.<A1|S1|Mix>.<fader|value|pan|panValue|mode|mute|solo|record|output|input|
-//! fx.<slot>|send.<slot>|meter|name>`, popup entries below them (`mixer.A1.mode.Touch`…), the
+//! fx.<slot>|send.<slot>|rack.knob|rack.value|rack.bypass|meter|name>` (effect slot menus:
+//! `…fx.<slot>.<effect id|none|folder.<name>>`, right-click `…fx.<slot>.<edit|bypass|postFader|
+//! knob.<param>|remove>`, `…fx.copy`, `…fx.paste`), popup entries below them (`mixer.A1.mode.Touch`…), the
 //! effects disclosure `mixer.showEffects`, and the footer transport `mixer.transport.<command>`.
 //! The Clip Mixer uses `clipMixer.A1.<fader|value|pan|mute|solo|keyframe|mode>`.
 //!
@@ -172,16 +175,63 @@ fn small_text(ui: &egui::Ui, pos: egui::Pos2, align: Align2, s: &str, size: f32,
     ui.painter().text(pos, align, s, Tokens::ui(size), c);
 }
 
-fn slot_box(ui: &mut egui::Ui, r: Rect, text: &str, filled: bool, dim: bool, t: &Tokens, id: egui::Id) -> egui::Response {
-    let resp = ui.interact(r, id, Sense::click());
-    ui.painter().rect_filled(r, 2.0, if resp.hovered() { t.hover } else { t.field_bg });
-    ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
+/// Width of the dropdown arrow at the right of a rack slot: clicking there opens the effect (or
+/// send) list; clicking the rest of a filled slot selects it.
+const ARROW_W: f32 = 14.0;
+/// Height of the parameter knob area under the rack.
+const KNOB_AREA_H: f32 = 78.0;
+
+/// An effect being dragged out of a rack slot: dropped on another slot (any strip) it moves there,
+/// with Alt (Option) held it is copied.
+#[derive(Clone, Debug)]
+struct RackDrag {
+    strip: u64,
+    slot: usize,
+    name: String,
+}
+
+/// Paint a rack slot: its text, the dropdown arrow, the selection and a drop marker.
+#[allow(clippy::too_many_arguments)]
+fn paint_slot(ui: &egui::Ui, r: Rect, text: &str, filled: bool, dim: bool, selected: bool, hovered: bool, drop: bool, t: &Tokens) {
+    let bg = if selected {
+        t.accent.gamma_multiply(0.35)
+    } else if hovered {
+        t.hover
+    } else {
+        t.field_bg
+    };
+    ui.painter().rect_filled(r, 2.0, bg);
+    let border = if selected { t.accent } else { t.field_border };
+    ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, border), StrokeKind::Inside);
     let col = if !filled || dim { t.text_faint } else { t.text };
     let galley = ui.painter().layout_no_wrap(text.to_string(), Tokens::ui(10.0), col);
-    let clip = ui.painter().with_clip_rect(r.shrink(1.0).intersect(ui.clip_rect()));
+    let clip = ui.painter().with_clip_rect(Rect::from_min_max(r.min, pos2(r.max.x - ARROW_W, r.max.y)).shrink(1.0).intersect(ui.clip_rect()));
     clip.galley(pos2(r.min.x + 4.0, r.center().y - galley.size().y / 2.0), galley, col);
+    if dim && filled {
+        // bypassed: struck through, as the effect is not heard
+        let y = r.center().y;
+        clip.line_segment([pos2(r.min.x + 3.0, y), pos2(r.max.x - ARROW_W - 2.0, y)], Stroke::new(1.0, t.text_faint));
+    }
     icons::paint(ui.painter(), Rect::from_center_size(pos2(r.max.x - 7.0, r.center().y), vec2(7.0, 7.0)), Icon::ChevronDown, t.text_dim);
-    resp
+    if drop {
+        // where a dragged effect lands: at this slot, the ones below move down
+        ui.painter().line_segment([pos2(r.min.x, r.min.y - 1.0), pos2(r.max.x, r.min.y - 1.0)], Stroke::new(2.0, t.accent));
+        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+    }
+}
+
+/// The parameter a rack knob shows for `e`: the one chosen in the slot's menu, else the effect's
+/// first adjustable number.
+fn knob_param(app: &FilmcraftApp, strip: TrackId, slot: usize, e: &filmcraft_project::EffectInstance) -> Option<&'static filmcraft_project::ParamDef> {
+    let def = e.def()?;
+    let numeric = |p: &&filmcraft_project::ParamDef| matches!(p.kind, filmcraft_project::ParamKind::Float { .. });
+    let chosen = app.ui.mixer_knob_param.get(&knob_key(strip, slot, &e.effect)).and_then(|id| def.params.iter().filter(numeric).find(|p| p.id == id));
+    chosen.or_else(|| def.params.iter().find(|p| numeric(p) && p.animatable)).or_else(|| def.params.iter().find(numeric))
+}
+
+/// Key of a rack knob's parameter choice: strip, slot and the effect there.
+fn knob_key(strip: TrackId, slot: usize, effect: &str) -> String {
+    format!("{}/{slot}/{effect}", strip.0)
 }
 
 /// The DSP-backed audio effects that can go in an insert slot.
@@ -286,7 +336,7 @@ pub fn track_mixer(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     off = off.clamp(0.0, max_off);
     let sb_h = if max_off > 0.0 { 12.0 } else { 0.0 };
     // strips never get shorter than their controls plus a usable fader: scroll vertically instead
-    let need = 4.0 + if app.ui.mixer_fx_open { 10.0 * SLOT_H + 10.0 } else { 0.0 } + 112.0 + 26.0 + 24.0 + 6.0 + 170.0 + 42.0;
+    let need = 4.0 + if app.ui.mixer_fx_open { 10.0 * SLOT_H + 6.0 + KNOB_AREA_H } else { 0.0 } + 112.0 + 26.0 + 24.0 + 6.0 + 170.0 + 42.0;
     let clip = Rect::from_min_max(pos2(x0, body.min.y), pos2(body.max.x - 8.0, body.max.y - sb_h));
     let voff_id = egui::Id::new("mixer-vscroll");
     let max_voff = (need - (clip.height() - 4.0)).max(0.0);
@@ -340,6 +390,18 @@ pub fn track_mixer(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         };
         strip(app, &mut cui, &mut cx, *id, sr, &m);
     }
+    // the effect being dragged follows the pointer ("+" when Alt makes the drop a copy)
+    if let (Some(d), Some(p)) = (egui::DragAndDrop::payload::<RackDrag>(ui.ctx()), ui.ctx().pointer_interact_pos()) {
+        let copy = ui.input(|i| i.modifiers.alt);
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("mixer-rack-drag")));
+        let text = if copy { format!("+ {}", d.name) } else { d.name.clone() };
+        let galley = painter.layout_no_wrap(text, Tokens::ui(11.0), t.text);
+        let r = Rect::from_min_size(p + vec2(12.0, 8.0), galley.size() + vec2(10.0, 6.0));
+        painter.rect_filled(r, 3.0, Color32::from_black_alpha(210));
+        painter.rect_stroke(r, 3.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+        painter.galley(r.min + vec2(5.0, 3.0), galley, t.text);
+        ui.ctx().set_cursor_icon(if copy { egui::CursorIcon::Copy } else { egui::CursorIcon::Grabbing });
+    }
     transport(app, ui, footer, &mut cx);
     let acts = std::mem::take(&mut cx.acts);
     run_actions(app, &ui.ctx().clone(), acts);
@@ -372,165 +434,9 @@ fn strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, id: TrackId, s
     let w = sr.width();
     let mut y = sr.min.y + 4.0;
 
-    // ---- effect and send slots
+    // ---- effect and send slots, and the parameter knob of the selected one
     if app.ui.mixer_fx_open {
-        let mut open_editor = None;
-        for k in 0..filmcraft_project::mixer::MAX_INSERTS {
-            let r = Rect::from_min_size(pos2(x + 4.0, y), vec2(w - 8.0, SLOT_H - 2.0));
-            let fx = tr.effects.get(k);
-            let text = match fx {
-                Some(e) => format!("{}{}", if e.post_fader { "▸ " } else { "" }, e.def().map(|d| d.name).unwrap_or(&e.effect)),
-                None => String::new(),
-            };
-            let resp = slot_box(ui, r, &text, fx.is_some(), fx.is_some_and(|e| !e.enabled), &t, egui::Id::new((&ap, "fx", k)));
-            app.auto.add(&format!("{ap}.fx.{k}"), r, &if text.is_empty() { format!("Effect slot {}", k + 1) } else { text.clone() });
-            let can_add = fx.is_none() && k == tr.effects.len();
-            egui::Popup::menu(&resp).show(|ui| {
-                ui.set_min_width(180.0);
-                match fx {
-                    Some(e) => {
-                        if crate::panels::audio_fx_editor::has_editor(&e.effect) {
-                            let r0 = ui.button("Edit…");
-                            app.auto.add(&format!("{ap}.fx.{k}.edit"), r0.rect, "Edit…");
-                            if r0.clicked() {
-                                open_editor = Some(crate::panels::audio_fx_editor::FxTarget::Insert { strip: id.0, slot: k });
-                            }
-                            ui.separator();
-                        }
-                        let on = e.enabled;
-                        let r1 = ui.selectable_label(!on, "Bypass");
-                        app.auto.add(&format!("{ap}.fx.{k}.bypass"), r1.rect, "Bypass");
-                        if r1.clicked() {
-                            cx.cmd("mixer.setInsert", json!({"strip": sid, "slot": k, "enabled": !on}));
-                        }
-                        let r2 = ui.selectable_label(e.post_fader, "Post-Fader");
-                        app.auto.add(&format!("{ap}.fx.{k}.postFader"), r2.rect, "Post-Fader");
-                        if r2.clicked() {
-                            cx.cmd("mixer.setInsert", json!({"strip": sid, "slot": k, "postFader": !e.post_fader}));
-                        }
-                        ui.separator();
-                        let r3 = ui.button("Remove Effect");
-                        app.auto.add(&format!("{ap}.fx.{k}.remove"), r3.rect, "Remove Effect");
-                        if r3.clicked() {
-                            cx.cmd("mixer.removeInsert", json!({"strip": sid, "slot": k}));
-                        }
-                    }
-                    None if can_add => {
-                        // Premiere's effect-slot menu: one submenu per Audio Effects folder.
-                        let fx = insert_effects();
-                        let mut folders: Vec<&str> = Vec::new();
-                        for d in &fx {
-                            let f = d.category.get(1).copied().unwrap_or("");
-                            if !folders.contains(&f) {
-                                folders.push(f);
-                            }
-                        }
-                        for folder in folders {
-                            let items: Vec<_> = fx.iter().filter(|d| d.category.get(1).copied().unwrap_or("") == folder).collect();
-                            let mut add = |ui: &mut egui::Ui| {
-                                for d in &items {
-                                    let r = ui.button(d.name);
-                                    app.auto.add(&format!("{ap}.fx.{k}.{}", d.id), r.rect, d.name);
-                                    if r.clicked() {
-                                        cx.cmd("mixer.addInsert", json!({"strip": sid, "effect": d.id}));
-                                        ui.close();
-                                    }
-                                }
-                            };
-                            if folder.is_empty() {
-                                add(ui);
-                            } else {
-                                let mr = ui.menu_button(folder, |ui| add(ui));
-                                app.auto.add(&format!("{ap}.fx.{k}.folder.{folder}"), mr.response.rect, folder);
-                            }
-                        }
-                    }
-                    None => {
-                        ui.label("Fill the slots above first");
-                    }
-                }
-            });
-            if resp.double_clicked()
-                && let Some(e) = fx
-                && crate::panels::audio_fx_editor::has_editor(&e.effect)
-            {
-                open_editor = Some(crate::panels::audio_fx_editor::FxTarget::Insert { strip: id.0, slot: k });
-            }
-            y += SLOT_H;
-        }
-        if let Some(target) = open_editor {
-            crate::panels::audio_fx_editor::open(app, target);
-        }
-        y += 4.0;
-        for k in 0..filmcraft_project::mixer::MAX_SENDS {
-            let r = Rect::from_min_size(pos2(x + 4.0, y), vec2(w - 8.0, SLOT_H - 2.0));
-            let snd = tr.mixer.sends.get(k);
-            let text = match snd {
-                Some(s) => format!("{}{} {}", if s.pre_fader { "pre " } else { "" }, strip_label(seq, s.target), db_text(s.level_db)),
-                None => String::new(),
-            };
-            if is_master {
-                y += SLOT_H;
-                continue;
-            }
-            let resp = slot_box(ui, r, &text, snd.is_some(), snd.is_some_and(|s| s.muted), &t, egui::Id::new((&ap, "send", k)));
-            app.auto.add(&format!("{ap}.send.{k}"), r, &if text.is_empty() { format!("Send slot {}", k + 1) } else { text.clone() });
-            let can_add = snd.is_none() && k == tr.mixer.sends.len();
-            let tg = targets(seq, id);
-            egui::Popup::menu(&resp).show(|ui| {
-                ui.set_min_width(180.0);
-                match snd {
-                    Some(s) => {
-                        let mut lvl = s.level_db;
-                        let sl = ui.add(egui::Slider::new(&mut lvl, FADER_MIN_DB..=FADER_MAX_DB).text("dB"));
-                        app.auto.add(&format!("{ap}.send.{k}.level"), sl.rect, "Send level");
-                        if sl.changed() {
-                            cx.cmd("mixer.setSend", json!({"strip": sid, "send": k, "levelDb": lvl}));
-                        }
-                        let r1 = ui.selectable_label(s.pre_fader, "Pre-Fader");
-                        app.auto.add(&format!("{ap}.send.{k}.preFader"), r1.rect, "Pre-Fader");
-                        if r1.clicked() {
-                            cx.cmd("mixer.setSend", json!({"strip": sid, "send": k, "preFader": !s.pre_fader}));
-                        }
-                        let r2 = ui.selectable_label(s.muted, "Mute Send");
-                        app.auto.add(&format!("{ap}.send.{k}.mute"), r2.rect, "Mute Send");
-                        if r2.clicked() {
-                            cx.cmd("mixer.setSend", json!({"strip": sid, "send": k, "muted": !s.muted}));
-                        }
-                        ui.separator();
-                        let r3 = ui.button("Remove Send");
-                        app.auto.add(&format!("{ap}.send.{k}.remove"), r3.rect, "Remove Send");
-                        if r3.clicked() {
-                            cx.cmd("mixer.removeSend", json!({"strip": sid, "send": k}));
-                        }
-                    }
-                    None if can_add => {
-                        for s in &tg {
-                            let lbl = format!("{} ({})", strip_label(seq, s.id), s.name);
-                            let r = ui.button(&lbl);
-                            app.auto.add(&format!("{ap}.send.{k}.{}", strip_label(seq, s.id)), r.rect, &lbl);
-                            if r.clicked() {
-                                cx.cmd("mixer.addSend", json!({"strip": sid, "target": s.id.0}));
-                            }
-                        }
-                        if seq.submix_tracks.iter().all(|s| s.id != id) {
-                            let r = ui.button("New Submix");
-                            app.auto.add(&format!("{ap}.send.{k}.newSubmix"), r.rect, "New Submix");
-                            if r.clicked() {
-                                let n = seq.submix_tracks.len();
-                                cx.cmd("mixer.addSubmix", json!({}));
-                                cx.cmd("mixer.addSend", json!({"strip": sid, "target": format!("S{}", n + 1)}));
-                            }
-                        }
-                    }
-                    None => {
-                        ui.label("Fill the slots above first");
-                    }
-                }
-            });
-            y += SLOT_H;
-        }
-        y += 6.0;
+        y = rack(app, ui, cx, &tr, id, &ap, x, w, y);
     }
 
     // ---- input / output
@@ -756,6 +662,385 @@ fn strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, id: TrackId, s
 /// The 5.1 panner: a puck in the listening square (x left … right, y rear … front; speakers drawn
 /// at L, C, R, Ls, Rs), and the Center % and LFE values. Drags are `mixer.touch` / `mixer.release`
 /// on the `pan51.x` / `pan51.y` lanes, so they are heard live and recorded like the pan knob.
+/// The effect rack of a strip (Premiere's Audio Track Mixer): five effect slots, five send slots
+/// and the knob of the selected slot's parameter. Returns the y below it.
+///
+/// An effect slot is selected by a click (its knob shows below), opens the effect list from its
+/// arrow (or anywhere when empty; on a filled slot the list replaces it, None empties it), opens
+/// its editor on a double-click and its menu on a right-click (Edit…, Bypass, Post-Fader, the
+/// knob's parameter, Copy / Paste Track Effects, Remove). Dragging an effect onto another slot,
+/// of this strip or another, moves it there; with Alt (Option) held it is copied.
+#[allow(clippy::too_many_arguments)]
+fn rack(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, tr: &Track, id: TrackId, ap: &str, x: f32, w: f32, mut y: f32) -> f32 {
+    use crate::state::RackSel;
+    use egui::SetOpenCommand;
+    let t = cx.t;
+    let seq = cx.seq;
+    let sid = json!(id.0);
+    let is_master = id == MASTER_STRIP;
+    let sel = app.ui.mixer_rack.get(&id.0).copied();
+    let mut select: Option<Option<RackSel>> = None;
+    let mut open_editor = None;
+    let can_paste = app.session.state.rack_clipboard.is_some();
+    let dragging = egui::DragAndDrop::has_payload_of_type::<RackDrag>(ui.ctx());
+    for k in 0..filmcraft_project::mixer::MAX_INSERTS {
+        let r = Rect::from_min_size(pos2(x + 4.0, y), vec2(w - 8.0, SLOT_H - 2.0));
+        let fx = tr.effects.get(k);
+        let name = fx.map(|e| e.def().map(|d| d.name).unwrap_or(&e.effect).to_string());
+        let text = match (fx, &name) {
+            (Some(e), Some(n)) => format!("{}{n}", if e.post_fader { "▸ " } else { "" }),
+            _ => String::new(),
+        };
+        let resp = ui.interact(r, egui::Id::new((ap, "fx", k)), Sense::click_and_drag());
+        let arrow = Rect::from_min_max(pos2(r.max.x - ARROW_W, r.min.y), r.max);
+        let hover_drop = dragging && resp.dnd_hover_payload::<RackDrag>().is_some();
+        paint_slot(ui, r, &text, fx.is_some(), fx.is_some_and(|e| !e.enabled), sel == Some(RackSel::Effect(k)) && fx.is_some(), resp.hovered(), hover_drop, &t);
+        app.auto.add(&format!("{ap}.fx.{k}"), r, &if text.is_empty() { format!("Effect slot {}", k + 1) } else { text.clone() });
+        if let (Some(_), Some(n)) = (fx, &name) {
+            resp.dnd_set_drag_payload(RackDrag { strip: id.0, slot: k, name: n.clone() });
+        }
+        if let Some(d) = resp.dnd_release_payload::<RackDrag>() {
+            let copy = ui.input(|i| i.modifiers.alt);
+            cx.cmd("mixer.moveInsert", json!({"strip": d.strip, "slot": d.slot, "to": id.0, "toSlot": k, "copy": copy}));
+            let landed = if !copy && d.strip == id.0 { k.min(tr.effects.len().saturating_sub(1)) } else { k.min(tr.effects.len()) };
+            select = Some(Some(RackSel::Effect(landed)));
+        }
+        let on_arrow = resp.interact_pointer_pos().is_some_and(|p| arrow.contains(p));
+        if resp.clicked() && fx.is_some() && !on_arrow {
+            select = Some(Some(RackSel::Effect(k)));
+        }
+        let open_list = resp.clicked() && (fx.is_none() || on_arrow);
+        // (its own id: the right-click menu below is the response's default popup)
+        let list = egui::Popup::menu(&resp).id(egui::Id::new((ap, "fx-list", k)));
+        list.open_memory(open_list.then_some(SetOpenCommand::Toggle)).show(|ui| {
+            ui.set_min_width(180.0);
+            if fx.is_some() {
+                // a filled slot: another effect replaces it, None empties it
+                let r = ui.button("None");
+                app.auto.add(&format!("{ap}.fx.{k}.none"), r.rect, "None");
+                if r.clicked() {
+                    cx.cmd("mixer.removeInsert", json!({"strip": sid, "slot": k}));
+                    ui.close();
+                }
+                ui.separator();
+            }
+            // Premiere's effect-slot menu: one submenu per Audio Effects folder
+            let list = insert_effects();
+            let mut folders: Vec<&str> = Vec::new();
+            for d in &list {
+                let f = d.category.get(1).copied().unwrap_or("");
+                if !folders.contains(&f) {
+                    folders.push(f);
+                }
+            }
+            for folder in folders {
+                let items: Vec<_> = list.iter().filter(|d| d.category.get(1).copied().unwrap_or("") == folder).collect();
+                let mut add = |ui: &mut egui::Ui| {
+                    for d in &items {
+                        let r = ui.button(d.name);
+                        app.auto.add(&format!("{ap}.fx.{k}.{}", d.id), r.rect, d.name);
+                        if r.clicked() {
+                            if fx.is_some() {
+                                cx.cmd("mixer.replaceInsert", json!({"strip": sid, "slot": k, "effect": d.id}));
+                            } else {
+                                cx.cmd("mixer.addInsert", json!({"strip": sid, "effect": d.id}));
+                            }
+                            ui.close();
+                        }
+                    }
+                };
+                if folder.is_empty() {
+                    add(ui);
+                } else {
+                    let mr = ui.menu_button(folder, |ui| add(ui));
+                    app.auto.add(&format!("{ap}.fx.{k}.folder.{folder}"), mr.response.rect, folder);
+                }
+            }
+        });
+        resp.context_menu(|ui| {
+            ui.set_min_width(190.0);
+            if let Some(e) = fx {
+                let r0 = ui.button("Edit…");
+                app.auto.add(&format!("{ap}.fx.{k}.edit"), r0.rect, "Edit…");
+                if r0.clicked() {
+                    open_editor = Some(crate::panels::audio_fx_editor::FxTarget::Insert { strip: id.0, slot: k });
+                    ui.close();
+                }
+                ui.separator();
+                let on = e.enabled;
+                let r1 = ui.selectable_label(!on, "Bypass");
+                app.auto.add(&format!("{ap}.fx.{k}.bypass"), r1.rect, "Bypass");
+                if r1.clicked() {
+                    cx.cmd("mixer.setInsert", json!({"strip": sid, "slot": k, "enabled": !on}));
+                }
+                let r2 = ui.selectable_label(e.post_fader, "Post-Fader");
+                app.auto.add(&format!("{ap}.fx.{k}.postFader"), r2.rect, "Post-Fader");
+                if r2.clicked() {
+                    cx.cmd("mixer.setInsert", json!({"strip": sid, "slot": k, "postFader": !e.post_fader}));
+                }
+                // the parameter the knob under the rack shows
+                let shown_param = knob_param(app, id, k, e).map(|p| p.id);
+                let params: Vec<&filmcraft_project::ParamDef> =
+                    e.def().map(|d| d.params.iter().filter(|p| matches!(p.kind, filmcraft_project::ParamKind::Float { .. })).collect()).unwrap_or_default();
+                if !params.is_empty() {
+                    ui.separator();
+                    for p in params {
+                        let label = match p.group {
+                            Some(g) if !p.label.starts_with(g) => format!("{g}: {}", p.label),
+                            _ => p.label.to_string(),
+                        };
+                        let r = ui.selectable_label(shown_param == Some(p.id), label);
+                        app.auto.add(&format!("{ap}.fx.{k}.knob.{}", p.id), r.rect, p.label);
+                        if r.clicked() {
+                            app.ui.mixer_knob_param.insert(knob_key(id, k, &e.effect), p.id.to_string());
+                            select = Some(Some(RackSel::Effect(k)));
+                            ui.close();
+                        }
+                    }
+                }
+                ui.separator();
+            }
+            let r = ui.button("Copy Track Effects");
+            app.auto.add(&format!("{ap}.fx.copy"), r.rect, "Copy Track Effects");
+            if r.clicked() {
+                cx.cmd("mixer.copyInserts", json!({"strip": sid}));
+                ui.close();
+            }
+            let r = ui.add_enabled(can_paste, egui::Button::new("Paste Track Effects"));
+            app.auto.add(&format!("{ap}.fx.paste"), r.rect, "Paste Track Effects");
+            if r.clicked() {
+                cx.cmd("mixer.pasteInserts", json!({"strip": sid}));
+                ui.close();
+            }
+            if fx.is_some() {
+                ui.separator();
+                let r3 = ui.button("Remove Effect");
+                app.auto.add(&format!("{ap}.fx.{k}.remove"), r3.rect, "Remove Effect");
+                if r3.clicked() {
+                    cx.cmd("mixer.removeInsert", json!({"strip": sid, "slot": k}));
+                    ui.close();
+                }
+            }
+        });
+        // (egui counts a click elsewhere just before a double-click as a triple-click)
+        if (resp.double_clicked() || resp.triple_clicked()) && fx.is_some() {
+            open_editor = Some(crate::panels::audio_fx_editor::FxTarget::Insert { strip: id.0, slot: k });
+        }
+        y += SLOT_H;
+    }
+    if let Some(target) = open_editor {
+        crate::panels::audio_fx_editor::open(app, target);
+    }
+    y += 4.0;
+    for k in 0..filmcraft_project::mixer::MAX_SENDS {
+        let r = Rect::from_min_size(pos2(x + 4.0, y), vec2(w - 8.0, SLOT_H - 2.0));
+        if is_master {
+            y += SLOT_H;
+            continue;
+        }
+        let snd = tr.mixer.sends.get(k);
+        let text = match snd {
+            Some(s) => format!("{}{} {}", if s.pre_fader { "pre " } else { "" }, strip_label(seq, s.target), db_text(s.level_db)),
+            None => String::new(),
+        };
+        let resp = ui.interact(r, egui::Id::new((ap, "send", k)), Sense::click());
+        let arrow = Rect::from_min_max(pos2(r.max.x - ARROW_W, r.min.y), r.max);
+        paint_slot(ui, r, &text, snd.is_some(), snd.is_some_and(|s| s.muted), sel == Some(RackSel::Send(k)) && snd.is_some(), resp.hovered(), false, &t);
+        app.auto.add(&format!("{ap}.send.{k}"), r, &if text.is_empty() { format!("Send slot {}", k + 1) } else { text.clone() });
+        let on_arrow = resp.interact_pointer_pos().is_some_and(|p| arrow.contains(p));
+        if resp.clicked() && snd.is_some() && !on_arrow {
+            select = Some(Some(RackSel::Send(k)));
+        }
+        let tg = targets(seq, id);
+        let open_list = resp.clicked() && (snd.is_none() || on_arrow);
+        let list = egui::Popup::menu(&resp).id(egui::Id::new((ap, "send-list", k)));
+        list.open_memory(open_list.then_some(SetOpenCommand::Toggle)).show(|ui| {
+            ui.set_min_width(180.0);
+            for s in &tg {
+                let lbl = format!("{} ({})", strip_label(seq, s.id), s.name);
+                let r = ui.selectable_label(snd.is_some_and(|x| x.target == s.id), &lbl);
+                app.auto.add(&format!("{ap}.send.{k}.{}", strip_label(seq, s.id)), r.rect, &lbl);
+                if r.clicked() {
+                    if snd.is_some() {
+                        cx.cmd("mixer.setSend", json!({"strip": sid, "send": k, "target": s.id.0}));
+                    } else {
+                        cx.cmd("mixer.addSend", json!({"strip": sid, "target": s.id.0}));
+                    }
+                    ui.close();
+                }
+            }
+            if snd.is_none() && seq.submix_tracks.iter().all(|s| s.id != id) {
+                let r = ui.button("New Submix");
+                app.auto.add(&format!("{ap}.send.{k}.newSubmix"), r.rect, "New Submix");
+                if r.clicked() {
+                    let n = seq.submix_tracks.len();
+                    cx.cmd("mixer.addSubmix", json!({}));
+                    cx.cmd("mixer.addSend", json!({"strip": sid, "target": format!("S{}", n + 1)}));
+                    ui.close();
+                }
+            }
+            if tg.is_empty() && snd.is_none() && seq.submix_tracks.iter().any(|s| s.id == id) {
+                ui.label("No submix after this one");
+            }
+        });
+        if let Some(s) = snd {
+            resp.context_menu(|ui| {
+                ui.set_min_width(180.0);
+                let mut lvl = s.level_db;
+                let sl = ui.add(egui::Slider::new(&mut lvl, FADER_MIN_DB..=FADER_MAX_DB).text("dB"));
+                app.auto.add(&format!("{ap}.send.{k}.level"), sl.rect, "Send level");
+                if sl.changed() {
+                    cx.cmd("mixer.setSend", json!({"strip": sid, "send": k, "levelDb": lvl}));
+                }
+                let r1 = ui.selectable_label(s.pre_fader, "Pre-Fader");
+                app.auto.add(&format!("{ap}.send.{k}.preFader"), r1.rect, "Pre-Fader");
+                if r1.clicked() {
+                    cx.cmd("mixer.setSend", json!({"strip": sid, "send": k, "preFader": !s.pre_fader}));
+                }
+                let r2 = ui.selectable_label(s.muted, "Mute Send");
+                app.auto.add(&format!("{ap}.send.{k}.mute"), r2.rect, "Mute Send");
+                if r2.clicked() {
+                    cx.cmd("mixer.setSend", json!({"strip": sid, "send": k, "muted": !s.muted}));
+                }
+                ui.separator();
+                let r3 = ui.button("Remove Send");
+                app.auto.add(&format!("{ap}.send.{k}.remove"), r3.rect, "Remove Send");
+                if r3.clicked() {
+                    cx.cmd("mixer.removeSend", json!({"strip": sid, "send": k}));
+                    ui.close();
+                }
+            });
+        }
+        y += SLOT_H;
+    }
+    if let Some(s) = select {
+        match s {
+            Some(v) => app.ui.mixer_rack.insert(id.0, v),
+            None => app.ui.mixer_rack.remove(&id.0),
+        };
+    }
+    y += 2.0;
+    rack_knob(app, ui, cx, tr, id, ap, Rect::from_min_size(pos2(x + 4.0, y), vec2(w - 8.0, KNOB_AREA_H - 6.0)));
+    y + KNOB_AREA_H
+}
+
+/// The knob area under the rack: the selected effect's chosen parameter (or the selected send's
+/// level) as a knob with its value and name, and the bypass button (effect bypass / send mute).
+/// Drags are `mixer.touch` / `mixer.release` on the parameter's lane (`fx.<slot>.<param>`,
+/// `send.<i>.level`), so they are heard live and recorded as automation like the fader.
+#[allow(clippy::too_many_arguments)]
+fn rack_knob(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, tr: &Track, id: TrackId, ap: &str, r: Rect) {
+    use crate::state::RackSel;
+    let t = cx.t;
+    let sid = json!(id.0);
+    ui.painter().rect_filled(r, 3.0, Color32::from_gray(0x1b));
+    ui.painter().rect_stroke(r, 3.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
+    // (lane, value, (min, max), unit, decimals, name, default, bypassed, bypass command)
+    struct Knob {
+        lane: String,
+        value: f64,
+        range: (f64, f64),
+        unit: &'static str,
+        decimals: usize,
+        name: String,
+        default: f64,
+        bypassed: bool,
+        bypass: (&'static str, Value),
+    }
+    let knob = match app.ui.mixer_rack.get(&id.0).copied() {
+        Some(RackSel::Effect(k)) => tr.effects.get(k).and_then(|e| {
+            let p = knob_param(app, id, k, e)?;
+            let filmcraft_project::ParamKind::Float { soft_min, soft_max, unit, decimals, .. } = p.kind else { return None };
+            let lane = filmcraft_project::mixer::fx_lane(k, p.id);
+            Some(Knob {
+                value: shown(app, tr, &lane, cx.now),
+                lane,
+                range: (soft_min, soft_max),
+                unit,
+                decimals: decimals as usize,
+                name: p.label.to_string(),
+                default: p.default.as_f64().unwrap_or(soft_min),
+                bypassed: !e.enabled,
+                bypass: ("mixer.setInsert", json!({"strip": sid, "slot": k, "enabled": !e.enabled})),
+            })
+        }),
+        Some(RackSel::Send(k)) => tr.mixer.sends.get(k).map(|s| {
+            let lane = format!("send.{k}.level");
+            Knob {
+                value: shown(app, tr, &lane, cx.now),
+                lane,
+                range: (FADER_MIN_DB, FADER_MAX_DB),
+                unit: "dB",
+                decimals: 1,
+                name: format!("Send to {}", strip_label(cx.seq, s.target)),
+                default: 0.0,
+                bypassed: s.muted,
+                bypass: ("mixer.setSend", json!({"strip": sid, "send": k, "muted": !s.muted})),
+            }
+        }),
+        None => None,
+    };
+    // bypass button at the right (Premiere's fx circle; struck through when bypassed)
+    let bc = pos2(r.max.x - 12.0, r.min.y + 13.0);
+    let br = Rect::from_center_size(bc, vec2(18.0, 18.0));
+    let bresp = ui.interact(br, egui::Id::new((ap, "rack-bypass")), Sense::click()).on_hover_text("Bypass");
+    let active = knob.is_some();
+    let ring = if !active {
+        Color32::from_gray(0x55)
+    } else if bresp.hovered() {
+        t.tab_text_active
+    } else {
+        Color32::from_gray(0xa8)
+    };
+    ui.painter().circle_stroke(bc, 8.0, Stroke::new(1.2, ring));
+    ui.painter().text(bc, Align2::CENTER_CENTER, "fx", egui::FontId::new(9.0, egui::FontFamily::Proportional), ring);
+    if knob.as_ref().is_some_and(|k| k.bypassed) {
+        ui.painter().line_segment([bc + vec2(-6.0, 6.0), bc + vec2(6.0, -6.0)], Stroke::new(1.5, RED));
+    }
+    app.auto.add(&format!("{ap}.rack.bypass"), br, "Bypass");
+    let Some(k) = knob else { return };
+    if bresp.clicked() {
+        cx.cmd(k.bypass.0, k.bypass.1.clone());
+    }
+    let kc = pos2(r.center().x - 4.0, r.min.y + 22.0);
+    let kr = Rect::from_center_size(kc, vec2(34.0, 34.0));
+    let kresp = ui.interact(kr, egui::Id::new((ap, "rack-knob")), Sense::click_and_drag()).on_hover_text(format!("{} (drag; double-click: default)", k.name));
+    let ring = if kresp.hovered() || kresp.dragged() { t.tab_text_active } else { Color32::from_gray(0xd0) };
+    let span = (k.range.1 - k.range.0).max(1e-9);
+    let u = ((k.value - k.range.0) / span).clamp(0.0, 1.0) as f32;
+    let ang = (-135.0 + 270.0 * u).to_radians();
+    ui.painter().circle_filled(kc, 13.0, Color32::from_gray(0x2a));
+    ui.painter().circle_stroke(kc, 13.0, Stroke::new(1.5, ring));
+    ui.painter().line_segment([kc, kc + vec2(ang.sin(), -ang.cos()) * 11.0], Stroke::new(2.0, ring));
+    app.auto.add(&format!("{ap}.rack.knob"), kr, &k.name);
+    if kresp.dragged() {
+        let d = kresp.drag_delta();
+        let fine = if ui.input(|i| i.modifiers.shift) { 0.1 } else { 1.0 };
+        let nv = (k.value + (d.x - d.y) as f64 * span / 150.0 * fine).clamp(k.range.0, k.range.1);
+        if nv != k.value {
+            cx.cmd("mixer.touch", json!({"strip": sid, "lane": k.lane, "value": nv, "time": cx.now.0}));
+        }
+    }
+    if kresp.drag_stopped() {
+        cx.cmd("mixer.release", json!({"strip": sid, "lane": k.lane, "time": cx.now.0}));
+    }
+    if kresp.double_clicked() {
+        cx.cmd("mixer.setValue", json!({"strip": sid, "lane": k.lane, "value": k.default}));
+    }
+    let vr = Rect::from_center_size(pos2(r.center().x, r.min.y + 50.0), vec2(r.width(), 16.0));
+    let mut vui = ui.new_child(egui::UiBuilder::new().max_rect(vr).layout(egui::Layout::top_down(egui::Align::Center)));
+    let suffix = if k.unit.is_empty() { String::new() } else { format!(" {}", k.unit) };
+    let (vresp, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new((ap, "rack-value")), k.value, span / 300.0, k.range, k.decimals, &suffix, &t);
+    app.auto.add(&format!("{ap}.rack.value"), vresp.rect, &format!("{:.*}{suffix}", k.decimals, k.value));
+    if let Some(v) = nv {
+        cx.cmd("mixer.setValue", json!({"strip": sid, "lane": k.lane, "value": v}));
+    }
+    let galley = ui.painter().layout_no_wrap(k.name.clone(), Tokens::ui(10.0), t.text_dim);
+    let clip = ui.painter().with_clip_rect(r.shrink(2.0).intersect(ui.clip_rect()));
+    let gx = if galley.size().x < r.width() - 6.0 { r.center().x - galley.size().x / 2.0 } else { r.min.x + 3.0 };
+    clip.galley(pos2(gx, r.max.y - galley.size().y - 3.0), galley, t.text_dim);
+}
+
 fn pan51_panner(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, tr: &Track, ap: &str, sid: &Value, r: Rect) {
     let t = cx.t;
     let px = shown(app, tr, LANE_PAN51_X, cx.now);

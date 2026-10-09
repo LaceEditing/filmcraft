@@ -53,6 +53,9 @@ pub struct DynamicsRack {
     /// Cached coefficients.
     c: [f32; 8],
     hold: u32,
+    /// Deepest gain reduction per stage (gate, compressor, expander, limiter) since the meters
+    /// were last read.
+    gr_peak: [f32; 4],
 }
 
 impl DynamicsRack {
@@ -91,6 +94,7 @@ impl DynamicsRack {
             out: Smoothed::with_ms(1.0, sample_rate, 20.0),
             c: [0.0; 8],
             hold: 0,
+            gr_peak: [0.0; 4],
         };
         s.apply_params(true);
         s
@@ -162,6 +166,12 @@ impl AudioEffect for DynamicsRack {
         self.comp_env = 0.0;
         self.lim_env = 0.0;
         self.out.snap();
+        self.gr_peak = [0.0; 4];
+    }
+    fn meters(&mut self) -> Option<[f32; 4]> {
+        let m = self.gr_peak;
+        self.gr_peak = [0.0; 4];
+        Some(m)
     }
     fn process(&mut self, channels: &mut [&mut [f32]]) {
         let n = block_len(channels);
@@ -210,6 +220,16 @@ impl AudioEffect for DynamicsRack {
                     smooth(&mut self.lim_env, target, 0.0, c[7]);
                 }
                 g += self.lim_env;
+            }
+            // the stages' reduction for the meters (an off stage reduces nothing)
+            let stages = [
+                if gate_on { self.gate_env } else { 0.0 },
+                if comp_on { self.comp_env } else { 0.0 },
+                if exp_on { self.exp_env } else { 0.0 },
+                if lim_on { self.lim_env } else { 0.0 },
+            ];
+            for (m, v) in self.gr_peak.iter_mut().zip(stages) {
+                *m = m.min(v);
             }
             let gain = db_to_gain(g);
             let o = self.out.tick();

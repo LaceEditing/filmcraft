@@ -203,3 +203,38 @@ fn mask_geometry_scales_to_the_target_frame_size() {
     assert!((c.x - 480.0).abs() < 1e-6 && (c.y - 270.0).abs() < 1e-6, "{c:?}");
     assert_eq!(m.feather.value, ParamValue::Float(80.0));
 }
+
+/// The Fx Editor's Presets menu: the settings of one effect (a track insert or a clip effect)
+/// saved under a name, applied to the same kind of effect anywhere, "(Default)" resets it.
+#[test]
+fn effect_settings_presets_from_inserts_and_clips() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    s.execute("mixer.addInsert", json!({"strip": "A1", "effect": "hard_limiter"})).unwrap();
+    s.execute("mixer.setInsert", json!({"strip": "A1", "slot": 0, "params": {"max": -3.0, "link": false}})).unwrap();
+    // automation on the insert: the preset keeps the value at the playhead only
+    s.execute("mixer.setKeyframe", json!({"strip": "A1", "lane": "fx.0.boost", "time": 0, "value": 6.0})).unwrap();
+    let r = s.execute("presets.saveSettings", json!({"name": "Loud limit", "strip": "A1", "slot": 0})).unwrap();
+    assert_eq!(r["ids"], json!(["hard_limiter"]));
+    let saved = s.presets.find("Loud limit").unwrap();
+    assert!(saved.effects[0].params.values().all(|p| p.keyframes.is_empty()));
+    // onto a clip's Hard Limiter
+    let clip = s.active_sequence().unwrap().audio_tracks[0].items[0].id;
+    s.execute("effects.apply", json!({"clips": [clip.0], "effect": "hard_limiter"})).unwrap();
+    let index = s.active_sequence().unwrap().find_item(clip).unwrap().1.effects.iter().position(|e| e.effect == "hard_limiter").unwrap();
+    s.execute("presets.applySettings", json!({"preset": "Loud limit", "clip": clip.0, "index": index})).unwrap();
+    let e = s.active_sequence().unwrap().find_item(clip).unwrap().1.effects[index].clone();
+    assert_eq!(e.param("max").map(|p| p.value.clone()), Some(ParamValue::Float(-3.0)));
+    assert_eq!(e.param("link").map(|p| p.value.clone()), Some(ParamValue::Bool(false)));
+    assert_eq!(s.history.undo.last().map(|u| u.0.as_str()), Some("Apply Preset Loud limit"));
+    // not onto another effect
+    s.execute("mixer.addInsert", json!({"strip": "A2", "effect": "bass"})).unwrap();
+    assert!(s.execute("presets.applySettings", json!({"preset": "Loud limit", "strip": "A2", "slot": 0})).is_err());
+    // (Default) resets the insert, automation included
+    s.execute("presets.applySettings", json!({"preset": "(Default)", "strip": "A1", "slot": 0})).unwrap();
+    let ins = s.active_sequence().unwrap().audio_tracks[0].effects[0].clone();
+    assert_eq!(ins.param("max").map(|p| p.value.clone()), Some(ParamValue::Float(-0.1)));
+    assert!(ins.param("boost").is_some_and(|p| p.keyframes.is_empty()));
+    assert!(s.execute("presets.saveSettings", json!({"name": "(Default)", "strip": "A1", "slot": 0})).is_err(), "reserved name");
+    assert!(s.execute("presets.saveSettings", json!({"name": "x", "strip": "A1", "slot": 4})).is_err());
+}

@@ -245,6 +245,29 @@ fn dynamics_rack_sections() {
     assert!(ys.iter().all(|v| v.abs() <= db_to_gain(-6.0) + 1e-6));
 }
 
+/// The Dynamics meters (the editor's gate lights and gain-reduction bars): each enabled stage
+/// reports its deepest reduction since the last read; stages that are off report none.
+#[test]
+fn dynamics_rack_meters_per_stage() {
+    let n = SR as usize / 2;
+    let mut e = fx("dynamics_rack", &[("comp_threshold", -20.0), ("comp_ratio", 4.0), ("comp_attack", 0.1), ("lim_on", 1.0), ("lim_threshold", -12.0)]);
+    let x = sine(1000.0, 0.5, SR as f64, n, 0.0);
+    run(e.as_mut(), &x, &x);
+    let m = e.meters().unwrap();
+    assert_eq!(m[0], 0.0, "the gate is off");
+    assert!(m[1] < -6.0, "the compressor reduces a -6 dBFS tone by ~10 dB: {m:?}");
+    assert_eq!(m[2], 0.0, "the expander is off");
+    assert!(m[3] <= 0.0);
+    assert_eq!(e.meters().unwrap(), [0.0; 4], "reading resets them");
+    // a closed gate shows its full range
+    let mut g = fx("dynamics_rack", &[("comp_on", 0.0), ("gate_on", 1.0), ("gate_threshold", -30.0)]);
+    let q = sine(1000.0, 0.01, SR as f64, n, 0.0);
+    run(g.as_mut(), &q, &q);
+    assert!(g.meters().unwrap()[0] < -40.0);
+    // effects without meters have none
+    assert!(fx("delay", &[]).meters().is_none());
+}
+
 #[test]
 fn multiband_crossovers_sum_flat_and_bands_compress_independently() {
     let mut e = fx("multiband_compressor", &[("b1_ratio", 1.0), ("b2_ratio", 1.0), ("b3_ratio", 1.0), ("b4_ratio", 1.0)]);

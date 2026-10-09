@@ -293,6 +293,9 @@ pub struct EditorState {
     /// Marker colours hidden in the Markers panel (Show All Marker Colors clears this).
     #[serde(default)]
     pub hidden_marker_colors: Vec<filmcraft_project::Label>,
+    /// Audio Track Mixer ▸ Copy Track Effects: a strip's effect rack, for Paste Track Effects.
+    #[serde(skip)]
+    pub rack_clipboard: Option<Vec<filmcraft_project::EffectInstance>>,
     /// Sequence markers copied with the clipboard clips (start relative to the copied range).
     #[serde(skip)]
     pub clipboard_markers: Vec<filmcraft_project::Marker>,

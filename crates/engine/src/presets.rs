@@ -408,6 +408,22 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         ),
         spec("presets.apply", "Apply Preset", r#"{"preset":str,"clips":[id]?}"#, has_seq, apply, true),
         spec("presets.delete", "Delete Preset", r#"{"name":str}"#, always, delete, true),
+        spec(
+            "presets.saveSettings",
+            "Save Effect Settings as Preset",
+            r#"{"name":str,"strip":"A1"|id,"slot":n}|{"name":str,"clip":id,"index":n}"#,
+            has_seq,
+            save_settings,
+            true,
+        ),
+        spec(
+            "presets.applySettings",
+            "Apply Effect Settings Preset",
+            r#"{"preset":str|"(Default)","strip":"A1"|id,"slot":n}|{"preset":str,"clip":id,"index":n}"#,
+            has_seq,
+            apply_settings,
+            true,
+        ),
         spec("presets.rename", "Rename Preset", r#"{"name":str,"to":str}"#, always, rename, true),
         spec("presets.export", "Export Presets", r#"{"path":str,"names":[str]?}"#, always, export, false),
         spec("presets.import", "Import Presets", r#"{"path":str}"#, always, import, true),
@@ -421,6 +437,7 @@ fn preset_json(p: &EffectPreset) -> Value {
         "builtin": p.builtin,
         "keyframes": p.keyframes.label(),
         "effects": p.effects.iter().map(|e| e.def().map(|d| d.name).unwrap_or(e.effect.as_str()).to_string()).collect::<Vec<_>>(),
+        "ids": p.effects.iter().map(|e| e.effect.clone()).collect::<Vec<_>>(),
         "animated": p.effects.iter().any(|e| e.is_animated()),
         "masks": p.effects.iter().map(|e| e.masks.len()).sum::<usize>(),
     })
@@ -505,6 +522,110 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(n)
     })?;
     Ok(json!({"applied": n}))
+}
+
+/// One effect addressed by an editor window: a track insert (`strip`, `slot`) or a clip effect
+/// (`clip`, `index`).
+enum Settings {
+    Insert(filmcraft_project::TrackId, usize),
+    Clip(ClipId, usize),
+}
+
+fn settings_target(s: &Session, p: &Value, cmd: &str) -> Result<Settings> {
+    if p.get("strip").is_some() || p.get("track").is_some() {
+        let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
+        let v = p.get("strip").or_else(|| p.get("track")).cloned().unwrap_or(Value::Null);
+        let id = crate::mixer::strip_ref(seq, &v).ok_or_else(|| bad(cmd, format!("no strip {v}")))?;
+        let slot = p.get("slot").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "need `slot`"))? as usize;
+        return Ok(Settings::Insert(id, slot));
+    }
+    let clip = clip_p(p, "clip").ok_or_else(|| bad(cmd, "need `strip` and `slot`, or `clip` and `index`"))?;
+    let index = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "need `index`"))? as usize;
+    Ok(Settings::Clip(clip, index))
+}
+
+/// The addressed effect and the time its values are read at (the playhead, in media time for a
+/// clip effect).
+fn settings_effect(s: &Session, t: &Settings, cmd: &str) -> Result<(EffectInstance, Tick)> {
+    let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    match t {
+        Settings::Insert(id, slot) => {
+            let e = seq.strip(*id).and_then(|tr| tr.effects.get(*slot).cloned()).ok_or_else(|| bad(cmd, "no effect in that slot"))?;
+            Ok((e, s.playhead()))
+        }
+        Settings::Clip(c, i) => {
+            let (_, it) = seq.find_item(*c).ok_or_else(|| bad(cmd, "no such clip"))?;
+            let e = it.effects.get(*i).cloned().ok_or_else(|| bad(cmd, "no such effect"))?;
+            Ok((e, it.source_time_at(s.playhead().clamp(it.start, it.end() - Tick(1)))))
+        }
+    }
+}
+
+/// Save the settings of one effect (the Fx Editor's Presets ▸ save): its values at the playhead,
+/// without keyframes, as a preset of that effect alone.
+fn save_settings(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "presets.saveSettings";
+    let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty() && *n != DEFAULT_SETTINGS).ok_or_else(|| bad(CMD, "need a `name`"))?.to_string();
+    let target = settings_target(s, p, CMD)?;
+    let (mut e, t) = settings_effect(s, &target, CMD)?;
+    for par in e.params.values_mut() {
+        par.value = par.value_at(t);
+        par.keyframes.clear();
+    }
+    e.enabled = true;
+    let preset = EffectPreset {
+        name: name.clone(),
+        description: String::new(),
+        keyframes: KeyframeMode::Scale,
+        source_duration: Tick::ZERO,
+        source_size: hd(),
+        effects: vec![e],
+        builtin: false,
+    };
+    let out = preset_json(&preset);
+    s.presets.user.retain(|x| x.name != name);
+    s.presets.user.push(preset);
+    s.presets.persist().map_err(EngineError::Other)?;
+    Ok(out)
+}
+
+/// The Presets menu's "(Default)": the effect's own defaults.
+pub const DEFAULT_SETTINGS: &str = "(Default)";
+
+/// Apply a preset of one effect to one effect of the same kind (the Fx Editor's Presets menu):
+/// its parameters take the preset's values (keyframes and automation are replaced);
+/// [`DEFAULT_SETTINGS`] resets them. One undo step.
+fn apply_settings(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "presets.applySettings";
+    let name = str_p(p, "preset").or_else(|| str_p(p, "name")).ok_or_else(|| bad(CMD, "need `preset`"))?.to_string();
+    let target = settings_target(s, p, CMD)?;
+    let (cur, _) = settings_effect(s, &target, CMD)?;
+    let values: Vec<(String, Param)> = if name == DEFAULT_SETTINGS {
+        let def = cur.def().ok_or_else(|| bad(CMD, "unknown effect"))?;
+        def.instance().params.into_iter().collect()
+    } else {
+        let preset = s.presets.find(&name).ok_or_else(|| bad(CMD, format!("no preset `{name}`")))?;
+        let [e] = preset.effects.as_slice() else { return Err(bad(CMD, format!("`{name}` holds more than one effect"))) };
+        if e.effect != cur.effect {
+            return Err(bad(CMD, format!("`{name}` is a preset of another effect")));
+        }
+        e.params.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let label = format!("Apply Preset {name}");
+    let set = move |e: &mut EffectInstance| {
+        for (k, v) in &values {
+            e.params.insert(k.clone(), v.clone());
+        }
+    };
+    match target {
+        Settings::Insert(id, slot) => s.edit_sequence(&label, move |q, _, _| {
+            q.with_strip_mut(id, |tr| tr.effects.get_mut(slot).map(set)).flatten().ok_or_else(|| bad(CMD, "no effect in that slot"))
+        })?,
+        Settings::Clip(c, i) => s.edit_sequence(&label, move |q, _, _| {
+            q.find_item_mut(c).and_then(|(_, it)| it.effects.get_mut(i)).map(set).ok_or_else(|| bad(CMD, "no such effect"))
+        })?,
+    }
+    Ok(json!({"applied": name}))
 }
 
 fn delete(s: &mut Session, p: &Value) -> Result<Value> {

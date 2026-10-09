@@ -481,3 +481,108 @@ fn surround_sequence_settings_and_panner_lanes() {
     assert!(s.execute("file.newSequence", json!({"mix": "7.1"})).is_err());
     s.execute("file.newSequence", json!({"trackType": "Standard"})).unwrap();
 }
+
+/// The effect ids in a strip's rack, in order.
+fn rack(s: &Session, strip: &str) -> Vec<String> {
+    let seq = s.active_sequence().unwrap();
+    let id = crate::mixer::strip_ref(seq, &json!(strip)).unwrap();
+    seq.strip(id).unwrap().effects.iter().map(|e| e.effect.clone()).collect()
+}
+
+/// Dragging an effect in the Audio Track Mixer: within a rack it reorders, onto another track it
+/// moves (settings and automation along), with Alt it copies; each is one undo step.
+#[test]
+fn track_effects_reorder_move_and_copy() {
+    let mut s = demo();
+    for fx in ["amplify", "bass", "treble"] {
+        s.execute("mixer.addInsert", json!({"strip": "A1", "effect": fx})).unwrap();
+    }
+    s.execute("mixer.setInsert", json!({"strip": "A1", "slot": 0, "params": {"gain": 6.0}})).unwrap();
+    // an automated parameter of the moved effect
+    s.execute("mixer.setKeyframe", json!({"strip": "A1", "lane": "fx.0.gain", "time": sec(1.0), "value": -3.0})).unwrap();
+    let before = s.project.clone();
+    // reorder: Amplify to the last slot
+    let r = s.execute("mixer.moveInsert", json!({"strip": "A1", "slot": 0, "toSlot": 2})).unwrap();
+    assert_eq!(r, json!({"slot": 2}));
+    assert_eq!(rack(&s, "A1"), ["bass", "treble", "amplify"]);
+    // and back to the top, past-the-end slots clamp
+    s.execute("mixer.moveInsert", json!({"strip": "A1", "slot": 2, "toSlot": 0})).unwrap();
+    assert_eq!(rack(&s, "A1"), ["amplify", "bass", "treble"]);
+    s.execute("mixer.moveInsert", json!({"strip": "A1", "slot": 0, "toSlot": 99})).unwrap();
+    assert_eq!(rack(&s, "A1"), ["bass", "treble", "amplify"]);
+    // onto the same slot: nothing to do, nothing to undo
+    let undo = s.history.undo.len();
+    s.execute("mixer.moveInsert", json!({"strip": "A1", "slot": 1, "toSlot": 1})).unwrap();
+    assert_eq!(s.history.undo.len(), undo);
+    // to another track: it leaves A1 with its settings and keyframes
+    s.execute("mixer.moveInsert", json!({"strip": "A1", "slot": 2, "to": "A2", "toSlot": 0})).unwrap();
+    assert_eq!(rack(&s, "A1"), ["bass", "treble"]);
+    assert_eq!(rack(&s, "A2"), ["amplify"]);
+    let a2 = &s.active_sequence().unwrap().audio_tracks[1];
+    let amp = &a2.effects[0];
+    assert_eq!(amp.param("gain").map(|p| p.keyframes.len()), Some(1), "its automation went with it");
+    assert_eq!(a2.lane_value("fx.0.gain", Tick(sec(1.0))), -3.0);
+    // Alt-drag: a copy on the Mix, the original stays
+    s.execute("mixer.moveInsert", json!({"strip": "A2", "slot": 0, "to": "Mix", "copy": true})).unwrap();
+    assert_eq!(rack(&s, "A2"), ["amplify"]);
+    assert_eq!(rack(&s, "Mix"), ["amplify"]);
+    assert_eq!(s.history.undo.last().map(|u| u.0.as_str()), Some("Copy Track Effect Amplify"));
+    // a copy within the same rack
+    s.execute("mixer.moveInsert", json!({"strip": "A1", "slot": 0, "toSlot": 0, "copy": true})).unwrap();
+    assert_eq!(rack(&s, "A1"), ["bass", "bass", "treble"]);
+    // undo all the way back, one step per drag
+    for _ in 0..6 {
+        s.execute("edit.undo", json!({})).unwrap();
+    }
+    assert_eq!(*s.project, *before);
+}
+
+#[test]
+fn a_full_rack_takes_no_more_effects_and_bad_drags_are_refused() {
+    let mut s = demo();
+    for _ in 0..filmcraft_project::mixer::MAX_INSERTS {
+        s.execute("mixer.addInsert", json!({"strip": "A1", "effect": "bass"})).unwrap();
+    }
+    s.execute("mixer.addInsert", json!({"strip": "A2", "effect": "treble"})).unwrap();
+    let before = s.project.clone();
+    for p in [
+        json!({"strip": "A2", "slot": 0, "to": "A1"}),
+        json!({"strip": "A1", "slot": 0, "toSlot": 1, "copy": true}),
+        json!({"strip": "A1", "slot": 7, "to": "A2"}),
+        json!({"strip": "A1", "slot": 0, "to": "Z9"}),
+        json!({"strip": "A1"}),
+    ] {
+        assert!(s.execute("mixer.moveInsert", p.clone()).is_err(), "{p}");
+    }
+    // within a full rack, reordering still works
+    s.execute("mixer.moveInsert", json!({"strip": "A1", "slot": 0, "toSlot": 4})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.project, *before);
+}
+
+#[test]
+fn track_effects_are_replaced_copied_and_pasted() {
+    let mut s = demo();
+    s.execute("mixer.addInsert", json!({"strip": "A1", "effect": "bass"})).unwrap();
+    s.execute("mixer.addInsert", json!({"strip": "A1", "effect": "treble", "postFader": true})).unwrap();
+    s.execute("mixer.setInsert", json!({"strip": "A1", "slot": 0, "params": {"boost": 9.0}})).unwrap();
+    // the slot menu: another effect takes the slot, keeping pre/post-fader
+    s.execute("mixer.replaceInsert", json!({"strip": "A1", "slot": 1, "effect": "hard_limiter"})).unwrap();
+    assert_eq!(rack(&s, "A1"), ["bass", "hard_limiter"]);
+    assert!(s.active_sequence().unwrap().audio_tracks[0].effects[1].post_fader);
+    assert!(s.execute("mixer.replaceInsert", json!({"strip": "A1", "slot": 1, "effect": "motion"})).is_err(), "not an audio effect");
+    assert!(s.execute("mixer.replaceInsert", json!({"strip": "A1", "slot": 3, "effect": "bass"})).is_err(), "an empty slot");
+    // "None" empties it
+    s.execute("mixer.replaceInsert", json!({"strip": "A1", "slot": 1, "effect": "none"})).unwrap();
+    assert_eq!(rack(&s, "A1"), ["bass"]);
+    // Copy / Paste Track Effects: the rack replaces the target's
+    assert!(!s.is_enabled("mixer.pasteInserts"), "nothing copied yet");
+    s.execute("mixer.addInsert", json!({"strip": "A2", "effect": "treble"})).unwrap();
+    s.execute("mixer.copyInserts", json!({"strip": "A1"})).unwrap();
+    s.execute("mixer.pasteInserts", json!({"strip": "A2"})).unwrap();
+    assert_eq!(rack(&s, "A2"), ["bass"]);
+    let boost = s.active_sequence().unwrap().audio_tracks[1].effects[0].param("boost").map(|p| p.value.clone());
+    assert_eq!(boost, Some(ParamValue::Float(9.0)), "with its settings");
+    s.execute("mixer.pasteInserts", json!({"strip": "Mix"})).unwrap();
+    assert_eq!(rack(&s, "Mix"), ["bass"]);
+}

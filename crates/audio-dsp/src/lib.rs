@@ -144,6 +144,12 @@ pub trait AudioEffect: Send {
     fn transfer_db(&self, _band: usize, _input_db: f32) -> Option<f32> {
         None
     }
+    /// The deepest gain reduction (dB, ≤ 0) of up to four stages since the last call, for the
+    /// meters of the effect editors; reading resets it. `None` for effects without meters.
+    /// Dynamics: auto gate, compressor, expander, limiter. Hard Limiter: the limiter first.
+    fn meters(&mut self) -> Option<[f32; 4]> {
+        None
+    }
 }
 
 /// Parameter value storage shared by the effect implementations.

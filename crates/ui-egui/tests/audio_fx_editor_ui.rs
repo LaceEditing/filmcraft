@@ -25,7 +25,7 @@ impl Driver {
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(session).with_control(rx);
         let snapshots = std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
-        let mut b = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000);
+        let mut b = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_step_dt(1.0 / 60.0).with_max_steps(10_000);
         if snapshots.is_some() {
             b = b.wgpu();
         }
@@ -210,9 +210,43 @@ fn graphic_eq_and_dynamics_editors() {
     d.click("effectControls.effect.graphic_eq_30");
     d.click("effectControls.effect.dynamics_rack.edit");
     d.frames(3);
-    assert!(d.element("fxEditor.dynamics_rack.curve").is_some());
+    // Premiere's four sections: switches, knobs and meters
+    let ids = d.ids("fxEditor.dynamics_rack.");
+    for id in [
+        "toggle.gate_on",
+        "toggle.comp_on",
+        "toggle.exp_on",
+        "toggle.lim_on",
+        "param.gate_threshold",
+        "param.gate_hold",
+        "param.comp_ratio",
+        "param.comp_makeup",
+        "param.exp_ratio",
+        "param.lim_release",
+        "value.comp_threshold",
+        "meter.gate",
+        "meter.comp",
+        "meter.exp",
+        "meter.lim",
+        "bypass",
+        "presets",
+        "close",
+    ] {
+        assert!(ids.iter().any(|i| *i == format!("fxEditor.dynamics_rack.{id}")), "{id} missing from {ids:?}");
+    }
     d.click("fxEditor.dynamics_rack.toggle.lim_on");
     assert!(truthy(&d.clip_param(clip, "dynamics_rack", "lim_on")));
+    // a knob turned up and to the right raises the compressor threshold, in one undo step
+    let undo0 = d.undo_len();
+    let t0 = num(&d.clip_param(clip, "dynamics_rack", "comp_threshold"));
+    d.drag("fxEditor.dynamics_rack.param.comp_threshold", 20.0, -40.0, 6);
+    let t1 = num(&d.clip_param(clip, "dynamics_rack", "comp_threshold"));
+    assert!(t1 > t0 + 5.0, "threshold {t0} → {t1}");
+    assert_eq!(d.undo_len(), undo0 + 1);
+    // double-click: back to the default
+    d.ok("ui.click", json!({"id": "fxEditor.dynamics_rack.param.comp_threshold", "count": 2}));
+    d.frames(3);
+    assert_eq!(num(&d.clip_param(clip, "dynamics_rack", "comp_threshold")), -20.0);
     d.snapshot("fx-editor-dynamics");
 }
 
@@ -223,7 +257,9 @@ fn track_fx_editor_from_the_mixer_slot() {
     d.ok("ui.set", json!({"workspace": "Audio"}));
     d.frames(3);
     d.click("mixer.showEffects");
-    d.click("mixer.A1.fx.0");
+    // the slot's right-click menu ▸ Edit…
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.0", "button": "right"}));
+    d.frames(2);
     d.click("mixer.A1.fx.0.edit");
     d.frames(3);
     let ids = d.ids("fxEditor.multiband_compressor.");
@@ -241,4 +277,221 @@ fn track_fx_editor_from_the_mixer_slot() {
     let xo2 = num(&a1["inserts"][0]["params"]["xo2"]);
     assert!(xo2 > 2200.0, "crossover after drag: {xo2} ({a1})");
     d.snapshot("fx-editor-multiband");
+}
+
+impl Driver {
+    /// The effect ids in a strip's rack (`mixer.inspect`).
+    fn rack(&mut self, strip: &str) -> Vec<String> {
+        let m = self.exec("mixer.inspect", json!({}));
+        let s = m["strips"].as_array().unwrap().iter().find(|s| s["ref"] == strip).unwrap().clone();
+        s["inserts"].as_array().unwrap().iter().map(|i| i["effect"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// An insert of a strip as `mixer.inspect` shows it.
+    fn insert(&mut self, strip: &str, slot: usize) -> Value {
+        let m = self.exec("mixer.inspect", json!({}));
+        let s = m["strips"].as_array().unwrap().iter().find(|s| s["ref"] == strip).unwrap().clone();
+        s["inserts"][slot].clone()
+    }
+
+    /// The Audio workspace with the mixer's effect racks open.
+    fn mixer_racks(&mut self) {
+        self.ok("ui.set", json!({"workspace": "Audio"}));
+        self.frames(3);
+        self.click("mixer.showEffects");
+        self.frames(2);
+    }
+
+    /// Drag from one element to another with the control channel (modifiers held throughout).
+    fn drag_to(&mut self, from: &str, to: &str, modifiers: Value) {
+        self.ok("ui.drag", json!({"from": {"id": from}, "to": {"id": to}, "modifiers": modifiers}));
+        self.frames(4);
+    }
+}
+
+/// Premiere's Audio Track Mixer racks: an effect dragged to another slot of its track moves
+/// there, onto another track it moves to that track, with Alt it is copied.
+#[test]
+fn mixer_effects_drag_between_slots_and_tracks() {
+    let mut d = Driver::demo();
+    for fx in ["amplify", "bass", "treble"] {
+        d.exec("mixer.addInsert", json!({"strip": "A1", "effect": fx}));
+    }
+    d.mixer_racks();
+    // reorder: Amplify onto the third slot
+    d.drag_to("mixer.A1.fx.0", "mixer.A1.fx.2", json!({}));
+    assert_eq!(d.rack("A1"), ["bass", "treble", "amplify"]);
+    // move: Treble onto Audio 2's first slot
+    d.drag_to("mixer.A1.fx.1", "mixer.A2.fx.0", json!({}));
+    assert_eq!(d.rack("A1"), ["bass", "amplify"]);
+    assert_eq!(d.rack("A2"), ["treble"]);
+    // Alt-drag: a copy of Bass onto Audio 2's second slot, the original stays
+    d.drag_to("mixer.A1.fx.0", "mixer.A2.fx.1", json!({"alt": true}));
+    assert_eq!(d.rack("A1"), ["bass", "amplify"]);
+    assert_eq!(d.rack("A2"), ["treble", "bass"]);
+    // dropping an effect on a send slot or outside the rack does nothing
+    d.drag_to("mixer.A1.fx.0", "mixer.A1.send.0", json!({}));
+    d.drag_to("mixer.A1.fx.0", "mixer.A1.fader", json!({}));
+    assert_eq!(d.rack("A1"), ["bass", "amplify"]);
+    // each drag is one undo step
+    d.exec("edit.undo", json!({}));
+    assert_eq!(d.rack("A2"), ["treble"]);
+}
+
+/// The slot menus and the knob under the rack: the arrow replaces or empties a filled slot, the
+/// right-click menu bypasses, chooses the knob's parameter and copies / pastes the rack, the knob
+/// turns the parameter (one undo step), its fx button bypasses, a double-click edits.
+#[test]
+fn mixer_rack_menus_and_knob() {
+    let mut d = Driver::demo();
+    d.exec("mixer.addInsert", json!({"strip": "A1", "effect": "hard_limiter"}));
+    d.exec("mixer.addInsert", json!({"strip": "A1", "effect": "bass"}));
+    d.mixer_racks();
+    // clicking the slot selects it: the knob shows its first parameter
+    d.click("mixer.A1.fx.0");
+    let knob = d.ids("mixer.A1.rack.");
+    assert!(knob.iter().any(|i| i == "mixer.A1.rack.knob"), "{knob:?}");
+    let v0 = d.insert("A1", 0)["params"]["max"].as_f64().unwrap();
+    let undo0 = d.undo_len();
+    d.drag("mixer.A1.rack.knob", -30.0, 30.0, 6);
+    let v1 = d.insert("A1", 0)["params"]["max"].as_f64().unwrap();
+    assert!(v1 < v0 - 5.0, "Maximum Amplitude turned down: {v0} → {v1}");
+    assert_eq!(d.undo_len(), undo0 + 1, "one undo step for the turn");
+    // the knob's parameter, from the slot's right-click menu
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.0", "button": "right"}));
+    d.frames(2);
+    d.click("mixer.A1.fx.0.knob.release");
+    let label = d.ok("ui.elements", json!({"prefix": "mixer.A1.rack.knob"}))[0]["label"].clone();
+    assert_eq!(label, "Release Time");
+    // the fx button bypasses the selected effect
+    d.click("mixer.A1.rack.bypass");
+    assert_eq!(d.insert("A1", 0)["enabled"], false);
+    d.click("mixer.A1.rack.bypass");
+    assert_eq!(d.insert("A1", 0)["enabled"], true);
+    // the arrow of a filled slot: another effect replaces it
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.1", "fx": 0.96}));
+    d.frames(2);
+    d.click("mixer.A1.fx.1.folder.Filter and EQ");
+    d.click("mixer.A1.fx.1.treble");
+    assert_eq!(d.rack("A1"), ["hard_limiter", "treble"]);
+    // … or None empties it
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.1", "fx": 0.96}));
+    d.frames(2);
+    d.click("mixer.A1.fx.1.none");
+    assert_eq!(d.rack("A1"), ["hard_limiter"]);
+    // Copy Track Effects on A1, Paste Track Effects on A2
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.0", "button": "right"}));
+    d.frames(2);
+    d.click("mixer.A1.fx.copy");
+    d.ok("ui.click", json!({"id": "mixer.A2.fx.0", "button": "right"}));
+    d.frames(2);
+    d.click("mixer.A2.fx.paste");
+    assert_eq!(d.rack("A2"), ["hard_limiter"]);
+    // double-click: the effect's editor
+    d.ok("ui.click", json!({"id": "mixer.A2.fx.0", "count": 2}));
+    d.frames(3);
+    assert!(d.element("fxEditor.hard_limiter.close").is_some(), "the Hard Limiter editor opened");
+}
+
+/// The Hard Limiter editor as in Premiere: Peak / True Peak, scaled sliders, Link Channels; and
+/// the frame every editor has: bypass, Presets (save, choose, delete), close.
+#[test]
+fn hard_limiter_editor_presets_and_bypass() {
+    let mut d = Driver::demo();
+    d.exec("mixer.addInsert", json!({"strip": "A1", "effect": "hard_limiter"}));
+    d.mixer_racks();
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.0", "count": 2}));
+    d.frames(3);
+    let ids = d.ids("fxEditor.hard_limiter.");
+    for id in [
+        "bypass",
+        "presets",
+        "presets.save",
+        "presets.delete",
+        "choice.detect.0",
+        "choice.detect.1",
+        "param.max",
+        "param.boost",
+        "param.lookahead",
+        "param.release",
+        "value.max",
+        "toggle.link",
+        "meter.lim",
+        "close",
+    ] {
+        assert!(ids.iter().any(|i| *i == format!("fxEditor.hard_limiter.{id}")), "{id} missing from {ids:?}");
+    }
+    // a slider dragged left lowers Maximum Amplitude
+    d.drag("fxEditor.hard_limiter.param.max", -80.0, 0.0, 6);
+    let max = d.insert("A1", 0)["params"]["max"].as_f64().unwrap();
+    assert!(max < -10.0, "Maximum Amplitude {max}");
+    d.click("fxEditor.hard_limiter.choice.detect.1");
+    assert_eq!(d.insert("A1", 0)["params"]["detect"].as_f64(), Some(1.0), "True Peak");
+    d.click("fxEditor.hard_limiter.toggle.link");
+    assert_eq!(d.insert("A1", 0)["params"]["link"], false);
+    // save these settings as a preset
+    d.click("fxEditor.hard_limiter.presets.save");
+    d.frames(2);
+    d.ok("ui.type", json!({"text": "Broadcast"}));
+    d.ok("ui.key", json!({"key": "Enter"}));
+    d.frames(3);
+    let presets = d.exec("presets.list", json!({}))["presets"].as_array().unwrap().clone();
+    assert!(presets.iter().any(|p| p["name"] == "Broadcast" && p["ids"] == json!(["hard_limiter"])), "{presets:?}");
+    let shown = d.ok("ui.elements", json!({"prefix": "fxEditor.hard_limiter.presets"}));
+    assert!(shown.as_array().unwrap().iter().any(|e| e["id"] == "fxEditor.hard_limiter.presets"), "{shown}");
+    // change something, then choose the preset from the menu: the settings come back
+    d.exec("mixer.setInsert", json!({"strip": "A1", "slot": 0, "params": {"max": -3.0}}));
+    d.frames(2);
+    d.click("fxEditor.hard_limiter.presets");
+    d.click("fxEditor.hard_limiter.presets.Broadcast");
+    assert_eq!(d.insert("A1", 0)["params"]["max"].as_f64(), Some(max));
+    // (Default) resets it
+    d.click("fxEditor.hard_limiter.presets");
+    d.click("fxEditor.hard_limiter.presets.(Default)");
+    assert_eq!(d.insert("A1", 0)["params"]["max"].as_f64(), Some(-0.1));
+    assert_eq!(d.insert("A1", 0)["params"]["link"], true);
+    // delete it (chosen first)
+    d.click("fxEditor.hard_limiter.presets");
+    d.click("fxEditor.hard_limiter.presets.Broadcast");
+    d.click("fxEditor.hard_limiter.presets.delete");
+    let presets = d.exec("presets.list", json!({}))["presets"].as_array().unwrap().clone();
+    assert!(!presets.iter().any(|p| p["name"] == "Broadcast"));
+    // the power button bypasses the effect
+    d.click("fxEditor.hard_limiter.bypass");
+    assert_eq!(d.insert("A1", 0)["enabled"], false);
+    d.snapshot("fx-editor-hard-limiter");
+    d.click("fxEditor.hard_limiter.close");
+    assert!(d.ids("fxEditor.hard_limiter.").is_empty());
+}
+
+/// Every audio effect has an editor: a few numbers as scaled sliders, many as sections of knobs,
+/// switches as checkboxes, choices as radio buttons.
+#[test]
+fn any_audio_effect_has_an_editor() {
+    let mut d = Driver::demo();
+    for fx in ["studio_reverb", "surround_reverb", "analog_delay"] {
+        d.exec("mixer.addInsert", json!({"strip": "A1", "effect": fx}));
+    }
+    d.mixer_racks();
+    // Studio Reverb: five sliders
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.0", "count": 2}));
+    d.frames(3);
+    let ids = d.ids("fxEditor.studio_reverb.param.");
+    assert_eq!(ids.len(), 5, "{ids:?}");
+    d.drag("fxEditor.studio_reverb.param.wet", 60.0, 0.0, 5);
+    let wet = d.insert("A1", 0)["params"]["wet"].as_f64().unwrap();
+    assert!(wet > 45.0, "Wet {wet}");
+    d.snapshot("fx-editor-studio-reverb");
+    d.click("fxEditor.studio_reverb.close");
+    // Surround Reverb: eleven numbers, as knobs
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.1", "count": 2}));
+    d.frames(3);
+    let ids = d.ids("fxEditor.surround_reverb.param.");
+    assert_eq!(ids.len(), 11, "{ids:?}");
+    d.click("fxEditor.surround_reverb.close");
+    // Analog Delay: its mode as radio buttons
+    d.ok("ui.click", json!({"id": "mixer.A1.fx.2", "count": 2}));
+    d.frames(3);
+    d.click("fxEditor.analog_delay.choice.mode.2");
+    assert_eq!(d.insert("A1", 2)["params"]["mode"].as_f64(), Some(2.0));
 }

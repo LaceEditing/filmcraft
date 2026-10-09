@@ -269,6 +269,17 @@ pub struct Limiter {
     /// Per-channel delay line (ring), length `look + det_delay + 1`.
     delay: Vec<Vec<f32>>,
     wpos: usize,
+    /// Gain computers: one for all channels when linked, one per channel otherwise.
+    gains: Vec<LimGain>,
+    link: bool,
+    t: u64,
+    gr_meter: f32,
+    /// Deepest gain reduction (dB) since the meters were last read.
+    gr_peak: f32,
+}
+
+/// The gain computer of a [`Limiter`] (all channels when linked, else one per channel).
+struct LimGain {
     /// Monotonic deque for the sliding minimum: (sample index, gain).
     minq: VecDeque<(u64, f32)>,
     /// Box filter ring and running sum.
@@ -276,16 +287,64 @@ pub struct Limiter {
     box_pos: usize,
     box_sum: f64,
     rel_state: f32,
-    t: u64,
-    gr_meter: f32,
+}
+
+impl LimGain {
+    fn new(look: usize) -> Self {
+        LimGain { minq: VecDeque::with_capacity(look + 2), box_ring: vec![1.0; look + 1], box_pos: 0, box_sum: (look + 1) as f64, rel_state: 1.0 }
+    }
+
+    fn reset(&mut self) {
+        self.minq.clear();
+        self.box_ring.iter_mut().for_each(|v| *v = 1.0);
+        self.box_pos = 0;
+        self.box_sum = self.box_ring.len() as f64;
+        self.rel_state = 1.0;
+    }
+
+    /// The gain for sample `t` from the gain it needs (`greq`): the sliding minimum over the
+    /// look-ahead window, released with `rel`, then averaged over the window.
+    fn next(&mut self, t: u64, greq: f32, window: u64, rel: f32) -> f32 {
+        while let Some(&(_, v)) = self.minq.back() {
+            if v >= greq {
+                self.minq.pop_back();
+            } else {
+                break;
+            }
+        }
+        self.minq.push_back((t, greq));
+        while let Some(&(idx, _)) = self.minq.front() {
+            if idx + window <= t {
+                self.minq.pop_front();
+            } else {
+                break;
+            }
+        }
+        let m = self.minq.front().map_or(1.0, |&(_, v)| v);
+        // Release.
+        self.rel_state = if m < self.rel_state { m } else { self.rel_state + (m - self.rel_state) * (1.0 - rel) };
+        // Moving average over look+1 samples.
+        let len = self.box_ring.len().max(1);
+        if let Some(slot) = self.box_ring.get_mut(self.box_pos) {
+            self.box_sum += self.rel_state as f64 - *slot as f64;
+            *slot = self.rel_state;
+        }
+        self.box_pos = (self.box_pos + 1) % len;
+        // Periodically re-sum to cancel floating-point drift.
+        if t.is_multiple_of(65536) {
+            self.box_sum = self.box_ring.iter().map(|&v| v as f64).sum();
+        }
+        (self.box_sum / len as f64) as f32
+    }
 }
 
 impl Limiter {
     pub const PARAMS: &'static [ParamSpec] = &[
-        ParamSpec::new("input_gain", "Input Boost", 0.0, 24.0, 0.0, Unit::Decibels),
-        ParamSpec::new("ceiling", "Ceiling", -24.0, 0.0, -1.0, Unit::Decibels),
+        ParamSpec::new("input_gain", "Input Boost", -100.0, 50.0, 0.0, Unit::Decibels),
+        ParamSpec::new("ceiling", "Ceiling", -100.0, 0.0, -1.0, Unit::Decibels),
         ParamSpec::log("release", "Release", 1.0, 1000.0, 60.0, Unit::Milliseconds),
         ParamSpec::toggle("true_peak", "True Peak", true),
+        ParamSpec::toggle("link", "Link Channels", true),
     ];
     /// Fixed look-ahead time.
     pub const LOOKAHEAD_MS: f32 = 5.0;
@@ -309,13 +368,11 @@ impl Limiter {
             interp: vec![Interpolator::default(); channels],
             delay: vec![vec![0.0; dlen]; channels],
             wpos: 0,
-            minq: VecDeque::with_capacity(look + 2),
-            box_ring: vec![1.0; look + 1],
-            box_pos: 0,
-            box_sum: (look + 1) as f64,
-            rel_state: 1.0,
+            gains: (0..channels).map(|_| LimGain::new(look)).collect(),
+            link: true,
             t: 0,
             gr_meter: 0.0,
+            gr_peak: 0.0,
         };
         s.apply_params(true);
         s
@@ -326,6 +383,12 @@ impl Limiter {
         self.ceiling = db_to_gain(self.pv.v("ceiling"));
         self.rel = coef(self.pv.v("release"), self.sr);
         self.true_peak = self.pv.on("true_peak");
+        let link = self.pv.on("link");
+        if link != self.link {
+            // the gain computers start over from unity (no stale reduction carried across)
+            self.gains.iter_mut().for_each(LimGain::reset);
+            self.link = link;
+        }
         if snap {
             self.in_gain.snap();
         }
@@ -347,67 +410,61 @@ impl AudioEffect for Limiter {
         self.interp.iter_mut().for_each(Interpolator::reset);
         self.delay.iter_mut().for_each(|d| d.iter_mut().for_each(|v| *v = 0.0));
         self.wpos = 0;
-        self.minq.clear();
-        self.box_ring.iter_mut().for_each(|v| *v = 1.0);
-        self.box_pos = 0;
-        self.box_sum = self.box_ring.len() as f64;
-        self.rel_state = 1.0;
+        self.gains.iter_mut().for_each(LimGain::reset);
         self.t = 0;
         self.gr_meter = 0.0;
+        self.gr_peak = 0.0;
+    }
+    fn meters(&mut self) -> Option<[f32; 4]> {
+        let m = [self.gr_peak, 0.0, 0.0, 0.0];
+        self.gr_peak = 0.0;
+        Some(m)
     }
     fn process(&mut self, channels: &mut [&mut [f32]]) {
         let n = block_len(channels);
         let nch = channels.len().min(self.delay.len());
         let dlen = self.delay[0].len();
         let window = (self.look + 1) as u64;
+        // per-channel required gain and output gain (index 0 is all channels when linked)
+        let mut greq = [1.0f32; 8];
+        let mut gout = [1.0f32; 8];
+        let nch = nch.min(greq.len());
         for i in 0..n {
             let g_in = self.in_gain.tick();
             let det_pos = (self.wpos + dlen - self.det_delay) % dlen;
             let out_pos = (self.wpos + 1) % dlen; // oldest = look + det_delay samples ago
-            let mut det = 0.0f32;
+            let mut det_all = 0.0f32;
             for ch in 0..nch {
                 let x = channels[ch][i] * g_in;
                 self.delay[ch][self.wpos] = x;
                 let aligned = self.delay[ch][det_pos].abs();
                 let tp = if self.true_peak { self.interp[ch].push_peak(&self.bank, x) } else { 0.0 };
-                det = det.max(aligned.max(tp));
+                let det = aligned.max(tp);
+                greq[ch] = if det > self.ceiling { self.ceiling / det } else { 1.0 };
+                det_all = det_all.max(det);
             }
-            let greq = if det > self.ceiling { self.ceiling / det } else { 1.0 };
-            // Sliding minimum over the last `window` values.
-            while let Some(&(_, v)) = self.minq.back() {
-                if v >= greq {
-                    self.minq.pop_back();
-                } else {
-                    break;
+            let (t, rel) = (self.t, self.rel);
+            let mut deepest = 1.0f32;
+            if self.link || nch <= 1 {
+                let need = if det_all > self.ceiling { self.ceiling / det_all } else { 1.0 };
+                let g = self.gains.first_mut().map_or(1.0, |c| c.next(t, need, window, rel));
+                gout[..nch].iter_mut().for_each(|v| *v = g);
+                deepest = g;
+            } else {
+                for ch in 0..nch {
+                    let g = self.gains.get_mut(ch).map_or(1.0, |c| c.next(t, greq[ch], window, rel));
+                    gout[ch] = g;
+                    deepest = deepest.min(g);
                 }
             }
-            self.minq.push_back((self.t, greq));
-            while let Some(&(idx, _)) = self.minq.front() {
-                if idx + window <= self.t {
-                    self.minq.pop_front();
-                } else {
-                    break;
-                }
-            }
-            let m = self.minq.front().map_or(1.0, |&(_, v)| v);
-            // Release.
-            self.rel_state = if m < self.rel_state { m } else { self.rel_state + (m - self.rel_state) * (1.0 - self.rel) };
-            // Moving average over look+1 samples.
-            self.box_sum += self.rel_state as f64 - self.box_ring[self.box_pos] as f64;
-            self.box_ring[self.box_pos] = self.rel_state;
-            self.box_pos = (self.box_pos + 1) % self.box_ring.len();
-            let g = (self.box_sum / self.box_ring.len() as f64) as f32;
             for ch in 0..nch {
-                let y = self.delay[ch][out_pos] * g;
+                let y = self.delay[ch][out_pos] * gout[ch];
                 channels[ch][i] = y.clamp(-self.ceiling, self.ceiling);
             }
             self.wpos = (self.wpos + 1) % dlen;
             self.t += 1;
-            // Periodically re-sum to cancel floating-point drift.
-            if self.t.is_multiple_of(65536) {
-                self.box_sum = self.box_ring.iter().map(|&v| v as f64).sum();
-            }
-            self.gr_meter = lin_to_db(g);
+            self.gr_meter = lin_to_db(deepest);
+            self.gr_peak = self.gr_peak.min(self.gr_meter);
         }
     }
 }
@@ -531,6 +588,34 @@ mod tests {
                 assert!(m.true_peak_dbtp() < -1.0 + 0.6, "TP {}", m.true_peak_dbtp());
             }
         }
+    }
+
+    /// Link Channels off: a loud left channel is limited on its own and leaves a quiet right
+    /// channel alone; linked, both get the same reduction. The meters report the deepest
+    /// reduction since they were last read.
+    #[test]
+    fn limiter_links_channels_or_not_and_meters_its_reduction() {
+        let n = 4800;
+        let loud = sine(1000.0, 0.9, SR as f64, n, 0.0);
+        let quiet = sine(1000.0, 0.1, SR as f64, n, 0.0);
+        let run = |link: f32| {
+            let mut lim = Limiter::new(SR, 2);
+            lim.set_param("ceiling", -12.0);
+            lim.set_param("link", link);
+            let (mut l, mut r) = (loud.clone(), quiet.clone());
+            lim.process(&mut [&mut l, &mut r]);
+            let m = lim.meters().map(|m| m[0]);
+            let tail = |v: &[f32]| v[n / 2..].iter().fold(0f32, |a, x| a.max(x.abs()));
+            (tail(&l), tail(&r), m, lim.meters().map(|m| m[0]))
+        };
+        let ceiling = db_to_gain(-12.0);
+        let (l, r, m, again) = run(1.0);
+        assert!(l <= ceiling + 1e-6 && r < 0.1 * 0.35, "linked: both reduced ({l}, {r})");
+        assert!(m.is_some_and(|m| m < -9.0), "meter shows ~ -17 dB: {m:?}");
+        assert_eq!(again, Some(0.0), "reading the meter resets it");
+        let (l, r, _, _) = run(0.0);
+        assert!(l <= ceiling + 1e-6, "unlinked: the loud channel is still limited ({l})");
+        assert!((r - 0.1).abs() < 0.005, "and the quiet one is untouched ({r})");
     }
 
     #[test]

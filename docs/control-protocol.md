@@ -78,12 +78,20 @@ Audio mixing: `mixer.*` commands (strips `"A1"`, `"S1"`, `"Mix"` or ids; lanes `
 solo, record arm, solo safe, mode Off/Read/Latch/Touch/Write, output, input map, channels),
 `mixer.setValue`, `mixer.touch` / `mixer.release` (a fader gesture; recorded during an automation pass),
 `mixer.recordStart` / `mixer.recordStop` (playback runs them), `mixer.addSubmix`, `mixer.deleteSubmix`,
-`mixer.addInsert` / `removeInsert` / `setInsert`, `mixer.addSend` / `setSend` / `removeSend`,
+`mixer.addInsert` / `removeInsert` / `setInsert` / `replaceInsert {effect | "none"}` /
+`moveInsert {to?, toSlot?, copy?}` (a rack drag; Alt-drag copies), `mixer.copyInserts` /
+`pasteInserts` (Copy / Paste Track Effects: the rack replaces the target's),
+`mixer.addSend` / `setSend` / `removeSend`,
 `mixer.setKeyframe` / `deleteKeyframe` / `moveKeyframe` / `clearLane`, `mixer.writeAutomation`;
 `clipMixer.set`; `clip.audioGain {clips?, mode: set|adjust|normalizeMax|normalizeAll, db}`, `clip.audioPeak`;
 `effects.setDefaultTransition`. UI ids: `mixer.<A1|S1|Mix>.<fader|value|pan|panValue|mode|mute|solo|
-record|soloSafe|output|input|fx.<n>|send.<n>|meter|name>` (popup entries below them, e.g.
-`mixer.A1.mode.Touch`, `mixer.A1.fx.0.studio_reverb`), `mixer.showEffects`, `mixer.transport.<cmd>`,
+record|soloSafe|output|input|fx.<n>|send.<n>|rack.knob|rack.value|rack.bypass|meter|name>` (popup
+entries below them, e.g. `mixer.A1.mode.Touch`, `mixer.A1.fx.0.studio_reverb`, the slot's right-click
+menu `mixer.A1.fx.0.<edit|bypass|postFader|knob.<param>|remove>`, `mixer.A1.fx.<copy|paste>`),
+`mixer.showEffects`, `mixer.transport.<cmd>`, the Fx Editor windows' `fxEditor.<effect>.<param|value|
+toggle|choice|meter>.<id>`, `fxEditor.<effect>.<bypass|presets|presets.<name>|presets.save|presets.delete|close>`
+(effect settings presets: `presets.saveSettings` / `presets.applySettings {preset | "(Default)"}` on
+`{strip, slot}` or `{clip, index}`),
 `clipMixer.A1.<fader|pan|mute|solo|keyframe|value>`, `timeline.track.A1.keyframes[.<lane>|.clip]`,
 `timeline.track.A1.lane[.kf.<n>]`, `audioGain.<set|adjust|normalizeMax|normalizeAll|ok|cancel|peak>`.
 

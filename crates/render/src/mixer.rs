@@ -79,6 +79,8 @@ pub struct LiveMix {
     overrides: Mutex<HashMap<(TrackId, String), Override>>,
     active: AtomicBool,
     meters: Mutex<HashMap<TrackId, Vec<f32>>>,
+    /// Gain-reduction meters of track effects ((strip, slot) → up to four stages, dB ≤ 0).
+    fx_meters: Mutex<HashMap<(TrackId, usize), [f32; 4]>>,
     /// Peak levels of the recording input (voice-over), per input channel.
     input_meter: Mutex<Vec<f32>>,
     project: Mutex<Option<Arc<Project>>>,
@@ -131,6 +133,20 @@ impl LiveMix {
     /// since the last call; [`MASTER`] is the Mix.
     pub fn take_meters(&self) -> HashMap<TrackId, Vec<f32>> {
         std::mem::take(&mut *lock(&self.meters))
+    }
+    /// The deepest gain reduction of each metered track effect (Dynamics, Hard Limiter) since
+    /// the last call: (strip, slot) → stages (see `AudioEffect::meters`).
+    pub fn take_fx_meters(&self) -> HashMap<(TrackId, usize), [f32; 4]> {
+        std::mem::take(&mut *lock(&self.fx_meters))
+    }
+    fn post_fx_meters(&self, m: &[(TrackId, usize, [f32; 4])]) {
+        let mut g = lock(&self.fx_meters);
+        for (id, slot, v) in m {
+            let e = g.entry((*id, *slot)).or_insert([0.0; 4]);
+            for (a, b) in e.iter_mut().zip(v) {
+                *a = a.min(*b);
+            }
+        }
     }
     fn post_meters(&self, m: &[(TrackId, Vec<f32>)]) {
         let mut g = lock(&self.meters);
@@ -630,7 +646,7 @@ fn convert_width(buf: &Bus, layout: Layout, to: usize) -> Bus {
 
 /// Run `chain` over `buf` (input-time samples from `x0`) with parameters at content time
 /// `x - lat` updated on the absolute [`PARAM_BLOCK`] grid.
-fn run_inserts(chain: &mut [Box<dyn AudioEffect>], ins: &[Insert], buf: &mut Bus, x0: i64, lat: usize, sr: u32) {
+fn run_inserts(chain: &mut [Box<dyn AudioEffect>], ins: &[Insert], buf: &mut Bus, x0: i64, lat: usize, sr: u32, meters: &mut Vec<(usize, [f32; 4])>) {
     if chain.is_empty() {
         return;
     }
@@ -649,6 +665,11 @@ fn run_inserts(chain: &mut [Box<dyn AudioEffect>], ins: &[Insert], buf: &mut Bus
             d.process(&mut ch);
         }
         i = end;
+    }
+    for (d, e) in chain.iter_mut().zip(ins) {
+        if let Some(m) = d.meters() {
+            meters.push((e.slot, m));
+        }
     }
 }
 
@@ -697,6 +718,8 @@ struct StripOut {
     /// (route index in the plan, delayed signal at the target's width)
     routes: Vec<(usize, Bus)>,
     meter: Vec<f32>,
+    /// Gain-reduction meters of the strip's effects: (slot, stages).
+    fx: Vec<(usize, [f32; 4])>,
     /// Final signal (Mix only).
     out: Option<Bus>,
 }
@@ -764,7 +787,8 @@ fn run_strip(plan: &Plan, si: usize, st: &mut StripState, mut buf: Bus, x0: i64,
         }
     }
     let lat_a = st.in_lat;
-    run_inserts(&mut st.pre, &s.pre, &mut buf, x0, lat_a, sr);
+    let mut fx = Vec::new();
+    run_inserts(&mut st.pre, &s.pre, &mut buf, x0, lat_a, sr, &mut fx);
     let lat_b = st.in_lat + st.lat_pre;
     let c_b = x0 - lat_b as i64;
     let send = |tap: Tap, buf: &Bus, c0: i64, scratch: &mut [f32], st: &mut StripState, outs: &mut Vec<(usize, Bus)>| {
@@ -805,12 +829,12 @@ fn run_strip(plan: &Plan, si: usize, st: &mut StripState, mut buf: Bus, x0: i64,
     let g = vol.fill(c_b, sr, &mut scratch, db_gain);
     apply_gain(&mut buf, g, &scratch);
     let meter: Vec<f32> = buf.iter().map(|c| c[skip.min(n)..].iter().fold(0f32, |a, x| a.max(x.abs()))).collect();
-    run_inserts(&mut st.post, &s.post, &mut buf, x0, lat_b, sr);
+    run_inserts(&mut st.post, &s.post, &mut buf, x0, lat_b, sr, &mut fx);
     let lat_c = lat_b + st.lat_post;
     let c_c = x0 - lat_c as i64;
     send(Tap::Post, &buf, c_c, &mut scratch, st, &mut outs);
     if s.kind == Kind::Master {
-        return StripOut { routes: outs, meter, out: Some(buf) };
+        return StripOut { routes: outs, meter, fx, out: Some(buf) };
     }
     let out_w = my_routes.iter().find(|(_, r)| r.tap == Tap::Out).map(|(_, r)| plan.strips[r.target].width).unwrap_or(2);
     if out_w == 6 {
@@ -823,7 +847,7 @@ fn run_strip(plan: &Plan, si: usize, st: &mut StripState, mut buf: Bus, x0: i64,
         apply_pan(&mut buf, &pan, c_c, sr, if mono { pan_law_mono } else { balance }, &mut scratch);
     }
     send(Tap::Out, &buf, c_c, &mut scratch, st, &mut outs);
-    StripOut { routes: outs, meter, out: None }
+    StripOut { routes: outs, meter, fx, out: None }
 }
 
 /// Mix `frames` samples of the sequence starting at sample `start` through the mixer graph, at the
@@ -893,22 +917,26 @@ pub(crate) fn mix_graph_at(
             Some(run_strip(&plan, si, ss, input, x0, skip, sr, &ovs))
         })
         .collect();
-    let deliver = |o: StripOut, si: usize, bus: &mut Vec<Option<Bus>>, meters: &mut Vec<(TrackId, Vec<f32>)>| {
-        meters.push((plan.strips[si].track.id, o.meter));
-        for (ri, sig) in o.routes {
-            let t = plan.routes[ri].target;
-            let b = bus[t].get_or_insert_with(|| silent(plan.strips[t].width, total));
-            for (bc, sc) in b.iter_mut().zip(&sig) {
-                for (d, s) in bc.iter_mut().zip(sc) {
-                    *d += *s;
+    let mut fx_meters: Vec<(TrackId, usize, [f32; 4])> = Vec::new();
+    let deliver =
+        |o: StripOut, si: usize, bus: &mut Vec<Option<Bus>>, meters: &mut Vec<(TrackId, Vec<f32>)>, fx_meters: &mut Vec<(TrackId, usize, [f32; 4])>| {
+            let id = plan.strips[si].track.id;
+            meters.push((id, o.meter));
+            fx_meters.extend(o.fx.iter().map(|(slot, m)| (id, *slot, *m)));
+            for (ri, sig) in o.routes {
+                let t = plan.routes[ri].target;
+                let b = bus[t].get_or_insert_with(|| silent(plan.strips[t].width, total));
+                for (bc, sc) in b.iter_mut().zip(&sig) {
+                    for (d, s) in bc.iter_mut().zip(sc) {
+                        *d += *s;
+                    }
                 }
             }
-        }
-        o.out
-    };
+            o.out
+        };
     for (si, o) in track_outs.into_iter().enumerate() {
         if let Some(o) = o {
-            deliver(o, si, &mut bus, &mut meters);
+            deliver(o, si, &mut bus, &mut meters, &mut fx_meters);
         }
     }
     // submixes in order, then the Mix
@@ -922,7 +950,7 @@ pub(crate) fn mix_graph_at(
         }
         let input = bus[si].take().unwrap_or_else(|| silent(s.width, total));
         let o = run_strip(&plan, si, ss, input, x0, skip, sr, &ovs);
-        if let Some(fin) = deliver(o, si, &mut bus, &mut meters) {
+        if let Some(fin) = deliver(o, si, &mut bus, &mut meters, &mut fx_meters) {
             out = fin;
         }
     }
@@ -940,6 +968,7 @@ pub(crate) fn mix_graph_at(
     }
     if let Some(l) = live {
         l.post_meters(&meters);
+        l.post_fx_meters(&fx_meters);
     }
     AudioBuffer { sample_rate: sr, channels: out.into_iter().map(|c| c[skip..].to_vec()).collect() }
 }

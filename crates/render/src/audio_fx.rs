@@ -47,8 +47,11 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
             preroll: |e, t| (f(e, "release", t) as f64 / 1000.0 * 5.0).clamp(0.05, 2.0),
             apply: |d, e, t| {
                 d.set_param("ceiling", f(e, "max", t));
-                d.set_param("input_gain", f(e, "boost", t).max(0.0));
+                d.set_param("input_gain", f(e, "boost", t));
                 d.set_param("release", f(e, "release", t));
+                // Detection: Peak (0) or True Peak (1); Link Channels on unless switched off
+                d.set_param("true_peak", if f(e, "detect", t) >= 0.5 { 1.0 } else { 0.0 });
+                d.set_param("link", if e.param("link").is_some_and(|p| matches!(p.value, filmcraft_project::ParamValue::Bool(false))) { 0.0 } else { 1.0 });
             },
         },
         "delay" => Mapping {

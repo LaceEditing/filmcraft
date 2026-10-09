@@ -244,10 +244,12 @@ pub(super) fn defs() -> Vec<EffectDef> {
             "Hard Limiter",
             A_AMP,
             vec![
-                db("max", "Maximum Amplitude", -0.1, -30.0, 0.0),
-                db("boost", "Input Boost", 0.0, -30.0, 30.0),
+                ch("detect", "Detection", &["Peak", "True Peak"], 0),
+                db("max", "Maximum Amplitude", -0.1, -100.0, 0.0),
+                db("boost", "Input Boost", 0.0, -100.0, 50.0),
                 db_ms_lookahead(),
-                fs("release", "Release Time", 100.0, (1.0, 1000.0), (1.0, 1000.0), "ms", 0),
+                fs("release", "Release Time", 100.0, (1.0, 1000.0), (40.0, 200.0), "ms", 0),
+                b("link", "Link Channels", true),
             ],
         ),
         audio("multiband_compressor", "Multiband Compressor", A_AMP, multiband()),
@@ -564,7 +566,7 @@ pub(super) fn defs() -> Vec<EffectDef> {
 }
 
 fn db_ms_lookahead() -> ParamDef {
-    fs("lookahead", "Look-Ahead Time", 7.0, (0.0, 30.0), (0.0, 30.0), "ms", 1)
+    fs("lookahead", "Look-Ahead Time", 7.0, (0.0, 30.0), (5.0, 20.0), "ms", 1)
 }
 
 /// Mute is keyframed to silence passages, so it is animatable (unlike most toggles).
