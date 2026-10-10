@@ -1127,3 +1127,81 @@ mod pipeline {
         assert!(e.px.iter().all(|v| v.is_finite()));
     }
 }
+
+/// Ultra Key against Premiere Pro: colours (display R′G′B′, 8-bit) and the alpha Premiere's own
+/// renders gave them, at the settings most of the user's keyed clips use (Custom: Transparency
+/// 46, Highlight 0, Shadow 58, Tolerance 99, Pedestal 100, Contrast 100, Mid Point 100, key colour
+/// 41/113/4). Measured on preview renders matched to their source frames (each value the mean of
+/// 117–7137 pixels of that colour, spread ≤ 0.03).
+#[test]
+fn ultra_key_matches_premiere_renders() {
+    let measured: [([f32; 3], f32); 9] = [
+        ([27.4, 71.9, 21.8], 0.000),
+        ([26.9, 69.0, 19.5], 0.069),
+        ([26.4, 65.9, 19.3], 0.204),
+        ([22.9, 61.6, 24.2], 0.437),
+        ([21.7, 60.4, 23.1], 0.474),
+        ([74.8, 77.6, 34.9], 0.602),
+        ([72.0, 72.2, 32.3], 0.750),
+        ([44.6, 46.5, 13.0], 0.943),
+        ([18.4, 15.2, 12.6], 1.000),
+    ];
+    let mut img = Image::filled(measured.len(), 1, [0.0; 4]);
+    for (i, (rgb, _)) in measured.iter().enumerate() {
+        let l = dec(rgb.map(|v| v / 255.0));
+        img.px[i * 4..i * 4 + 4].copy_from_slice(&[l[0], l[1], l[2], 1.0]);
+    }
+    let mut e = inst("ultra_key");
+    set(&mut e, "key_color", ParamValue::Color([41.0 / 255.0, 113.0 / 255.0, 4.0 / 255.0, 1.0]));
+    set(&mut e, "setting", ParamValue::Choice(3));
+    for (p, v) in
+        [("transparency", 46.0), ("highlight", 0.0), ("shadow", 58.0), ("tolerance", 99.0), ("pedestal", 100.0), ("contrast", 100.0), ("mid_point", 100.0)]
+    {
+        setf(&mut e, p, v);
+    }
+    let o = run("ultra_key", &e, &img, &cx());
+    for (i, (rgb, want)) in measured.iter().enumerate() {
+        let got = o.get(i, 0)[3];
+        assert!((got - want).abs() < 0.05, "{rgb:?}: Premiere {want}, FilmCraft {got}");
+    }
+
+    // spill: a green-tinted opaque pixel loses its excess green but keeps its brightness (Premiere
+    // lifts red and blue rather than darkening green)
+    let tint = [0.45f32, 0.52, 0.40];
+    let mut img = Image::filled(1, 1, [0.0; 4]);
+    let l = dec(tint);
+    img.px.copy_from_slice(&[l[0], l[1], l[2], 1.0]);
+    let mut e = inst("ultra_key");
+    set(&mut e, "key_color", ParamValue::Color([41.0 / 255.0, 113.0 / 255.0, 4.0 / 255.0, 1.0]));
+    setf(&mut e, "transparency", 0.0);
+    setf(&mut e, "tolerance", 0.0);
+    let o = run("ultra_key", &e, &img, &cx());
+    let p = o.get(0, 0);
+    let out = enc([p[0] / p[3], p[1] / p[3], p[2] / p[3]]);
+    assert!(out[1] - out[0].max(out[2]) < 0.005, "green excess removed: {out:?}");
+    assert!(out[0] > tint[0] + 0.03 && out[2] > tint[2] + 0.03, "red and blue lifted: {out:?}");
+    assert!((luma(out) - luma(tint)).abs() < 0.015, "brightness kept: {out:?}");
+}
+
+#[test]
+fn ultra_key_choke_erodes_and_soften_blurs_up_to_nine_pixels() {
+    // left half green screen, right half grey: a hard matte edge at x = 16
+    let mut img = solid(32, 1, [0.0, 0.8, 0.2]);
+    let grey = dec([0.5, 0.45, 0.42]);
+    for x in 16..32 {
+        img.px[x * 4..x * 4 + 4].copy_from_slice(&[grey[0], grey[1], grey[2], 1.0]);
+    }
+    let plain = run("ultra_key", &inst("ultra_key"), &img, &cx());
+    assert!(plain.get(15, 0)[3] < 0.05 && plain.get(16, 0)[3] > 0.95);
+    // Choke 100: a 9 × 9 erode moves the edge 4 pixels into the foreground
+    let mut e = inst("ultra_key");
+    setf(&mut e, "choke", 100.0);
+    let o = run("ultra_key", &e, &img, &cx());
+    assert!(o.get(19, 0)[3] < 0.05 && o.get(20, 0)[3] > 0.95, "{:?}", (16..22).map(|x| o.get(x, 0)[3]).collect::<Vec<_>>());
+    // Soften 100: a 9 × 9 box blur ramps the edge over 9 pixels
+    let mut e = inst("ultra_key");
+    setf(&mut e, "soften", 100.0);
+    let o = run("ultra_key", &e, &img, &cx());
+    assert!(o.get(11, 0)[3] < 0.05 && o.get(20, 0)[3] > 0.95);
+    assert!((o.get(15, 0)[3] - 4.0 / 9.0).abs() < 0.06 && (o.get(16, 0)[3] - 5.0 / 9.0).abs() < 0.06);
+}

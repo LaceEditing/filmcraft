@@ -851,3 +851,27 @@ fn a_cyclic_subclip_chain_has_no_media_duration() {
     *parent = sub;
     assert_eq!(crate::media_duration(&s.project, &s.media, sub), None);
 }
+
+/// Ultra Key in Effect Controls, as in Premiere: changing a Matte Generation value makes the
+/// Setting Custom; choosing Default puts the Matte Generation values back to the defaults.
+#[test]
+fn ultra_key_setting_follows_matte_generation() {
+    let mut s = demo();
+    let c = v1(&s)[0].id.0;
+    s.execute("effects.apply", json!({"clips": [c], "effect": "ultra_key"})).unwrap();
+    let idx = clip(&s, c).effects.iter().position(|e| e.effect == "ultra_key").unwrap();
+    let get = |s: &Session, p: &str| clip(s, c).effects[idx].param(p).map(|x| x.value.clone()).unwrap();
+    assert_eq!(get(&s, "setting"), filmcraft_project::ParamValue::Choice(0));
+    s.execute("effects.setParam", json!({"clip": c, "effect": idx, "param": "tolerance", "value": 99.0})).unwrap();
+    assert_eq!(get(&s, "setting"), filmcraft_project::ParamValue::Choice(3), "Custom");
+    s.execute("effects.setParam", json!({"clip": c, "effect": idx, "param": "pedestal", "value": 100.0})).unwrap();
+    s.execute("effects.setParam", json!({"clip": c, "effect": idx, "param": "setting", "value": 0})).unwrap();
+    assert_eq!((get(&s, "tolerance"), get(&s, "pedestal")), (filmcraft_project::ParamValue::Float(50.0), filmcraft_project::ParamValue::Float(10.0)));
+    // other controls leave the Setting alone
+    s.execute("effects.setParam", json!({"clip": c, "effect": idx, "param": "choke", "value": 20.0})).unwrap();
+    assert_eq!(get(&s, "setting"), filmcraft_project::ParamValue::Choice(0));
+    // one undo step each
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(get(&s, "setting"), filmcraft_project::ParamValue::Choice(3));
+}

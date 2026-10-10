@@ -258,32 +258,53 @@ pub fn logo_cutout(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     });
 }
 
-/// Ultra Key: a colour-difference keyer working in Y′CbCr against the key colour's chroma, with
-/// Premiere's matte generation, cleanup, spill suppression and colour correction stages.
+/// Ultra Key, calibrated against renders Premiere Pro made of the same frames (preview files of
+/// a keyed clip, matched to its source frames; see `crates/render/README.md`). Observed: the matte
+/// is a per-pixel function of the colour (no spatial filtering unless Choke / Soften are set) of
+/// the green excess over the other two channels, `key channel − max(others)` (in display-encoded
+/// R′G′B′, normalised by the key colour's own excess), opaque up to a point set by Tolerance and
+/// then falling linearly with a slope set by Transparency and weighted by brightness relative to
+/// the key colour (Shadow keeps darker pixels opaque, Highlight brighter ones). Pedestal cuts the
+/// faint end, Contrast steepens around Mid Point. Spill suppression takes the excess (plus a margin
+/// set by Range) off the key channel, scaled by Spill, and adds the lost brightness back to all
+/// three channels (Luma), so a despilled edge keeps its brightness instead of going dark;
+/// Desaturate greys nearly transparent pixels. The constants reproduce Premiere's matte to about
+/// 2/255 on average (13/255 on edge pixels) and its foreground colour to 2/255 at the settings
+/// observed; how other settings scale follows Adobe's descriptions of the controls.
 pub fn ultra_key(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     let kc = cv(e, "key_color", cx);
-    let k = rgb_to_ycbcr(kc[0], kc[1], kc[2], Matrix::Bt709);
-    let kmag2 = (k[1] * k[1] + k[2] * k[2]).max(1e-6);
-    let setting = chv(e, "setting");
-    let (g_mul, ped_mul) = match setting {
-        1 => (0.85, 0.7),
-        2 => (1.2, 1.5),
-        _ => (1.0, 1.0),
-    };
-    let transparency = fv(e, "transparency", cx) / 100.0;
-    let highlight = fv(e, "highlight", cx) / 100.0;
-    let shadow = fv(e, "shadow", cx) / 100.0;
-    let tol = 0.08 + fv(e, "tolerance", cx) / 100.0 * 0.5;
-    let pedestal = (fv(e, "pedestal", cx) / 100.0 * 0.3 * ped_mul).min(0.9);
-    let gain = (1.0 + 2.0 * transparency) * g_mul;
-    let output = chv(e, "output");
-    let dom = if kc[1] >= kc[0] && kc[1] >= kc[2] {
+    let key = [kc[0].clamp(0.0, 1.0), kc[1].clamp(0.0, 1.0), kc[2].clamp(0.0, 1.0)];
+    // the key's dominant channel is the one keyed (green for a green screen)
+    let dom = if key[1] >= key[0] && key[1] >= key[2] {
         1
-    } else if kc[2] >= kc[0] {
+    } else if key[2] >= key[0] {
         2
     } else {
         0
     };
+    let (o1, o2) = ((dom + 1) % 3, (dom + 2) % 3);
+    let excess = |v: [f32; 3]| v[dom] - v[o1].max(v[o2]);
+    // a key without a dominant channel (grey) keys nothing meaningful: keep the division sane
+    let kd = excess(key).max(0.02);
+    let yk = luma(key).clamp(0.02, 1.0);
+    let setting = chv(e, "setting");
+    // Relaxed / Aggressive narrow / widen what is keyed; Default and Custom use the values as set
+    let (slope_mul, ped_mul) = match setting {
+        1 => (0.85, 0.7),
+        2 => (1.2, 1.5),
+        _ => (1.0, 1.0),
+    };
+    let pct = |id: &str| (fv(e, id, cx) / 100.0).clamp(0.0, 1.0);
+    let transparency = pct("transparency");
+    let highlight = pct("highlight");
+    let shadow = pct("shadow");
+    let tolerance = pct("tolerance");
+    let pedestal = (pct("pedestal") * 0.25 * ped_mul).min(0.9);
+    let slope = 0.5876 / (1.0 - 0.99 * transparency) * slope_mul;
+    let x0 = -0.093 * tolerance;
+    let dark_pow = 5.24 * shadow;
+    let bright_pow = 0.2975 + 3.0 * highlight;
+    let output = chv(e, "output");
     // matte
     let n = img.w * img.h;
     let mut alpha = vec![1.0f32; n];
@@ -293,54 +314,49 @@ pub fn ultra_key(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
             return;
         }
         let v = enc(Image::unpremul([p[0], p[1], p[2], p[3]]));
-        let y = rgb_to_ycbcr(v[0], v[1], v[2], Matrix::Bt709);
-        let proj = (y[1] * k[1] + y[2] * k[2]) / kmag2;
-        let perp = ((y[1] - proj * k[1]).powi(2) + (y[2] - proj * k[2]).powi(2)).sqrt() / kmag2.sqrt();
-        let keyness = proj.clamp(0.0, 1.5) * (1.0 - smoothstep(0.0, tol, perp));
-        let mut m = (1.0 - keyness * gain).clamp(0.0, 1.0);
-        m += (y[0] - k[0]).max(0.0) * highlight * 2.0 * keyness.min(1.0);
-        m += (k[0] - y[0]).max(0.0) * shadow * 2.0 * keyness.min(1.0);
-        *a = ((m.clamp(0.0, 1.0) - pedestal) / (1.0 - pedestal)).clamp(0.0, 1.0);
+        let xn = excess(v) / kd;
+        let y = luma(v);
+        let w = if y < yk { (y.max(0.0) / yk).powf(dark_pow) } else { (yk / y).powf(bright_pow) };
+        let raw = (1.0 - slope * w * (xn - x0 * w.powf(0.2427))).clamp(0.0, 1.0);
+        *a = ((raw - pedestal) / (1.0 - pedestal)).clamp(0.0, 1.0);
     });
-    // cleanup
-    let choke = fv(e, "choke", cx) / 100.0;
-    let soften = fv(e, "soften", cx) / 100.0;
-    let contrast = fv(e, "contrast", cx) / 100.0;
-    let mid = fv(e, "mid_point", cx) / 100.0;
+    // cleanup (Premiere: Choke is an erode and Soften a box blur, both up to 9 × 9 at 100)
+    let choke = pct("choke");
+    let soften = pct("soften");
+    let contrast = pct("contrast");
+    let mid = pct("mid_point");
     if choke > 0.0 {
-        let r = (choke * 4.0 * cx.px_scale).max(0.5);
-        let b = blur_plane(&alpha, img.w, img.h, r);
-        let c = choke * 0.5;
-        alpha.par_iter_mut().zip(b.par_iter()).for_each(|(a, &bb)| *a = a.min(((bb - c) / (1.0 - c)).clamp(0.0, 1.0)));
+        alpha = erode_plane(&alpha, img.w, img.h, choke * 4.0 * cx.px_scale);
     }
     if soften > 0.0 {
-        alpha = blur_plane(&alpha, img.w, img.h, soften * 10.0 * cx.px_scale);
+        alpha = box_plane(&alpha, img.w, img.h, soften * 4.0 * cx.px_scale);
     }
     if contrast > 0.0 {
-        let g = 1.0 + contrast * 4.0;
+        let g = 1.0 + 3.0 * contrast;
         alpha.par_iter_mut().for_each(|a| *a = ((*a - mid) * g + mid).clamp(0.0, 1.0));
     }
     // spill suppression + colour correction on the foreground
-    let spill = fv(e, "spill", cx) / 100.0;
-    let desat = fv(e, "desaturate", cx) / 100.0;
-    let range = fv(e, "range", cx) / 100.0;
-    let sluma = fv(e, "spill_luma", cx) / 100.0;
+    let spill = fv(e, "spill", cx).max(0.0) / 50.0;
+    let range = pct("range");
+    let luma_back = fv(e, "spill_luma", cx).max(0.0) / 50.0;
+    let desat = pct("desaturate");
+    let weights = [0.2126f32, 0.7152, 0.0722];
+    let dom_weight = weights[dom];
     let (cc_s, cc_h, cc_l) = (fv(e, "cc_saturation", cx) / 100.0, fv(e, "cc_hue", cx) / 360.0, fv(e, "cc_luminance", cx) / 100.0);
     let cc = (cc_s - 1.0).abs() > 1e-4 || cc_h.abs() > 1e-6 || (cc_l - 1.0).abs() > 1e-4;
     img.px.par_chunks_mut(4).zip(alpha.par_iter()).for_each(|(p, &a)| {
         let src_a = p[3];
         let mut v = enc(Image::unpremul([p[0], p[1], p[2], p[3]]));
-        let (o1, o2) = (v[(dom + 1) % 3], v[(dom + 2) % 3]);
-        let limit = o1.max(o2) * (1.0 - range) + (o1 + o2) * 0.5 * range;
-        let excess = (v[dom] - limit).max(0.0);
-        if excess > 0.0 && spill > 0.0 {
-            let l0 = luma(v);
-            v[dom] -= excess * spill;
-            let l1 = luma(v);
-            let lm = luma(v);
-            v = v.map(|q| lm + (q - lm) * (1.0 - desat * (excess * 4.0).min(1.0)));
-            let comp = (l0 - l1) * sluma;
-            v = v.map(|q| q + comp);
+        let r = (excess(v) + 0.034 * range).max(0.0) * 0.97 * spill;
+        if r > 0.0 {
+            v[dom] -= r;
+            let back = r * dom_weight * 1.086 * luma_back;
+            v = v.map(|q| q + back);
+        }
+        if desat > 0.0 && a < 1.0 {
+            let t = (desat * 0.5 * (1.0 - a)).clamp(0.0, 1.0);
+            let l = luma(v);
+            v = v.map(|q| q + (l - q) * t);
         }
         if cc {
             let mut h = rgb_to_hsl(v[0].clamp(0.0, 1.0), v[1].clamp(0.0, 1.0), v[2].clamp(0.0, 1.0));
@@ -362,6 +378,73 @@ pub fn ultra_key(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
             }
         }
     });
+}
+
+/// Separable min filter over `plane` with a fractional radius (`r` = 2.5 blends the 2- and
+/// 3-pixel erosions halfway).
+pub(crate) fn erode_plane(plane: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
+    let r = r.clamp(0.0, 64.0);
+    let lo = r.floor() as usize;
+    let frac = r - lo as f32;
+    let a = min_plane(plane, w, h, lo);
+    if frac <= 1e-4 {
+        return a;
+    }
+    let b = min_plane(plane, w, h, lo + 1);
+    a.iter().zip(&b).map(|(x, y)| x + (y - x) * frac).collect()
+}
+
+fn min_plane(plane: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    if r == 0 || w == 0 || h == 0 {
+        return plane.to_vec();
+    }
+    let mut tmp = vec![0.0f32; plane.len()];
+    tmp.par_chunks_mut(w).zip(plane.par_chunks(w)).for_each(|(out, row)| {
+        for (x, o) in out.iter_mut().enumerate() {
+            let (s, e) = (x.saturating_sub(r), (x + r).min(w - 1));
+            *o = row.get(s..=e).unwrap_or_default().iter().copied().fold(f32::INFINITY, f32::min);
+        }
+    });
+    let mut out = vec![0.0f32; plane.len()];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let (s, e) = (y.saturating_sub(r), (y + r).min(h - 1));
+        for (x, o) in row.iter_mut().enumerate() {
+            *o = (s..=e).filter_map(|yy| tmp.get(yy * w + x).copied()).fold(f32::INFINITY, f32::min);
+        }
+    });
+    out
+}
+
+/// Separable box blur with a fractional radius (the outermost taps weigh the fraction).
+pub(crate) fn box_plane(plane: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
+    let r = r.clamp(0.0, 64.0);
+    if r <= 1e-4 || w == 0 || h == 0 {
+        return plane.to_vec();
+    }
+    let n = r.ceil() as isize;
+    let frac = r - (n - 1) as f32;
+    let weight = |d: isize| if d.abs() == n { frac } else { 1.0 };
+    let total: f32 = (-n..=n).map(weight).sum();
+    let pass = |src: &[f32], horizontal: bool| -> Vec<f32> {
+        let mut out = vec![0.0f32; src.len()];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for (x, o) in row.iter_mut().enumerate() {
+                let mut s = 0.0;
+                for d in -n..=n {
+                    let (xx, yy) = if horizontal {
+                        ((x as isize + d).clamp(0, w as isize - 1) as usize, y)
+                    } else {
+                        (x, (y as isize + d).clamp(0, h as isize - 1) as usize)
+                    };
+                    s += src.get(yy * w + xx).copied().unwrap_or(0.0) * weight(d);
+                }
+                *o = s / total;
+            }
+        });
+        out
+    };
+    let a = pass(plane, true);
+    pass(&a, false)
 }
 
 /// Track Matte Key: multiplies the layer by another video track's alpha or luma (sampled where

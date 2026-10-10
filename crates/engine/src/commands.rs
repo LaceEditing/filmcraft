@@ -2225,6 +2225,9 @@ fn build() -> Vec<CommandSpec> {
                     let prm = crate::masks::target_param(e, &pq, &pid).ok_or_else(|| bad("effects.setParam", format!("no param `{pid}`")))?;
                     let v = json_to_param(&prm.value, &val).ok_or_else(|| bad("effects.setParam", "value has the wrong type"))?;
                     prm.set_at(mt, v);
+                    if pq.get("mask").is_none() {
+                        follow_param_links(e, &pid);
+                    }
                     Ok(())
                 })?;
                 Ok(Value::Null)
@@ -3191,6 +3194,29 @@ fn project_name_for(path: &str) -> Option<String> {
 fn name_project(p: &mut filmcraft_project::Project, name: String) {
     p.root.name.clone_from(&name);
     p.name = name;
+}
+
+/// Parameters that move together, as in Premiere: Ultra Key's Setting is Custom once a Matte
+/// Generation value is changed, and choosing Default puts those values back to the defaults.
+fn follow_param_links(e: &mut filmcraft_project::EffectInstance, changed: &str) {
+    const MATTE: [&str; 5] = ["transparency", "highlight", "shadow", "tolerance", "pedestal"];
+    const CUSTOM: u32 = 3;
+    if e.effect != "ultra_key" {
+        return;
+    }
+    let setting = e.params.get("setting").map(|p| p.value.clone());
+    if MATTE.contains(&changed) {
+        if setting != Some(filmcraft_project::ParamValue::Choice(CUSTOM)) {
+            e.params.insert("setting".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Choice(CUSTOM)));
+        }
+    } else if changed == "setting" && setting == Some(filmcraft_project::ParamValue::Choice(0)) {
+        let Some(def) = e.def() else { return };
+        for id in MATTE {
+            if let Some(d) = def.param(id) {
+                e.params.insert(id.into(), filmcraft_project::Param::new(d.default.clone()));
+            }
+        }
+    }
 }
 
 /// Save (`adopt`: and keep saving there) to `path`: a FilmCraft project, or a Premiere Pro project

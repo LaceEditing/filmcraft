@@ -123,7 +123,10 @@ Each codec README has the full fixture matrix and the measured results.
   Displace, Ultra Key, Wonder Glow + Glint, Spacer + Stroke + Long Shadow over Gradient, VR Rotate Sphere,
   Channel Mix + Color Emboss + Rounded Crop); per-effect unit tests live in `crates/render/src/vfx/tests.rs`
   (identity at neutral parameters, determinism, range, a known value each, temporal/track effects through
-  the compositor). `scenes_are_distinct` guards against blank or duplicate
+  the compositor). Ultra Key is also checked against Premiere Pro itself (`ultra_key_matches_premiere_renders`):
+  colours and the alpha Premiere's own preview renders gave them, measured by matching a project's
+  lossless preview files (sequence renders with alpha) to the frames of the keyed source; the measured
+  numbers are in the test, the renders are not. `scenes_are_distinct` guards against blank or duplicate
   scenes.
 - **Video transitions** (`crates/render/src/transitions/tests.rs`) are checked for every transition
   (84 modern, 21 Legacy, 7 hidden Obsolete): p = 0 is exactly the outgoing frame and p = 1 exactly
