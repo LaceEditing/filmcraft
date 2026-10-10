@@ -4,9 +4,11 @@
 //!
 //! For each project: import it, take off everything that ties it to Premiere, create a new
 //! Premiere project from it (borrowing effect and transition layouts from up to eight of the other
-//! files given, as from the projects a user opened before), import that and require every
-//! sequence's clips back (position, length, source in point, source). New projects are written to
-//! OUT_DIR for opening in Premiere. One line per file, then what the report left out.
+//! files given, as from the projects a user opened before, or from the `.prproj` files in the
+//! folder `PRPROJ_MODELS` names), import that and require every sequence's clips back (position,
+//! length, source in point, source). New projects are written to OUT_DIR (media paths relative to
+//! it; `/mnt/LocalDisk` written as `L:`) for opening in Premiere. One line per file, then what the
+//! report left out.
 
 use std::time::Instant;
 
@@ -60,8 +62,12 @@ fn check(path: &str, all: &[String], out_dir: &str) -> Result<(String, Vec<Strin
     for it in imp.project.items.values_mut() {
         it.metadata.retain(|k, _| !k.starts_with("premiere."));
     }
-    let models = all.iter().filter(|p| p.as_str() != path).take(8).filter_map(|p| std::fs::read(p).ok()).collect();
-    let copts = CreateOptions { dest_dir: dir, path_map: vec![("/mnt/LocalDisk".into(), "L:".into())], models };
+    let models = match std::env::var("PRPROJ_MODELS") {
+        Ok(d) => std::fs::read_dir(d).map_err(|e| e.to_string())?.filter_map(|e| e.ok()).filter_map(|e| std::fs::read(e.path()).ok()).collect(),
+        Err(_) => all.iter().filter(|p| p.as_str() != path).take(8).filter_map(|p| std::fs::read(p).ok()).collect(),
+    };
+    let out_abs = std::fs::canonicalize(out_dir).map(|p| p.to_string_lossy().to_string()).ok();
+    let copts = CreateOptions { dest_dir: out_abs, path_map: vec![("/mnt/LocalDisk".into(), "L:".into())], models };
     let (out, report) = create_prproj(&imp.project, &copts).map_err(|e| format!("create: {e}"))?;
     let stem = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let _ = std::fs::write(format!("{out_dir}/{stem} (new).prproj"), &out);
