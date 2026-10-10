@@ -177,7 +177,12 @@ fn main() -> eframe::Result {
                 rfd::FileDialog::new().add_filter("Media", exts).pick_files().unwrap_or_default().into_iter().map(|p| p.to_string_lossy().to_string()).collect()
             }));
             app.hooks.pick_save = Some(Box::new(|name: &str| {
-                rfd::FileDialog::new().add_filter("FilmCraft Project", &["fcproj"]).set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string())
+                rfd::FileDialog::new()
+                    .add_filter("FilmCraft Project", &["fcproj"])
+                    .add_filter("Premiere Pro Project", &["prproj"])
+                    .set_file_name(name)
+                    .save_file()
+                    .map(|p| p.to_string_lossy().to_string())
             }));
             app.hooks.pick_save_as = Some(Box::new(|filter: &str, exts: &[&str], name: &str| {
                 rfd::FileDialog::new().add_filter(filter, exts).set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string())

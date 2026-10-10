@@ -20,6 +20,46 @@ pub(crate) fn escape(s: &str) -> String {
     o
 }
 
+/// Text of an element read without a parser: the five named entities and numeric references
+/// resolved (anything else is kept as written).
+pub(crate) fn unescape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('&') {
+        o.push_str(rest.get(..at).unwrap_or(""));
+        let tail = rest.get(at..).unwrap_or("");
+        let entity = tail.find(';').filter(|e| *e <= 10).and_then(|e| tail.get(1..e).map(|name| (name, e)));
+        let decoded = entity.and_then(|(name, e)| {
+            let c = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                n => n
+                    .strip_prefix("#x")
+                    .or_else(|| n.strip_prefix("#X"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| n.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32),
+            };
+            c.map(|c| (c, e))
+        });
+        match decoded {
+            Some((c, e)) => {
+                o.push(c);
+                rest = tail.get(e + 1..).unwrap_or("");
+            }
+            None => {
+                o.push('&');
+                rest = tail.get(1..).unwrap_or("");
+            }
+        }
+    }
+    o.push_str(rest);
+    o
+}
+
 /// Pretty-printing XML writer (two-space indent, one element per line).
 pub(crate) struct XmlWriter {
     out: String,

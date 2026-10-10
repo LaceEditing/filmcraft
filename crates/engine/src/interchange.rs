@@ -186,6 +186,16 @@ pub enum PremiereSave {
     Original,
 }
 
+/// Whether a path names a Premiere Pro project (`.prproj`).
+pub fn is_prproj(path: &str) -> bool {
+    std::path::Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("prproj"))
+}
+
+/// Whether any sequence of the open project came from a Premiere Pro project.
+fn from_premiere(s: &Session) -> bool {
+    s.project.items.values().any(|i| i.as_sequence().is_some() && i.metadata.contains_key(filmcraft_interchange::META_SEQUENCE))
+}
+
 /// The Premiere Pro project the open project came from (None: not opened from one).
 pub fn premiere_source(s: &Session) -> Option<String> {
     s.project.items.values().find(|i| i.metadata.contains_key(filmcraft_interchange::META_SEQUENCE)).and_then(|i| i.metadata.get(PREMIERE_SOURCE).cloned())
@@ -194,8 +204,12 @@ pub fn premiere_source(s: &Session) -> Option<String> {
 /// Whether Save writes a Premiere Pro project here: the project came from one, was not saved as
 /// a FilmCraft project, and Settings ▸ General says so.
 pub fn premiere_save_mode(s: &Session) -> Option<PremiereSave> {
-    if s.path.is_some() || premiere_source(s).is_none() {
+    if s.path.is_some() {
         return None;
+    }
+    if premiere_source(s).is_none() {
+        // a FilmCraft project saved as a new .prproj (Save As): Save writes that file again
+        return s.premiere_save_path.as_ref().map(|_| PremiereSave::Copy);
     }
     match s.prefs.general.save_premiere_projects.as_str() {
         "filmcraft" => None,
@@ -239,8 +253,13 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
         Some(a) => a.iter().filter_map(Value::as_u64).map(ItemId).collect(),
         None => s.project.items.values().filter(|i| i.as_sequence().is_some() && i.metadata.contains_key(META_SEQUENCE)).map(|i| i.id).collect(),
     };
+    if wanted.is_empty() && !from_premiere(s) {
+        // a project that did not come from Premiere: a new Premiere project
+        let adopt = premiere_save_mode(s).is_some();
+        return create_prproj(s, &path, adopt);
+    }
     if wanted.is_empty() {
-        return Err(bad("No sequence in this project came from a Premiere Pro project. Open the .prproj in FilmCraft first, or use File ▸ Export ▸ Final Cut Pro XML, which Premiere imports.".into()));
+        return Err(bad("None of these sequences came from the Premiere Pro project this project was opened from.".into()));
     }
     let meta = |id: &ItemId, k: &str| s.project.item(*id).and_then(|i| i.metadata.get(k).cloned());
     let fingerprints: std::collections::BTreeSet<String> = wanted.iter().filter_map(|i| meta(i, META_FINGERPRINT)).collect();
@@ -309,4 +328,185 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
         format!("{verb} to Premiere Pro project {path} ({n} note(s) in the export report)")
     });
     Ok(json!({"path": path, "sequences": wanted.iter().map(|i| i.0).collect::<Vec<_>>(), "report": lines}))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Premiere Pro projects: new ones
+// ---------------------------------------------------------------------------------------------
+
+/// Write the open project (which did not come from Premiere Pro) as a new `.prproj` at `path`.
+/// `adopt`: Save writes this file from now on (Save As, or Save after one).
+pub fn create_prproj(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
+    let bad = |m: String| EngineError::Other(m);
+    let dest_dir = std::path::Path::new(path).parent().and_then(|d| d.to_str()).map(str::to_string);
+    let path_map = premiere_drives(s);
+    let models = if needs_layouts(&s.project) { premiere_layouts(s) } else { Vec::new() };
+    let opts = filmcraft_interchange::prproj_new::CreateOptions { dest_dir, path_map: path_map.clone(), models };
+    let (bytes, report) = filmcraft_interchange::create_prproj(&s.project, &opts).map_err(|e| bad(e.to_string()))?;
+    let mut lines = report_json(&report);
+    // a .prproj FilmCraft did not write for this project is kept
+    let ours = s.premiere_save_path.as_deref() == Some(path);
+    if !ours && s.services.read_file(path).is_ok() {
+        let backup = format!("{path}.before-filmcraft");
+        if s.services.read_file(&backup).is_err() {
+            let old = s.services.read_file(path).map_err(|e| bad(format!("{path}: {e}")))?;
+            s.services.write_file(&backup, &old).map_err(|e| bad(format!("{backup}: {e}")))?;
+            lines.push(format!("the file that was there was kept as {backup}"));
+        }
+    }
+    s.services.write_file(path, &bytes).map_err(|e| bad(format!("{path}: {e}")))?;
+    let has_files = s.project.items.values().any(is_file_media);
+    if path_map.is_empty() && has_files {
+        lines.push(
+            "media paths are written as this computer's paths (open a .prproj saved on the Premiere machine in FilmCraft once so it learns that machine's drives); Premiere finds media stored with the project by its relative path, or asks to locate it".into(),
+        );
+    }
+    if adopt {
+        s.path = None;
+        s.premiere_save_path = Some(path.to_string());
+        s.saved_revision = s.revision;
+    }
+    let n = lines.len();
+    let verb = if adopt { "Saved" } else { "Exported" };
+    s.toast(if n == 0 {
+        format!("{verb} as Premiere Pro project {path}")
+    } else {
+        format!("{verb} as Premiere Pro project {path} ({n} note(s) in the export report)")
+    });
+    let sequences: Vec<u64> = s.project.items.values().filter(|i| i.as_sequence().is_some()).map(|i| i.id.0).collect();
+    Ok(json!({"path": path, "sequences": sequences, "created": true, "report": lines}))
+}
+
+/// Whether the project has effects or transitions whose Premiere layout must be borrowed.
+fn needs_layouts(p: &filmcraft_project::Project) -> bool {
+    p.sequences().filter_map(|i| i.as_sequence()).flat_map(|q| q.all_tracks()).any(|t| {
+        !t.transitions.is_empty()
+            || t.items.iter().any(|c| c.effects.iter().any(|e| filmcraft_project::effect::find_effect(&e.effect).is_some_and(|d| !d.intrinsic)))
+    })
+}
+
+/// The kept copies of opened Premiere projects, newest first (at most 16).
+fn premiere_originals(s: &Session) -> Vec<std::path::PathBuf> {
+    let Some(dir) = premiere_originals_dir(s) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| is_prproj(&p.to_string_lossy()))
+        .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p))
+        .collect();
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    files.into_iter().take(16).map(|(_, p)| p).collect()
+}
+
+/// Premiere projects to borrow effect and transition layouts from.
+fn premiere_layouts(s: &Session) -> Vec<Vec<u8>> {
+    premiere_originals(s).iter().filter_map(|p| std::fs::read(p).ok()).collect()
+}
+
+/// (local folder, Premiere drive) pairs, learned from the Premiere projects FilmCraft has opened:
+/// a media path such as `L:\Editing\a.mp4` in one of them, found on this computer as
+/// `/mnt/LocalDisk/Editing/a.mp4`, maps `/mnt/LocalDisk` to `L:`. Kept until another Premiere
+/// project is opened.
+fn premiere_drives(s: &mut Session) -> Vec<(String, String)> {
+    let originals = premiere_originals(s);
+    let names: Vec<String> = originals.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    if let Some((known, map)) = &s.premiere_drives
+        && *known == names
+    {
+        return map.clone();
+    }
+    let mut windows = Vec::new();
+    for p in &originals {
+        if let Ok(bytes) = std::fs::read(p)
+            && let Ok(paths) = filmcraft_interchange::prproj_media_paths(&bytes)
+        {
+            windows.extend(paths);
+        }
+    }
+    let local: Vec<String> = s
+        .project
+        .items
+        .values()
+        .filter_map(|i| match &i.kind {
+            ItemKind::Media(m) => match &m.media {
+                MediaRef::File { path } => Some(path.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let map = learn_drives(&windows, &local, &mount_roots(), |p| std::path::Path::new(p).exists());
+    s.premiere_drives = Some((names, map.clone()));
+    map
+}
+
+/// Folders drives are usually mounted at (`/mnt/*`, `/media/*`, `/media/<user>/*`,
+/// `/run/media/<user>/*`, `/Volumes/*`).
+fn mount_roots() -> Vec<String> {
+    let mut out = Vec::new();
+    let user = std::env::var("USER").unwrap_or_default();
+    let mut bases = vec!["/mnt".to_string(), "/media".to_string(), "/Volumes".to_string()];
+    if !user.is_empty() {
+        bases.push(format!("/media/{user}"));
+        bases.push(format!("/run/media/{user}"));
+    }
+    for b in bases {
+        let Ok(entries) = std::fs::read_dir(&b) else { continue };
+        for e in entries.filter_map(|e| e.ok()).take(64) {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                out.push(e.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Which local folder each Windows drive letter of `windows` paths is: the first candidate
+/// (folders above the project's media first, then `mounts`) under which a path's remainder
+/// exists. Bounded: at most 20 000 lookups.
+pub(crate) fn learn_drives(windows: &[String], local_media: &[String], mounts: &[String], exists: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    let mut roots: Vec<String> = Vec::new();
+    for p in local_media {
+        let mut cur = std::path::Path::new(p).parent();
+        while let Some(d) = cur {
+            let d_s = d.to_string_lossy().to_string();
+            if d_s.len() > 1 && !roots.contains(&d_s) {
+                roots.push(d_s);
+            }
+            cur = d.parent();
+        }
+    }
+    for m in mounts {
+        if !roots.contains(m) {
+            roots.push(m.clone());
+        }
+    }
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut budget = 20_000usize;
+    for w in windows {
+        let b = w.as_bytes();
+        let drive = match (b.first(), b.get(1), b.get(2)) {
+            (Some(l), Some(b':'), Some(b'\\')) if l.is_ascii_alphabetic() => format!("{}:", (*l as char).to_ascii_uppercase()),
+            _ => continue,
+        };
+        if found.iter().any(|(_, d)| *d == drive) {
+            continue;
+        }
+        let rest = w.get(3..).unwrap_or("").replace('\\', "/");
+        if rest.is_empty() {
+            continue;
+        }
+        for r in &roots {
+            if budget == 0 {
+                return found;
+            }
+            budget -= 1;
+            if exists(&format!("{}/{rest}", r.trim_end_matches('/'))) {
+                found.push((r.clone(), drive));
+                break;
+            }
+        }
+    }
+    found
 }

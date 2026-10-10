@@ -1060,9 +1060,11 @@ impl FilmcraftApp {
                     .values()
                     .find_map(|i| i.metadata.get(filmcraft_engine::interchange::PREMIERE_SOURCE).cloned())
                     .unwrap_or_default();
-                let stem =
-                    std::path::Path::new(&source).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.session.project.name.clone());
-                let suggested = format!("{stem} (FilmCraft).prproj");
+                // a project from Premiere: beside its original under a new name; any other: its own name
+                let suggested = match std::path::Path::new(&source).file_stem() {
+                    Some(stem) if !source.is_empty() => format!("{} (FilmCraft).prproj", stem.to_string_lossy()),
+                    _ => format!("{}.prproj", self.session.project.name),
+                };
                 let Some(path) = self.hooks.pick_save_as.as_mut().and_then(|f| f("Premiere Pro Project", &["prproj"], &suggested)) else {
                     return Ok(Value::Null);
                 };

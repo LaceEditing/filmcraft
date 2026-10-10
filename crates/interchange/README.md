@@ -1,8 +1,8 @@
 # filmcraft-interchange
 
 Timeline interchange for FilmCraft: CMX 3600 EDL, Final Cut Pro 7 XML (xmeml), FCPXML,
-OpenTimelineIO, AAF and OMF import and export, plus Avid ALE and Premiere Pro project (`.prproj`)
-import. Layer L2: no file I/O; media
+OpenTimelineIO, AAF and OMF import and export, plus Avid ALE import and Premiere Pro projects
+(`.prproj`: import, write-back, and new projects). Layer L2: no file I/O; media
 references are strings and audio essence is supplied by the caller (the engine).
 
 ## Specifications
@@ -82,7 +82,8 @@ OMF carries no video at all.
 
 ## Premiere Pro projects (`.prproj`)
 
-Import (`prproj`) and write-back into the project they came from (`prproj_write`). There is no
+Import (`prproj`), write-back into the project they came from (`prproj_write`), and new projects
+for FilmCraft projects that did not come from Premiere (`prproj_new`). There is no
 published specification; like the Premiere-exported XML layouts above, everything was read off
 project files saved by Premiere Pro, never from the application. The observations come from 461
 projects saved by Premiere Pro 2025–2026 (1 to 230 media files, up to ~4 000 clips each), which
@@ -144,8 +145,8 @@ committed).
 
 ### Writing back
 
-FilmCraft never generates a Premiere project: it patches the one the sequences came from, by byte
-range, so everything it did not change keeps its exact bytes (an unchanged project is written back
+A project that came from Premiere is never regenerated: FilmCraft patches the one the sequences
+came from, by byte range, so everything it did not change keeps its exact bytes (an unchanged project is written back
 byte-identical: 455 of the 455 readable corpus projects). Every clip remembers its Premiere track
 item (`TrackItem::origin`); media and sequence items their UIDs (`premiere.media`,
 `premiere.sequence` metadata). The engine keeps a copy of each opened project so the version that
@@ -164,7 +165,8 @@ was opened is the one patched.
   written where they changed. Parameters are compared in Premiere's terms (source-time keys,
   normalised points, linear gain) and rewritten only where they differ, so a trim does not touch
   source-timed keys; unchanged keys keep their exact text. Effects removed in FilmCraft are taken
-  off; effects added in FilmCraft are reported, not written.
+  off; an effect added in FilmCraft copies a component of the same effect elsewhere in the project
+(reported when there is none).
 - Clips and transitions FilmCraft never imported (sources it does not understand, transitions
   joined to no clip) are kept where they are. A clip the importer moved off its track because it
   overlapped another goes back to its track while its timing is unchanged.
@@ -178,12 +180,65 @@ was opened is the one patched.
   `ObjectRef` / `ObjectURef` / `BinaryHash` the original resolved, and import back into exactly
   the clips FilmCraft wrote. Otherwise the export is an error, never a file.
 
+### New projects
+
+A FilmCraft project that did not come from Premiere becomes a new `.prproj` (`prproj_new`):
+
+- A *seed* document is built with the objects a project saved by Premiere has before any clip is
+  placed, laid out as observed: the project and its settings objects (`ProjectSettings`, five
+  `CompileSettings`, scratch disks, ingest, workspace), the root bin (`Node/ID` 1000000) and bins,
+  and per media file a `ClipProjectItem` → `MasterClip` (logging info, a default audio component
+  chain, a `VideoClip` and/or `AudioClip`, audio channel groups) → `VideoMediaSource` /
+  `AudioMediaSource` → `Media` (`FilePath` / `ActualMediaFilePath` in the Premiere machine's
+  terms, `RelativePath` from the project's folder, importer `1fa18bfa-…`, a new `FileKey`; stills
+  `Infinite`, `IsStill`, 12-hour length) with its `VideoStream` / `AudioStream`. Mono files keep
+  mono clips (`[{"channellabel":0}]`, channel type 0); everything else is stereo.
+- Per sequence: its master clip (an `AudioClip` and a `VideoClip` of `Audio`/`VideoSequenceSource`),
+  the `Sequence` ("Custom" editing mode `9678af98-…`, its preview preset, work area), an empty
+  `LinkContainer`, the video, audio and data track groups, one `VideoClipTrack` per video track and
+  one `AudioClipTrack` per audio track (each with a fader + meter chain and a stereo panner at
+  0.5), and the master `AudioMixTrack` (fader, meter, default panner, an inlet listing the tracks;
+  audio track ids start at 2, the master is 1). Track faders hold the track volume, linear with 1.0
+  = 0 dB (upper bound 5.6234 = +15 dB), as observed.
+- For each media file and nested sequence a sequence uses, a *template* clip per kind of track:
+  a `VideoClipTrackItem` with explicit `AE.ADBE Motion` (11 parameters, with its private data) and
+  `AE.ADBE Opacity` components, or an `AudioClipTrackItem` with `Internal Volume Stereo` +
+  `Internal Channel Volume Stereo` (Bypass, Left, Right and 30 more levels) or `Internal Volume
+  Mono`. (Clips Premiere places itself carry no components and `DefaultMotion` / `DefaultVol`;
+  explicit ones are what it saves once a value changes, and what the writer can set.)
+- Effects and transitions need Premiere's own layout of their component. They are borrowed from
+  Premiere projects the user opened in FilmCraft (the kept copies): one component per effect (with
+  its parameters, renumbered, binary payloads inlined) or one transition track item per transition
+  name. Only components all of whose settings FilmCraft maps are borrowed (group headings, an
+  audio effect's processing state and a Bypass that is off hold no setting), so no value of the
+  borrowed clip leaks in; a model without animation is preferred.
+- `prproj_write::export` then writes the sequences into the seed exactly as into a project from
+  Premiere (copies of the templates and borrowed layouts for every clip, timing, speed, holds,
+  Motion / Opacity / volume, effects, transitions, links, markers) and verifies the result; the
+  templates and borrowed layouts, which nothing refers to, are dropped last.
+- Left out, and listed in the report: effects and transitions with no layout to borrow, graphics /
+  titles, adjustment layers, generated media (clips of them), captions, submixes, track effects,
+  pan, mute and solo, time remapping, clip pan / channel volume, blend modes, masks, audio gain.
+- Media paths: FilmCraft's local paths are written as the Premiere machine sees them, with the
+  drive mapping the engine learns from the Premiere projects it has opened (a media path
+  `L:\Editing\a.mp4` in one of them that exists here as `/mnt/LocalDisk/Editing/a.mp4` maps
+  `/mnt/LocalDisk` to `L:`). Without one, the local path is written; Premiere then finds media kept
+  with the project through `RelativePath`, or asks to locate it.
+
+`examples/prproj_recreate.rs` re-creates every project of a corpus this way (as a FilmCraft
+project, layouts borrowed from other projects of the corpus) and requires every sequence's clips
+back: 85 of the 85 local projects with a sequence.
+
 In the app the project is written by File ▸ Export ▸ Premiere Pro Project, and by File ▸ Save
 (Ctrl+S) on a project opened from Premiere that was not saved as a FilmCraft project: Settings ▸
 General ▸ Save a project opened from Premiere Pro chooses a `.prproj` beside the original (the
 default; the first Save asks where, later ones write there), over the original (keeping
 `<file>.before-filmcraft`), or a FilmCraft project (`file.save {path?}`; engine
-`interchange::save_as_premiere`). A Save there leaves the project saved (not dirty).
+`interchange::save_as_premiere`). A Save there leaves the project saved (not dirty). Any other
+project becomes a new Premiere project through File ▸ Export ▸ Premiere Pro Project or Save As /
+Save a Copy with a `.prproj` name; after Save As, Save writes that file again
+(`interchange::create_prproj`). A `.prproj` FilmCraft did not write there is kept as
+`<file>.before-filmcraft`.
 
 ## Tests
 

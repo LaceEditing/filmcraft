@@ -8,7 +8,8 @@
 //! - **OpenTimelineIO** JSON (`.otio`) ([`otio`]);
 //! - **AAF** (`.aaf`, Edit Protocol, structured storage) ([`aaf`]);
 //! - **OMF Interchange 2.0** (`.omf`, Bento) for audio post ([`omf`]);
-//! - **Premiere Pro projects** (`.prproj`), import only, from observed files (`prproj`).
+//! - **Premiere Pro projects** (`.prproj`), from observed files: import (`prproj`), write-back
+//!   into the project they came from (`prproj_write`) and new projects ([`prproj_new`]).
 //!
 //! AAF and OMF can embed or consolidate audio: [`essence::audio_needs`] lists what the caller
 //! (the engine) has to render, and [`essence::MediaOptions`] passes the result back in.
@@ -37,6 +38,7 @@ pub mod otio;
 mod prproj;
 mod prproj_fx;
 mod prproj_graph;
+pub mod prproj_new;
 mod prproj_write;
 
 mod common;
@@ -420,19 +422,53 @@ pub fn export(project: &Project, sequence: ItemId, format: Format, opts: &Export
     Ok((text.into_bytes(), report))
 }
 
-/// Write sequences back into the Premiere Pro project they were imported from (`original` is that
-/// `.prproj` file's bytes). `sequences` empty = every sequence that came from a Premiere project.
-/// The original document is patched, not regenerated: what FilmCraft did not change keeps its
-/// exact bytes. The result is verified (references, binary payloads, and a re-import that must
-/// give back exactly the written clips) before it is returned.
 /// The fingerprint recorded in [`META_FINGERPRINT`] when a Premiere project is imported.
 pub fn prproj_fingerprint(bytes: &[u8]) -> String {
     prproj_graph::fingerprint(bytes)
 }
 
-/// `dest_dir` is the folder the new project goes to (for media paths relative to it).
+/// Write sequences back into the Premiere Pro project they were imported from (`original` is that
+/// `.prproj` file's bytes). `sequences` empty = every sequence that came from a Premiere project.
+/// The original document is patched, not regenerated: what FilmCraft did not change keeps its
+/// exact bytes. The result is verified (references, binary payloads, and a re-import that must
+/// give back exactly the written clips) before it is returned. `dest_dir` is the folder the new
+/// project goes to (for media paths relative to it).
 pub fn export_prproj(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir: Option<&str>) -> Result<(Vec<u8>, Report)> {
     prproj_write::export(project, original, sequences, dest_dir)
+}
+
+/// A new Premiere Pro project (gzip-compressed `.prproj`) with every sequence, media file and bin
+/// of `project`, for a project that did not come from Premiere (see [`prproj_new`]). Verified like
+/// [`export_prproj`]; what a new Premiere project cannot hold is listed in the report.
+pub fn create_prproj(project: &Project, opts: &prproj_new::CreateOptions) -> Result<(Vec<u8>, Report)> {
+    prproj_new::create(project, opts)
+}
+
+/// The media file paths a Premiere project refers to, as written in it (Windows paths when it was
+/// saved on Windows), each once. Used to learn how another machine's drives map onto this one.
+pub fn prproj_media_paths(bytes: &[u8]) -> Result<Vec<String>> {
+    let (raw, _) = prproj_graph::decompress(bytes)?;
+    let text = String::from_utf8_lossy(&raw);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tag in ["<ActualMediaFilePath>", "<FilePath>"] {
+        let close = tag.replacen('<', "</", 1);
+        let mut rest = text.as_ref();
+        while let Some(at) = rest.find(tag) {
+            rest = rest.get(at + tag.len()..).unwrap_or("");
+            let Some(end) = rest.find(close.as_str()) else { break };
+            let value = xml::unescape(rest.get(..end).unwrap_or("")).trim().to_string();
+            rest = rest.get(end..).unwrap_or("");
+            // Premiere also writes four-character codes in some `FilePath`s
+            if (value.contains('\\') || value.contains('/')) && seen.insert(value.clone()) {
+                out.push(value);
+            }
+            if out.len() >= 100_000 {
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Premiere's "Export ▸ EDL" with one list per video track: returns `(suggested suffix, document)`

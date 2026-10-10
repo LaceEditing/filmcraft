@@ -116,11 +116,85 @@ fn a_source_saved_again_elsewhere_is_not_patched_silently() {
     assert!(r["report"].to_string().contains("changed after it was opened"));
 }
 
+/// A FilmCraft project with a media file: the Premiere project opened, then everything that ties
+/// it to Premiere taken off (as if the media had been imported into FilmCraft).
+fn filmcraft_project(dir: &std::path::Path) -> Session {
+    let src = dir.join("show.prproj");
+    std::fs::write(&src, prproj()).unwrap();
+    let mut s = session(dir);
+    s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
+    let mut p = (*s.project).clone();
+    for it in p.items.values_mut() {
+        it.metadata.retain(|k, _| !k.starts_with("premiere."));
+    }
+    s.project = std::sync::Arc::new(p);
+    assert!(crate::interchange::premiere_source(&s).is_none());
+    s
+}
+
+fn clips_of(path: &std::path::Path, dir: &std::path::Path) -> Vec<(i64, i64, i64)> {
+    let mut t = session(dir);
+    t.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+    let seq = t.project.sequences().find(|i| i.name == "Edit").and_then(|i| i.as_sequence()).unwrap().clone();
+    seq.all_tracks().flat_map(|tr| tr.items.iter().map(|c| (c.start.0, c.duration.0, c.source_in.0))).collect()
+}
+
+/// File ▸ Export ▸ Premiere Pro Project and Save As … .prproj on a project that did not come from
+/// Premiere: a new Premiere project; after Save As, Save writes it again.
 #[test]
-fn export_needs_a_project_that_came_from_premiere() {
-    let mut s = Session::default();
+fn a_filmcraft_project_becomes_a_new_premiere_project() {
+    let dir = tmp_dir("prproj-create");
+    let mut s = filmcraft_project(&dir);
+    assert!(crate::find_command("file.exportPrproj").map(|c| (c.enabled)(&s)).unwrap().is_ok());
+
+    // Export: written, nothing about Save changes
+    let out = dir.join("new.prproj");
+    let r = s.execute("file.exportPrproj", json!({"path": out.to_string_lossy()})).unwrap();
+    assert_eq!(r["created"], true, "{r}");
+    assert!(std::fs::read(&out).unwrap().starts_with(&[0x1f, 0x8b]), "gzip, as Premiere saves");
+    assert_eq!(clips_of(&out, &dir), vec![(0, 10 * S, 0), (0, 10 * S, 0)]);
+    assert!(s.premiere_save_path.is_none());
+
+    // Save As .prproj: saved there, and Save writes it again
+    let saved = dir.join("saved.prproj");
+    s.execute("file.saveAs", json!({"path": saved.to_string_lossy()})).unwrap();
+    assert_eq!(s.premiere_save_path.as_deref(), Some(saved.to_string_lossy().as_ref()));
+    assert!(s.path.is_none() && !s.is_dirty());
+    set_first_video_clip(&mut s, 4);
+    assert!(s.is_dirty());
+    s.execute("file.save", json!({})).unwrap();
+    assert!(!s.is_dirty());
+    assert!(clips_of(&saved, &dir).contains(&(0, 4 * S, 0)));
+    assert!(!dir.join("saved.prproj.before-filmcraft").exists(), "its own file is simply replaced");
+
+    // a .prproj FilmCraft did not write is kept
+    let mut t = filmcraft_project(&dir);
+    let foreign = dir.join("show.prproj");
+    t.execute("file.saveCopy", json!({"path": foreign.to_string_lossy()})).unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("show.prproj.before-filmcraft")).unwrap(), prproj());
+    assert!(t.premiere_save_path.is_none(), "Save a Copy does not change where Save goes");
+}
+
+#[test]
+fn a_project_of_generated_media_reports_what_it_left_out() {
+    let dir = tmp_dir("prproj-demo");
+    let mut s = Session { prefs_path: Some(dir.join("prefs.json")), ..Default::default() };
     s.execute("file.openDemoProject", json!({})).unwrap();
-    assert!(s.execute("file.exportPrproj", json!({"path": "/nonexistent/x.prproj"})).is_err());
+    let out = dir.join("demo.prproj");
+    let r = s.execute("file.exportPrproj", json!({"path": out.to_string_lossy()})).unwrap();
+    assert!(r["report"].to_string().contains("generated media"), "{r}");
+    assert!(out.exists());
+}
+
+#[test]
+fn premiere_drives_are_learned_from_files_both_machines_have() {
+    let on_disk = ["/mnt/LocalDisk/Editing/Show/a.mp4", "/run/media/me/Drive/Music/b.wav"];
+    let exists = |p: &str| on_disk.contains(&p);
+    let windows =
+        ["L:\\Editing\\Show\\a.mp4".to_string(), "M:\\Music\\b.wav".to_string(), "\\\\server\\share\\c.mp4".to_string(), "Q:\\nowhere.mp4".to_string()];
+    let local = ["/mnt/LocalDisk/Editing/New/clip.mp4".to_string()];
+    let map = crate::interchange::learn_drives(&windows, &local, &["/run/media/me/Drive".to_string()], exists);
+    assert_eq!(map, vec![("/mnt/LocalDisk".to_string(), "L:".to_string()), ("/run/media/me/Drive".to_string(), "M:".to_string())]);
 }
 
 fn set_first_video_clip(s: &mut Session, secs: i64) {

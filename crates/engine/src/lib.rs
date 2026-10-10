@@ -344,6 +344,9 @@ pub struct Session {
     /// Where Save writes the Premiere Pro project of a project opened from one (Settings ▸
     /// General ▸ Save a project opened from Premiere Pro): set by the first Save / export.
     pub premiere_save_path: Option<String>,
+    /// How this computer's folders map onto the drives of the machine running Premiere, learned
+    /// from the Premiere projects FilmCraft has opened (by the kept copies it was learned from).
+    pub premiere_drives: Option<(Vec<String>, Vec<(String, String)>)>,
     pub path: Option<String>,
     pub state: EditorState,
     pub media: Arc<MediaPool>,
@@ -450,6 +453,7 @@ impl Session {
             saved_revision: 1,
             merge_scope: None,
             premiere_save_path: None,
+            premiere_drives: None,
             path: None,
             state: EditorState {
                 snapping: true,

@@ -1,6 +1,7 @@
 //! Write FilmCraft sequences back into the Premiere Pro project they were imported from.
 //!
-//! FilmCraft does not generate Premiere projects: it *patches* the original document. Everything
+//! A project that came from Premiere is not regenerated: FilmCraft *patches* the original document
+//! (new projects are seeded by [`crate::prproj_new`] and then written by this module). Everything
 //! FilmCraft did not change keeps its exact bytes (the document is edited by byte range, not
 //! re-serialised); what changed is rewritten in place:
 //!
@@ -1048,20 +1049,7 @@ impl<'a, 'i> Writer<'a, 'i> {
                 _ => {
                     let guid = self.uuid();
                     let id = self.alloc_id();
-                    let mut d = serde_json::Map::new();
-                    if !k.comment.is_empty() {
-                        d.insert("mComment".into(), k.comment.clone().into());
-                    }
-                    if k.duration > 0 {
-                        d.insert("mDuration".into(), serde_json::json!({"ticks": k.duration}));
-                    }
-                    d.insert("mMarkerID".into(), guid.clone().into());
-                    if !k.name.is_empty() {
-                        d.insert("mName".into(), k.name.clone().into());
-                    }
-                    d.insert("mStartTime".into(), serde_json::json!({"ticks": k.start}));
-                    d.insert("mType".into(), k.kind.clone().into());
-                    let json = serde_json::json!({ "DVAMarker": d }).to_string();
+                    let json = k.json(&guid);
                     self.created.push(format!(
                         "<Marker ObjectID=\"{id}\" ClassID=\"a45508e0-3ff7-4d04-90a7-2e0dfff4c910\" Version=\"3\"><DVAMarker>{}</DVAMarker></Marker>\n\t",
                         escape(&json)
@@ -1707,7 +1695,7 @@ const OWNED_KINDS: &[&str] = &[
 ];
 
 /// Reference elements of an object, skipping embedded objects that number their own children.
-fn public_refs<'a, 'i>(obj: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
+pub(crate) fn public_refs<'a, 'i>(obj: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
     public_refs_skipping(obj, &[])
 }
 
@@ -1786,7 +1774,29 @@ struct MarkerKey {
     kind: String,
 }
 
+/// A marker's `DVAMarker` JSON, as Premiere writes it (`guid` is its `mMarkerID`).
+pub(crate) fn marker_json(m: &filmcraft_project::Marker, guid: &str) -> String {
+    MarkerKey::of(m).json(guid)
+}
+
 impl MarkerKey {
+    fn json(&self, guid: &str) -> String {
+        let mut d = serde_json::Map::new();
+        if !self.comment.is_empty() {
+            d.insert("mComment".into(), self.comment.clone().into());
+        }
+        if self.duration > 0 {
+            d.insert("mDuration".into(), serde_json::json!({"ticks": self.duration}));
+        }
+        d.insert("mMarkerID".into(), guid.into());
+        if !self.name.is_empty() {
+            d.insert("mName".into(), self.name.clone().into());
+        }
+        d.insert("mStartTime".into(), serde_json::json!({"ticks": self.start}));
+        d.insert("mType".into(), self.kind.clone().into());
+        serde_json::json!({ "DVAMarker": d }).to_string()
+    }
+
     fn of(m: &filmcraft_project::Marker) -> Self {
         let kind = match m.kind {
             filmcraft_project::MarkerKind::Chapter => "Chapter",
@@ -1887,7 +1897,7 @@ fn displaced(text: &str) -> HashMap<(String, bool, String), usize> {
 }
 
 /// Unresolved object references and binary payloads of a document (empty when it is sound).
-fn problems(text: &str) -> HashSet<String> {
+pub(crate) fn problems(text: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     let Ok(doc) = crate::xml::parse(text) else {
         out.insert("unparsable".to_string());

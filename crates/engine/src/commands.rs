@@ -917,16 +917,24 @@ fn build() -> Vec<CommandSpec> {
                 return r;
             }
             let path = str_p(p, "path").map(str::to_string).or_else(|| s.path.clone()).ok_or_else(|| bad("file.save", "no path (use Save As)"))?;
-            write_project(s, &path, true)
+            save_to(s, &path, true)
         }),
-        cmd!("file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), r#"{"path":str}"#, always, |s, p| {
+        cmd!("file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), r#"{"path":str} (a .prproj path saves a Premiere Pro project)"#, always, |s, p| {
             let path = str_p(p, "path").ok_or_else(|| bad("file.saveAs", "need `path`"))?.to_string();
-            write_project(s, &path, true)
+            save_to(s, &path, true)
         }),
-        cmd!("file.saveCopy", "Save a Copy…", ["File"], Some("Cmd+Alt+S"), r#"{"path":str}"#, always, |s, p| {
-            let path = str_p(p, "path").ok_or_else(|| bad("file.saveCopy", "need `path`"))?.to_string();
-            write_project(s, &path, false)
-        }),
+        cmd!(
+            "file.saveCopy",
+            "Save a Copy…",
+            ["File"],
+            Some("Cmd+Alt+S"),
+            r#"{"path":str} (a .prproj path saves a Premiere Pro project)"#,
+            always,
+            |s, p| {
+                let path = str_p(p, "path").ok_or_else(|| bad("file.saveCopy", "need `path`"))?.to_string();
+                save_to(s, &path, false)
+            }
+        ),
         cmd!("file.revert", "Revert", ["File"], None, "{}", has_saved_path, |s, _| {
             let path = s.path.clone().ok_or_else(|| bad("file.revert", "project was never saved"))?;
             let keep = s.state.active_sequence;
@@ -942,12 +950,8 @@ fn build() -> Vec<CommandSpec> {
             "Premiere Pro Project…",
             ["File", "Export"],
             None,
-            r#"{"path":str,"sequences":[seqId]?,"force":bool?,"overwrite":bool?} (sequences opened from a .prproj, written back into it as a new .prproj)"#,
-            |s| if s.project.items.values().any(|i| i.metadata.contains_key(filmcraft_interchange::META_SEQUENCE)) {
-                Ok(())
-            } else {
-                Err("Open a Premiere Pro project (.prproj) first".into())
-            },
+            r#"{"path":str,"sequences":[seqId]?,"force":bool?,"overwrite":bool?} (sequences opened from a .prproj are written back into it as a new .prproj; any other project becomes a new Premiere Pro project)"#,
+            |s| if s.project.items.values().any(|i| i.as_sequence().is_some()) { Ok(()) } else { Err("The project has no sequence".into()) },
             |s, p| crate::interchange::export_prproj(s, p)
         ),
         cmd!("file.open", "Open Project…", ["File"], Some("Cmd+O"), r#"{"path":str}"#, always, |s, p| {
@@ -3187,6 +3191,18 @@ fn project_name_for(path: &str) -> Option<String> {
 fn name_project(p: &mut filmcraft_project::Project, name: String) {
     p.root.name.clone_from(&name);
     p.name = name;
+}
+
+/// Save (`adopt`: and keep saving there) to `path`: a FilmCraft project, or a Premiere Pro project
+/// for a `.prproj` path (written back into the one the project came from, else a new one).
+fn save_to(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
+    if !crate::interchange::is_prproj(path) {
+        return write_project(s, path, adopt);
+    }
+    if s.project.items.values().any(|i| i.metadata.contains_key(filmcraft_interchange::META_SEQUENCE)) {
+        return crate::interchange::export_prproj(s, &json!({"path": path}));
+    }
+    crate::interchange::create_prproj(s, path, adopt)
 }
 
 fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
