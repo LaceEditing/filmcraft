@@ -141,6 +141,8 @@ struct Writer<'a, 'i> {
     added_items: Vec<String>,
     /// Written track item id → its instance and the object it was written from.
     clip_objects: HashMap<String, (usize, Node<'a, 'i>)>,
+    /// Binary payloads by hash (read on first use).
+    payloads: Option<HashMap<&'a str, &'a str>>,
 }
 
 /// A media asset copied into the project for media FilmCraft added.
@@ -192,7 +194,50 @@ impl<'a, 'i> Writer<'a, 'i> {
             assets: HashMap::new(),
             added_items: Vec::new(),
             clip_objects: HashMap::new(),
+            payloads: None,
         }
+    }
+
+    /// The bytes of a binary value, stored in the element or in another one with its hash.
+    fn binary(&mut self, el: Node<'a, 'i>) -> Option<Vec<u8>> {
+        let text = match el.text().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => t,
+            None => {
+                let hash = el.attribute("BinaryHash")?;
+                let root = self.root;
+                let map = self.payloads.get_or_insert_with(|| {
+                    let mut m = HashMap::new();
+                    for n in root.descendants().filter(Node::is_element) {
+                        if let (Some(h), Some(t)) = (n.attribute("BinaryHash"), n.text().map(str::trim).filter(|t| !t.is_empty())) {
+                            m.entry(h).or_insert(t);
+                        }
+                    }
+                    m
+                });
+                map.get(hash).copied()?
+            }
+        };
+        crate::prproj_text::base64(text)
+    }
+
+    /// Whether FilmCraft's text layer differs from the Premiere title it was imported from in what
+    /// is not written back (the text and its formatting live in Premiere's `Source Text` value).
+    fn title_edited(&mut self, comp: &prproj_fx::Component<'a, 'i>, e: &filmcraft_project::EffectInstance) -> bool {
+        let source = comp.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim() == "Source Text"));
+        let Some(t) = source.and_then(|p| child(p, "StartKeyframeValue")).and_then(|v| self.binary(v)).and_then(|b| crate::prproj_text::decode(&b)) else {
+            return false;
+        };
+        let text = |id: &str| match e.params.get(id).map(|p| &p.value) {
+            Some(filmcraft_project::ParamValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let num = |id: &str| e.params.get(id).and_then(|p| p.value.as_f64());
+        let animated = ["text", "size", "fill_color"].iter().any(|id| e.params.get(*id).is_some_and(|p| !p.keyframes.is_empty()));
+        let font = t.font.as_deref().map(crate::prproj_text::font_family_style);
+        animated
+            || text("text").as_deref() != Some(t.text.as_str())
+            || num("size").is_some_and(|v| (v - f64::from(t.size)).abs() > 1e-3)
+            || font.is_some_and(|(f, st)| text("font").as_deref() != Some(f.as_str()) || text("font_style").as_deref() != Some(st.as_str()))
     }
 
     /// Edits so far, counting a copied object as one.
@@ -786,6 +831,15 @@ impl<'a, 'i> Writer<'a, 'i> {
                         keep_refs.push(false);
                         continue;
                     }
+                    if def.id == filmcraft_project::graphic::TEXT_LAYER
+                        && let Some(e) = found
+                        && self.title_edited(comp, e)
+                    {
+                        self.report.warn(format!(
+                            "title \"{}\": changes to its text or formatting are not written to Premiere projects yet; Premiere keeps the original (position, size and opacity are written)",
+                            c.name
+                        ));
+                    }
                     found
                 }
                 // FilmCraft never saw it: keep it on clips from Premiere, drop it from copies of
@@ -852,6 +906,14 @@ impl<'a, 'i> Writer<'a, 'i> {
         let mut seen: HashMap<&str, usize> = HashMap::new();
         for e in &c.effects {
             let Some(def) = filmcraft_project::find_effect(&e.effect).filter(|d| !d.intrinsic) else { continue };
+            if def.id == filmcraft_project::graphic::TEXT_LAYER || def.id == filmcraft_project::graphic::SHAPE_LAYER {
+                let n = seen.entry(e.effect.as_str()).or_insert(0);
+                *n += 1;
+                if *n > have.get(e.effect.as_str()).copied().unwrap_or(0) {
+                    self.report.warn(format!("a text or shape layer added to \"{}\" in FilmCraft is not written to Premiere projects yet", c.name));
+                }
+                continue;
+            }
             let n = seen.entry(e.effect.as_str()).or_insert(0);
             *n += 1;
             if *n <= have.get(e.effect.as_str()).copied().unwrap_or(0) {

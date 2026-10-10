@@ -126,6 +126,7 @@ pub(crate) fn layer_defs() -> Vec<EffectDef> {
                 bo("underline", "Underline", false, X),
                 fl("box_width", "Text Box Width", 0.0, (0.0, 100_000.0), (0.0, 3840.0), "", X),
                 bo("vertical", "Vertical Text", false, X),
+                bo("top_left_origin", "Origin at Top Left", false, X),
             ],
         ),
         layer_def(
@@ -196,6 +197,10 @@ pub struct TextProps {
     pub box_width: f32,
     /// Vertical text (characters stacked top to bottom; columns right to left).
     pub vertical: bool,
+    /// The layer's origin (where Position puts it, what Anchor Point is measured from) is the
+    /// top-left corner of the text's bounds instead of the alignment point on the first baseline
+    /// (titles from Premiere Pro, whose text layers work this way).
+    pub top_left_origin: bool,
     /// Per-character style overrides as *byte* ranges of `text` (sorted, non-overlapping).
     pub runs: Vec<(std::ops::Range<usize>, crate::graphic_design::CharStyle)>,
 }
@@ -287,6 +292,7 @@ pub fn eval_layer(e: &EffectInstance, t: Tick, frame: (u32, u32)) -> Option<Laye
                 underline: bb(e, "underline", t),
                 box_width: ff(e, "box_width", t).max(0.0),
                 vertical: bb(e, "vertical", t),
+                top_left_origin: bb(e, "top_left_origin", t),
             }
         }),
         SHAPE_LAYER => {

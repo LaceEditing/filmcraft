@@ -31,7 +31,21 @@ pub fn xform(a: &Affine) -> Xform {
 /// Layer pixels → graphic canvas pixels (position / anchor / scale / rotation).
 pub fn layer_matrix(spec: &LayerSpec) -> Affine {
     let t = &spec.transform;
-    Affine::motion(t.position, t.scale, t.rotation, t.anchor)
+    let m = Affine::motion(t.position, t.scale, t.rotation, t.anchor);
+    let (ox, oy) = layer_origin(spec);
+    if ox == 0.0 && oy == 0.0 { m } else { m.then_apply(&Affine::translate(-ox as f64, -oy as f64)) }
+}
+
+/// Where a layer's origin is in its layout coordinates: (0, 0), or for text whose origin is the
+/// top-left corner of its bounds ([`TextProps::top_left_origin`]), that corner.
+pub fn layer_origin(spec: &LayerSpec) -> (f32, f32) {
+    match &spec.content {
+        LayerContent::Text(t) if t.top_left_origin => {
+            let b = text_layout(t).bounds;
+            (b[0], b[1])
+        }
+        _ => (0.0, 0.0),
+    }
 }
 
 /// Text style + paragraph style of a text layer.

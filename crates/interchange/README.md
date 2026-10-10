@@ -135,6 +135,18 @@ committed).
   Gaussian Blur): their numeric, angle, boolean and point parameters by name. A name an effect
   uses for several parameters (Lumetri's "Intensity") is not mapped. Choices, colours and the rest
   are listed in the import report and left as they are.
+- Titles (graphics made in Premiere's timeline): the clip's "media" has no file (`FilePath` is a
+  type code, `ImplementationID` `42008e7a-…`, a still `VideoStream` whose `FrameRect` is the
+  canvas) and becomes a FilmCraft graphic item; each `AE.ADBE Text` component becomes a text
+  layer. Its `Source Text` value (`StartKeyframeValue`, base64, often stored once under its
+  `BinaryHash`) is an 8-byte length, the marker `44 33 22 11` and a FlatBuffers buffer; the fields
+  read are listed in `prproj_text.rs` (text runs, font PostScript names, paragraph box and
+  alignment, font size, fill and stroke colours as bytes that are 255 unless stored, stroke width).
+  Premiere measures a text layer from the top-left corner of its text, so these layers get
+  FilmCraft's "Origin at Top Left". Checked against a frame of a video Premiere exported (white
+  "50" with a 26-pixel black stroke, centred in its box). Not read: shadows, backgrounds,
+  gradients, per-character styles. Writing back keeps Premiere's title (its text and formatting
+  are reported when changed in FilmCraft; position, scale, rotation and opacity are written).
 - Markers: `Clip/MarkerOwner/Markers` (before `Clip/Source`) → `Markers` object (class
   `bee50706-…`) → `Markers/Marker` (`First` = GUID, `Second` → `Marker` object with a
   `DVAMarker` JSON value: `mStartTime.ticks`, `mDuration.ticks`, `mName`, `mComment`, `mType`).

@@ -355,3 +355,74 @@ fn the_sequence_premiere_had_open_comes_first_and_stills_get_no_placeholder_dura
     // only as long as its longest use (15 s of source), not Premiere's 60 s / 12 h placeholder
     assert_eq!(m.info.duration, Tick(24 * S));
 }
+
+fn base64_encode(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in b.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// The test project with a title on a second video track, made the way Premiere saves one: a
+/// "Graphic" media without a file (the graphics importer, a still stream the canvas size) and a
+/// text layer component whose `Source Text` holds the title (stored once, by hash).
+pub(crate) fn doc_with_title() -> String {
+    let src = base64_encode(&crate::prproj_text::tests::fifty());
+    let title = format!(
+        r#"
+  <VideoClipTrack ObjectUID="vt2"><ClipTrack><Track><Index>1</Index></Track><ClipItems><TrackItems><TrackItem Index="0" ObjectRef="900"/></TrackItems></ClipItems></ClipTrack></VideoClipTrack>
+  <VideoClipTrackItem ObjectID="900"><ClipTrackItem><ComponentOwner><Components ObjectRef="901"/></ComponentOwner><TrackItem><Start>{s1}</Start><End>{s3}</End></TrackItem><SubClip ObjectRef="902"/></ClipTrackItem></VideoClipTrackItem>
+  <VideoComponentChain ObjectID="901"><ComponentChain><Components><Component Index="0" ObjectRef="910"/></Components></ComponentChain></VideoComponentChain>
+  <SubClip ObjectID="902"><Clip ObjectRef="903"/><MasterClip ObjectURef="gmc"/><Name>Graphic</Name></SubClip>
+  <VideoClip ObjectID="903"><Clip><Source ObjectRef="904"/><InPoint>0</InPoint><OutPoint>{s2}</OutPoint></Clip></VideoClip>
+  <MasterClip ObjectUID="gmc"><Clips><Clip Index="0" ObjectRef="905"/></Clips><Name>Graphic</Name></MasterClip>
+  <VideoClip ObjectID="905"><Clip><Source ObjectRef="904"/></Clip></VideoClip>
+  <VideoMediaSource ObjectID="904"><MediaSource><Media ObjectURef="gmedia"/></MediaSource></VideoMediaSource>
+  <Media ObjectUID="gmedia"><VideoStream ObjectRef="906"/><FilePath>1196574294</FilePath><ImplementationID>42008e7a-de6f-4270-96de-7e287abb9b4b</ImplementationID><Title>Graphic</Title><Infinite>true</Infinite></Media>
+  <VideoStream ObjectID="906"><FrameRate>8467200000</FrameRate><FrameRect>0,0,2560,1440</FrameRect><IsStill>true</IsStill></VideoStream>
+  <VideoFilterComponent ObjectID="910"><Component><Params><Param Index="0" ObjectRef="911"/><Param Index="1" ObjectRef="912"/><Param Index="2" ObjectRef="913"/><Param Index="3" ObjectRef="914"/></Params><DisplayName>Text</DisplayName><InstanceName>50</InstanceName></Component><MatchName>AE.ADBE Text</MatchName></VideoFilterComponent>
+  <ArbVideoComponentParam ObjectID="911"><Name>Source Text</Name><StartKeyframeValue Encoding="base64" BinaryHash="tt-1"/></ArbVideoComponentParam>
+  <PointComponentParam ObjectID="912"><Name>Position</Name><StartKeyframe>-91445760000000000,0.0946:0.5449,0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe></PointComponentParam>
+  <VideoComponentParam ObjectID="913"><Name>Scale</Name><StartKeyframe>-91445760000000000,100.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="914"><Name>Horizontal Scale</Name><StartKeyframe>-91445760000000000,100.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <Blob ObjectID="915"><Data Encoding="base64" BinaryHash="tt-1">{src}</Data></Blob>
+</PremiereData>"#,
+        s1 = S,
+        s2 = 2 * S,
+        s3 = 3 * S
+    );
+    doc()
+        .replace(
+            r#"<Tracks><Track Index="0" ObjectURef="vt1"/></Tracks>"#,
+            r#"<Tracks><Track Index="0" ObjectURef="vt1"/><Track Index="1" ObjectURef="vt2"/></Tracks>"#,
+        )
+        .replace("</PremiereData>", &title)
+}
+
+#[test]
+fn premiere_titles_come_in_as_graphics_with_their_text() {
+    let (imp, report) = import(doc_with_title().as_bytes(), Some("/edits/show"));
+    let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    let clip = seq.video_tracks[1].items.first().expect("the title clip");
+    let item = imp.project.item(clip.item).unwrap();
+    assert!(matches!(item.kind, filmcraft_project::ItemKind::Graphic { width: 2560, height: 1440, .. }), "{:?}", item.kind);
+    let e = clip.effect("graphic_text").expect("a text layer");
+    let v = |id: &str| e.params.get(id).map(|p| p.value.clone()).unwrap();
+    assert_eq!(v("text"), ParamValue::Text("50".into()));
+    assert_eq!((v("font"), v("font_style")), (ParamValue::Text("FatFrank".into()), ParamValue::Text("Heavy".into())));
+    assert!(matches!(v("size"), ParamValue::Float(s) if (s - 399.41).abs() < 1e-2));
+    assert_eq!(
+        (v("stroke"), v("stroke_width"), v("box_width"), v("align")),
+        (ParamValue::Bool(true), ParamValue::Float(26.0), ParamValue::Float(2125.0), ParamValue::Choice(1))
+    );
+    assert_eq!(v("top_left_origin"), ParamValue::Bool(true));
+    let ParamValue::Vec2(p) = v("position") else { panic!() };
+    assert!((p.x - 0.0946 * 2560.0).abs() < 0.01 && (p.y - 0.5449 * 1440.0).abs() < 0.01, "{p:?}");
+    assert!(!report.to_string().contains("Source Text"), "{report}");
+    assert!(!report.to_string().contains("no file path"), "not offline: {report}");
+}

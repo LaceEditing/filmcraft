@@ -258,7 +258,8 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                     app.auto.add(&format!("program.layer.{}.{}.handle.{n}", v.clip.0, v.layer), hr.expand(4.0), "scale handle");
                 }
                 // anchor point
-                let a = sp(&v.to_screen, v.spec.transform.anchor.x as f32, v.spec.transform.anchor.y as f32);
+                let (ox, oy) = filmcraft_render::graphic_clip::layer_origin(&v.spec);
+                let a = sp(&v.to_screen, v.spec.transform.anchor.x as f32 + ox, v.spec.transform.anchor.y as f32 + oy);
                 painter.circle_stroke(a, 4.0, Stroke::new(1.0, accent));
                 painter.line_segment([a - vec2(6.0, 0.0), a + vec2(6.0, 0.0)], Stroke::new(1.0, accent));
                 painter.line_segment([a - vec2(0.0, 6.0), a + vec2(0.0, 6.0)], Stroke::new(1.0, accent));
@@ -419,7 +420,8 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                 DragKind::Scale(n) if moved => {
                     if let Some(v) = v {
                         // the layer scales about its anchor, so it also moves to keep the pinned side still
-                        let a = sp(&v.to_screen, v.spec.transform.anchor.x as f32, v.spec.transform.anchor.y as f32);
+                        let (ox, oy) = filmcraft_render::graphic_clip::layer_origin(&v.spec);
+                        let a = sp(&v.to_screen, v.spec.transform.anchor.x as f32 + ox, v.spec.transform.anchor.y as f32 + oy);
                         let h = HandleScale::new(&v.quad(), n, d.start, cur);
                         let off = h.apply(a) - a;
                         let lin = Affine { e: 0.0, f: 0.0, ..v.canvas_to_screen };

@@ -25,7 +25,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use filmcraft_media::MediaKind;
-use filmcraft_project::{BinId, ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, Sequence, TrackKind, Transition, TransitionAlign, TransitionId};
+use filmcraft_project::{
+    BinId, ClipId, ItemId, ItemKind, Label, Marker, MarkerId, MarkerKind, Param, ParamValue, Sequence, TrackKind, Transition, TransitionAlign, TransitionId,
+};
 use filmcraft_time::{FrameRate, Tick};
 use roxmltree::Node;
 
@@ -44,6 +46,12 @@ pub const META_SEQUENCE: &str = "premiere.sequence";
 pub const META_SOURCE: &str = "premiere.source";
 /// Sequence item metadata: the fingerprint of that document when it was imported.
 pub const META_FINGERPRINT: &str = "premiere.fingerprint";
+
+/// The importer Premiere records for graphics (titles) made in the timeline: their "media" has no
+/// file (`FilePath` is a type code) and a still video stream the size of the canvas.
+const GRAPHIC_IMPORTER: &str = "42008e7a-de6f-4270-96de-7e287abb9b4b";
+/// Premiere's text layer component.
+const TEXT_COMPONENT: &str = "AE.ADBE Text";
 
 /// Nested bins deeper than this are not followed.
 const MAX_DEPTH: usize = 64;
@@ -80,6 +88,8 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
     let name = opts.name.clone().unwrap_or_else(|| "Premiere Project".to_string());
     let mut imp = Imp {
         b: Builder::new(&name),
+        root,
+        payloads: None,
         ix: Index::new(root),
         opts,
         report,
@@ -135,6 +145,9 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
 
 struct Imp<'a, 'i, 'r> {
     b: Builder,
+    root: Node<'a, 'i>,
+    /// Binary payloads by hash (read on first use).
+    payloads: Option<HashMap<&'a str, &'a str>>,
     ix: Index<'a, 'i>,
     opts: &'r ImportOptions,
     report: &'r mut Report,
@@ -272,6 +285,9 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         if let Some(id) = self.b.find_media(key) {
             return Some(id);
         }
+        if child_text(media, "ImplementationID").is_some_and(|i| i.trim().eq_ignore_ascii_case(GRAPHIC_IMPORTER)) {
+            return Some(self.graphic(media, key));
+        }
         let path = self.media_path(media);
         if path.is_empty() {
             self.report.warn(format!("media \"{}\" has no file path and was not imported", name.unwrap_or("?")));
@@ -326,6 +342,107 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             it.metadata.insert(META_MEDIA.to_string(), uid.to_string());
         }
         Some(id)
+    }
+
+    /// A graphic made in Premiere's timeline (its titles): a FilmCraft graphic item the size of its
+    /// canvas, whose clips get the text layers of their `AE.ADBE Text` components.
+    fn graphic(&mut self, media: Node<'a, 'i>, key: &str) -> ItemId {
+        let v = self.ix.follow(media, &["VideoStream"]);
+        let (width, height) = v.and_then(|v| frame_rect(child_text(v, "FrameRect"))).unwrap_or((1920, 1080));
+        let rate = v.and_then(|v| child_text(v, "FrameRate")).and_then(parse_i64).and_then(rate_of).unwrap_or(FrameRate::FPS_30);
+        let name = child_text(media, "Title").unwrap_or("Graphic");
+        let id = self.b.p.add_item(name, Label::Rose, ItemKind::Graphic { width, height, rate }, None);
+        self.b.register_media(key, id);
+        if let Some(uid) = media.attribute("ObjectUID")
+            && let Some(it) = self.b.p.item_mut(id)
+        {
+            it.metadata.insert(META_MEDIA.to_string(), uid.to_string());
+        }
+        id
+    }
+
+    /// The bytes of a binary value (`Encoding="base64"`), stored in the element or, when another
+    /// element with the same `BinaryHash` holds them, there.
+    fn binary(&mut self, el: Node<'a, 'i>) -> Option<Vec<u8>> {
+        let own = el.text().map(str::trim).filter(|t| !t.is_empty());
+        let text = match own {
+            Some(t) => t,
+            None => {
+                let hash = el.attribute("BinaryHash")?;
+                let root = self.root;
+                let map = self.payloads.get_or_insert_with(|| {
+                    let mut m = HashMap::new();
+                    for n in root.descendants().filter(Node::is_element) {
+                        if let (Some(h), Some(t)) = (n.attribute("BinaryHash"), n.text().map(str::trim).filter(|t| !t.is_empty())) {
+                            m.entry(h).or_insert(t);
+                        }
+                    }
+                    m
+                });
+                map.get(hash).copied()?
+            }
+        };
+        crate::prproj_text::base64(text)
+    }
+
+    /// A Premiere text layer as a FilmCraft text layer: the decoded `Source Text` (text, font,
+    /// size, fill, stroke, paragraph box and alignment) and the layer's transform.
+    fn title(&mut self, ti: &mut filmcraft_project::TrackItem, c: &prproj_fx::Component<'a, 'i>, ctx: &Ctx) {
+        let Some(def) = filmcraft_project::effect::find_effect(filmcraft_project::graphic::TEXT_LAYER) else { return };
+        let source = c.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim() == "Source Text"));
+        let decoded = source.and_then(|p| child(p, "StartKeyframeValue")).and_then(|v| self.binary(v)).and_then(|b| crate::prproj_text::decode(&b));
+        let Some(t) = decoded else {
+            self.report.warn("a Premiere title's text could not be read; it was imported empty");
+            ti.effects.push(def.instance());
+            return;
+        };
+        if source.is_some_and(|p| child(p, "Keyframes").is_some()) {
+            self.report.info("animated title text was imported as its first value");
+        }
+        let mut e = def.instance();
+        let mut set = |id: &str, v: ParamValue| {
+            e.params.insert(id.to_string(), Param::new(v));
+        };
+        set("text", ParamValue::Text(t.text.clone()));
+        if let Some(ps) = &t.font {
+            let (family, style) = crate::prproj_text::font_family_style(ps);
+            set("font", ParamValue::Text(family));
+            set("font_style", ParamValue::Text(style));
+        }
+        set("size", ParamValue::Float(f64::from(t.size)));
+        set("align", ParamValue::Choice(t.align));
+        if let Some((w, _)) = t.area {
+            set("box_width", ParamValue::Float(f64::from(w)));
+        }
+        set("top_left_origin", ParamValue::Bool(true));
+        let rgb = |c: [u8; 3]| ParamValue::Color([f32::from(c[0]) / 255.0, f32::from(c[1]) / 255.0, f32::from(c[2]) / 255.0, 1.0]);
+        set("fill_color", rgb(t.fill));
+        if let Some((colour, width)) = t.stroke {
+            set("stroke", ParamValue::Bool(true));
+            set("stroke_color", rgb(colour));
+            set("stroke_width", ParamValue::Float(f64::from(width)));
+        }
+        // the transform, by name as for any effect
+        let (maps, unmapped) = prproj_fx::mappings(c, prproj_fx::Target::Effect(def));
+        for m in maps {
+            if let Some(p) = prproj_fx::import_param(&m, ctx) {
+                e.params.insert(m.param.to_string(), p);
+            }
+        }
+        // Horizontal Scale is FilmCraft's Scale Width
+        if let Some(hs) = c.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim() == "Horizontal Scale"))
+            && let Some(v) = prproj_fx::start_value(hs).and_then(|v| v.trim_end_matches('.').parse::<f64>().ok())
+            && (v - 100.0).abs() > 1e-6
+        {
+            e.params.insert("scale_width".into(), Param::new(ParamValue::Float(v)));
+            e.params.insert("uniform_scale".into(), Param::new(ParamValue::Bool(false)));
+        }
+        const READ: [&str; 8] = ["Source Text", "Transform", "Horizontal Scale", "Parent Width", "Parent Height", "Parent Rotation", "start", "end"];
+        let rest: Vec<String> = unmapped.into_iter().filter(|n| !READ.contains(&n.as_str())).collect();
+        if !rest.is_empty() {
+            self.unmapped.entry("Text".to_string()).or_default().extend(rest);
+        }
+        ti.effects.push(e);
     }
 
     /// Where the media file is: Premiere's project-relative path when it is a plain relative path
@@ -484,7 +601,12 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     fn components(&mut self, ti: &mut filmcraft_project::TrackItem, chain: Node<'a, 'i>, ctx: &Ctx) {
         let comps = prproj_fx::chain(&self.ix, chain);
         let targets = prproj_fx::targets(&comps);
+        let titled = self.b.p.item(ti.item).is_some_and(|i| matches!(i.kind, ItemKind::Graphic { .. }));
         for (c, target) in comps.iter().zip(targets) {
+            if titled && c.match_name == TEXT_COMPONENT {
+                self.title(ti, c, ctx);
+                continue;
+            }
             match target {
                 Target::Ignore => continue,
                 Target::Unsupported => {
@@ -580,6 +702,7 @@ pub(crate) fn source_frame(p: &filmcraft_project::Project, item: ItemId) -> Opti
     match &p.item(item)?.kind {
         filmcraft_project::ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width as f64, v.height as f64)),
         filmcraft_project::ItemKind::Sequence(s) => Some((s.settings.width as f64, s.settings.height as f64)),
+        filmcraft_project::ItemKind::Graphic { width, height, .. } => Some((*width as f64, *height as f64)),
         _ => None,
     }
 }

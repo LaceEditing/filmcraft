@@ -391,3 +391,26 @@ fn effects_choices_and_colours_added_in_filmcraft_are_written() {
     assert_eq!(b.effect("tint").unwrap().params["amount"].value, ParamValue::Float(100.0));
     assert_eq!(a.effects.iter().filter(|e| !filmcraft_project::find_effect(&e.effect).is_some_and(|d| d.intrinsic)).count(), 2, "{report}");
 }
+
+#[test]
+fn titles_round_trip_and_text_edits_are_reported() {
+    let plain = crate::prproj::tests::doc_with_title();
+    let (imp, _) = import(plain.as_bytes(), Some("/edits/show"));
+    let (out, report) = export(&imp.project, plain.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), plain, "unchanged: {report}");
+    // a moved title is written; its new text is reported, not written
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let clip = &mut p.sequence_mut(sid).unwrap().video_tracks[1].items[0];
+        clip.start = Tick(4 * S);
+        clip.effect_mut("graphic_text").unwrap().params.insert("text".into(), Param::new(ParamValue::Text("60".into())));
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let back = read(&out);
+    let seq = back.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    assert_eq!(seq.video_tracks[1].items[0].start, Tick(4 * S));
+    assert!(report.to_string().contains("changes to its text or formatting are not written"), "{report}");
+    let t = seq.video_tracks[1].items[0].effect("graphic_text").unwrap();
+    assert_eq!(t.params.get("text").map(|x| x.value.clone()), Some(ParamValue::Text("50".into())), "Premiere keeps its text");
+}

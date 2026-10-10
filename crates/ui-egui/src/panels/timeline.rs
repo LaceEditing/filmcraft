@@ -643,6 +643,13 @@ fn draw_clip(
     // name band
     if w > 24.0 {
         let mut label = it.name.clone();
+        // a graphic clip that was not renamed shows its text, as in Premiere
+        if label == "Graphic"
+            && app.session.project.item(it.item).is_some_and(|i| matches!(i.kind, filmcraft_project::ItemKind::Graphic { .. }))
+            && let Some(text) = graphic_text_label(it)
+        {
+            label = text;
+        }
         if let Some(m) = it.multicam.filter(|m| m.enabled) {
             let cam = app.session.project.sequence(it.item).and_then(|q| q.cameras().cameras.get(m.angle as usize).map(|c| c.name.clone()));
             label = format!("[MC{}] {}", m.angle + 1, cam.unwrap_or(label));
@@ -2254,6 +2261,14 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         }
     }
     app.auto.add("timeline.tracks", layout.content, "tracks");
+}
+
+/// The first line of a graphic clip's first non-empty text layer.
+fn graphic_text_label(it: &filmcraft_project::TrackItem) -> Option<String> {
+    it.effects.iter().filter(|e| e.effect == filmcraft_project::graphic::TEXT_LAYER).find_map(|e| match e.params.get("text").map(|p| &p.value) {
+        Some(filmcraft_project::ParamValue::Text(t)) => t.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
