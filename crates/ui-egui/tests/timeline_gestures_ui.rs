@@ -407,3 +407,84 @@ fn editing_keys_do_what_they_say() {
     d.key("K");
     assert!(!play(&d).0);
 }
+
+/// The centre of the automation element `id` (screen points).
+fn centre(d: &mut Driver, id: &str) -> (f64, f64) {
+    let els = d.ok("ui.elements", json!({"prefix": id}));
+    let e = els.as_array().and_then(|a| a.iter().find(|e| e["id"] == json!(id))).cloned().unwrap_or_else(|| panic!("no element {id}: {els}"));
+    let r = &e["rect"];
+    (r[0].as_f64().unwrap() + r[2].as_f64().unwrap() / 2.0, r[1].as_f64().unwrap() + r[3].as_f64().unwrap() / 2.0)
+}
+
+/// A clip dragged into the empty space below the last audio track lands on a new audio track
+/// (as in Premiere), in one undo step; above the top video track, on a new video track.
+#[test]
+fn dragging_past_the_last_track_makes_a_new_one() {
+    let mut d = Driver::new();
+    let [_, b, c] = three_clips(&mut d);
+    let sound_c = d.app().session.active_sequence().unwrap().audio_tracks[0].items[2].id;
+    // take only C's sound (Alt-click selects one side of the link), then drag it below A1
+    let ya = d.y(sound_c);
+    d.exec("edit.deselectAll", json!({}));
+    d.click(d.x(120.0), ya, json!({"alt": true}));
+    assert_eq!(d.selected(), vec![sound_c]);
+    let steps = d.app().session.history.undo.len();
+    d.drag((d.x(120.0), ya), (d.x(120.0), ya + 70.0), json!({}));
+    let q = d.app().session.active_sequence().unwrap();
+    assert_eq!(q.audio_tracks.len(), 2, "a new audio track");
+    assert_eq!(q.audio_tracks[1].items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![sound_c], "with the sound on it");
+    assert_eq!(d.app().session.history.undo.len(), steps + 1, "one undo step");
+    d.undo();
+    assert_eq!(d.app().session.active_sequence().unwrap().audio_tracks.len(), 1, "undo takes the track away too");
+    // C's picture dragged above V2 (the top video track): a new V3
+    let yv = d.y(c);
+    d.exec("edit.deselectAll", json!({}));
+    d.click(d.x(120.0), yv, json!({"alt": true}));
+    let top = d.ok("ui.elements", json!({"prefix": "timeline.track.V2.header"}));
+    let v2_top = top[0]["rect"][1].as_f64().unwrap();
+    d.drag((d.x(120.0), yv), (d.x(120.0), v2_top - 20.0), json!({}));
+    let q = d.app().session.active_sequence().unwrap();
+    assert_eq!(q.video_tracks.len(), 3, "a new video track");
+    assert_eq!(q.video_tracks[2].items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![c]);
+    assert!(q.video_tracks[0].items.iter().any(|i| i.id == b), "B stayed");
+}
+
+/// Right-click on a track header: Rename, Add Track (right after it), Add Audio Submix Track,
+/// Add Tracks…, Delete Track, Delete Tracks…, as Premiere's track menu.
+#[test]
+fn track_header_menu_adds_renames_and_deletes_tracks() {
+    let mut d = Driver::new();
+    three_clips(&mut d);
+    let menu = |d: &mut Driver, header: &str, item: &str| {
+        let (x, y) = centre(d, header);
+        // on the lock button: the header's menu opens wherever it is right-clicked
+        d.ok("ui.click", json!({"x": x - 53.0, "y": y, "button": "right"}));
+        d.frames(4);
+        d.ok("ui.click", json!({"id": format!("timeline.trackMenu.{item}")}));
+        d.frames(4);
+    };
+    // Add Track on A1: A2 after it
+    menu(&mut d, "timeline.track.A1.header", "addTrack");
+    assert_eq!(d.app().session.active_sequence().unwrap().audio_tracks.len(), 2);
+    // Add Track on V1: inserted right after V1 (the old V2 becomes V3)
+    let old_v2 = d.app().session.active_sequence().unwrap().video_tracks[1].id;
+    menu(&mut d, "timeline.track.V1.header", "addTrack");
+    let q = d.app().session.active_sequence().unwrap();
+    assert_eq!(q.video_tracks.len(), 3);
+    assert_eq!(q.video_tracks[2].id, old_v2, "the new track went between V1 and the old V2");
+    // Rename A2
+    menu(&mut d, "timeline.track.A2.header", "rename");
+    assert!(d.app().tl.renaming.is_some(), "an editor opened");
+    d.ok("ui.key", json!({"key": "Cmd+A"}));
+    d.ok("ui.type", json!({"text": "Music"}));
+    d.key("Enter");
+    assert_eq!(d.app().session.active_sequence().unwrap().audio_tracks[1].name, "Music");
+    // Delete Track on the renamed one
+    menu(&mut d, "timeline.track.A2.header", "deleteTrack");
+    let q = d.app().session.active_sequence().unwrap();
+    assert_eq!(q.audio_tracks.len(), 1);
+    // Add Tracks… opens the dialog, set to add after the clicked track
+    menu(&mut d, "timeline.track.V1.header", "addTracks");
+    assert!(matches!(d.app().dialog, Some(filmcraft_ui_egui::Dialog::AddTracks)));
+    assert_eq!(d.app().ui.add_tracks.video_after, 1);
+}

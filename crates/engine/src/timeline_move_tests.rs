@@ -292,3 +292,61 @@ fn copy_to_places_copies_and_keeps_the_originals() {
     assert!(s.execute("timeline.copyTo", json!({"moves": []})).is_err());
     assert_eq!(s.history.undo.len(), undo + 1, "only the lock was a change");
 }
+
+/// A clip dragged below the last audio track (or above the top video track) lands on a new
+/// track: `timeline.move` / `timeline.copyTo` naming a track past the last one add it, in the same
+/// undo step as the move; a move that fails leaves no new track behind.
+#[test]
+fn moving_past_the_last_track_adds_one() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let (_, v, _, a) = pair_in_an_empty_sequence(&mut s, 1.0);
+    let undo = s.history.undo.len();
+    s.execute("timeline.move", json!({"moves": [{"clip": a.id.0, "track": "A3", "time": a.start.0}], "linked": false, "addTracks": true})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.audio_tracks.len(), 3, "a third audio track was added");
+    assert_eq!(state(&s, a.id).0, q.audio_tracks[2].id);
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    s.undo();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.audio_tracks.len(), 2, "undo takes the track away with the move");
+    assert_eq!(state(&s, a.id).0, q.audio_tracks[0].id);
+    // a copy above the top video track
+    s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": "V3", "time": v.start.0}], "addTracks": true})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.video_tracks.len(), 3);
+    assert_eq!(q.video_tracks[2].items.len(), 1, "the copy is on the new track");
+    // a failing move adds nothing
+    let tracks = s.active_sequence().unwrap().audio_tracks.len();
+    assert!(s.execute("timeline.move", json!({"moves": [{"clip": 999_999, "track": "A9", "time": 0}], "addTracks": true})).is_err());
+    assert_eq!(s.active_sequence().unwrap().audio_tracks.len(), tracks);
+    assert!(s.execute("timeline.move", json!({"moves": [{"clip": a.id.0, "track": "A40", "time": 0}], "addTracks": true})).is_err(), "too many at once");
+    // without addTracks a missing track stays an error
+    assert!(s.execute("timeline.move", json!({"moves": [{"clip": a.id.0, "track": "A9", "time": 0}]})).is_err());
+    assert_eq!(s.active_sequence().unwrap().audio_tracks.len(), tracks);
+}
+
+/// A Project item dropped past the last track: `timeline.place` naming tracks past the last adds
+/// them (only for the streams the item has), in the clip's undo step.
+#[test]
+fn placing_past_the_last_track_adds_one() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    s.execute("file.newSequence", json!({"name": "Drops", "video": 1, "audio": 1})).unwrap();
+    let item = s.project.items.values().find(|i| i.has_video() && i.has_audio() && i.as_media().is_some()).map(|i| i.id).unwrap();
+    let undo = s.history.undo.len();
+    let r = s.execute("timeline.place", json!({"item": item.0, "track": "V1", "audioTrack": "A2", "time": 0, "addTracks": true})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (1, 2), "{r}");
+    assert_eq!(q.audio_tracks[1].items.len(), 1);
+    assert_eq!(s.history.undo.len(), undo + 1);
+    s.execute("timeline.place", json!({"item": item.0, "track": "V2", "audioTrack": "A1", "time": 0, "addTracks": true})).unwrap();
+    assert_eq!(s.active_sequence().unwrap().video_tracks.len(), 2);
+    // a sound-only item adds no video track
+    if let Some(sound) = s.project.items.values().find(|i| !i.has_video() && i.has_audio()).map(|i| i.id) {
+        let v = s.active_sequence().unwrap().video_tracks.len();
+        s.execute("timeline.place", json!({"item": sound.0, "audioTrack": "A3", "time": 0, "addTracks": true})).unwrap();
+        let q = s.active_sequence().unwrap();
+        assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (v, 3));
+    }
+}

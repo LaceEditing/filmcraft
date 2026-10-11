@@ -245,6 +245,112 @@ pub(crate) fn item_p(p: &Value, k: &str) -> Option<ItemId> {
     u64_p(p, k).map(ItemId)
 }
 
+/// `timeline.place` on existing tracks (see [`on_new_tracks`] for tracks past the last).
+fn place_clip(s: &mut Session, p: &Value) -> Result<Value> {
+    let item = item_p(p, "item").ok_or_else(|| bad("timeline.place", "need `item`"))?;
+    let at = time_p(s, p, "").unwrap_or(s.playhead());
+    let tg = s.targeting();
+    let pi = s.project.item(item).ok_or_else(|| bad("timeline.place", "no such item"))?;
+    let is_audio = |t: TrackId| s.active_sequence().is_some_and(|q| q.audio_tracks.iter().any(|x| x.id == t));
+    // `track` is where the picture goes and `audioTrack` where the sound goes. A caller that
+    // names an audio track as `track` asks for the sound alone, on that track.
+    let (v, a) = match (track_p(s, p, "track", "timeline.place")?, track_p(s, p, "audioTrack", "timeline.place")?) {
+        (Some(t), Some(_)) if is_audio(t) => {
+            return Err(bad("timeline.place", "`track` names an audio track and `audioTrack` is given as well: name the sound's track once"));
+        }
+        (_, Some(t)) if !is_audio(t) => return Err(bad("timeline.place", "`audioTrack` names a video track")),
+        (Some(t), None) if is_audio(t) && !pi.has_audio() => {
+            return Err(bad("timeline.place", "`track` names an audio track and this item has no sound"));
+        }
+        (Some(t), None) if is_audio(t) => (None, Some(t)),
+        (Some(_), None) if !pi.has_video() => {
+            return Err(bad("timeline.place", "`track` names a video track and this item has no picture: name an audio track"));
+        }
+        (v, a) => (v.or(tg.video_dest), a.or(tg.audio_dest)),
+    };
+    let full = match &pi.kind {
+        // Settings ▸ Timeline ▸ Still Image Default Duration
+        ItemKind::Media(m)
+            if matches!(m.info.kind, filmcraft_media::MediaKind::Still)
+                || (matches!(m.info.kind, filmcraft_media::MediaKind::Synthetic) && m.info.duration.0 <= 0) =>
+        {
+            s.prefs.timeline.still_duration(s.sequence_rate())
+        }
+        _ => pi.duration(),
+    };
+    let (mi, mo) = match &pi.kind {
+        ItemKind::Media(m) => (m.mark_in, m.mark_out.map(|o| o + pi.frame_rate().frame_duration())),
+        ItemKind::Subclip { range, .. } => (Some(range.start), Some(range.end())),
+        _ => (None, None),
+    };
+    let sin = p.get("sourceIn").and_then(Value::as_i64).map(Tick).or(mi).unwrap_or_default();
+    let dur = p.get("duration").and_then(Value::as_i64).map(Tick).unwrap_or_else(|| mo.unwrap_or(full) - sin);
+    let ids = place_item(s, item, TimeRange::new(sin, dur), at, v, a, bool_p(p, "insert").unwrap_or(false), "Place Clip", None)?;
+    Ok(json!({"clips": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))
+}
+
+/// `timeline.move` / `timeline.copyTo` / `timeline.place` with `"addTracks": true` naming tracks
+/// past the last of their kind ("A4" in a sequence with three audio tracks: a clip or a Project
+/// item dragged below the last audio track, or above the top video track): the missing tracks are
+/// added after the last one first, then the edit runs, as one undo step. When the edit fails the
+/// new tracks go away. Without `addTracks` a missing track is an error, as everywhere.
+fn on_new_tracks(s: &mut Session, p: &Value, cmd: &str, run: fn(&mut Session, &Value) -> Result<Value>) -> Result<Value> {
+    // only when asked: otherwise naming a missing track stays an error (never a silent default)
+    if p.get("addTracks").and_then(Value::as_bool) != Some(true) {
+        return run(s, p);
+    }
+    let Some(q) = s.active_sequence() else { return run(s, p) };
+    let (have_v, have_a) = (q.video_tracks.len(), q.audio_tracks.len());
+    let (mut need_v, mut need_a) = (0usize, 0usize);
+    // a placed item adds tracks only for the streams it has
+    let placed = item_p(p, "item").and_then(|i| s.project.item(i)).map(|i| (i.has_video(), i.has_audio()));
+    let named = p
+        .get("moves")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("track"))
+        .chain(["track", "audioTrack"].iter().filter_map(|k| p.get(*k)));
+    for v in named {
+        let Some(name) = v.as_str() else { continue };
+        let mut rest = name.trim().chars();
+        let (kind, n) = match (rest.next(), rest.as_str().parse::<usize>()) {
+            (Some(k), Ok(n)) if n > 0 => (k.to_ascii_uppercase(), n),
+            _ => continue,
+        };
+        match kind {
+            'V' if n > have_v && placed.is_none_or(|(video, _)| video) => need_v = need_v.max(n - have_v),
+            'A' if n > have_a && placed.is_none_or(|(_, audio)| audio) => need_a = need_a.max(n - have_a),
+            _ => {}
+        }
+    }
+    if need_v + need_a == 0 {
+        return run(s, p);
+    }
+    if need_v + need_a > 8 {
+        return Err(bad(cmd, "an edit adds at most 8 tracks"));
+    }
+    crate::sequence_tools::add_tracks(s, &json!({"video": need_v, "audio": need_a}))?;
+    let mark = s.history.undo.len();
+    match run(s, p) {
+        Ok(v) => {
+            // the new tracks and the move are one undo step
+            if mark >= 1
+                && s.history.undo.len() == mark + 1
+                && let (Some((label, _)), Some((_, before))) = (s.history.undo.pop(), s.history.undo.pop())
+            {
+                s.history.undo.push((label, before));
+            }
+            Ok(v)
+        }
+        Err(e) => {
+            s.undo();
+            s.history.redo.pop();
+            Err(e)
+        }
+    }
+}
+
 /// `timeline.move`: move the listed clips to (track, time). With Linked Selection on (or
 /// `linked: true`) the linked partners of a listed clip that are not listed themselves follow by
 /// the same time offset on their own tracks, so picture and sound stay in sync; a partner on a
@@ -1776,50 +1882,9 @@ fn build() -> Vec<CommandSpec> {
             "Place Clip",
             [],
             None,
-            r#"{"item":id,"track":"V1"|id|"A1" (sound only)?,"audioTrack":"A1"|id?,"time":ticks|"frame":i64|"seconds":f64,"insert":bool,"sourceIn":ticks?,"duration":ticks?}"#,
+            r#"{"item":id,"track":"V1"|id|"A1" (sound only)?,"audioTrack":"A1"|id?,"time":ticks|"frame":i64|"seconds":f64,"insert":bool,"sourceIn":ticks?,"duration":ticks?,"addTracks":bool (tracks named past the last are added)?}"#,
             has_seq,
-            |s, p| {
-                let item = item_p(p, "item").ok_or_else(|| bad("timeline.place", "need `item`"))?;
-                let at = time_p(s, p, "").unwrap_or(s.playhead());
-                let tg = s.targeting();
-                let pi = s.project.item(item).ok_or_else(|| bad("timeline.place", "no such item"))?;
-                let is_audio = |t: TrackId| s.active_sequence().is_some_and(|q| q.audio_tracks.iter().any(|x| x.id == t));
-                // `track` is where the picture goes and `audioTrack` where the sound goes. A caller that
-                // names an audio track as `track` asks for the sound alone, on that track.
-                let (v, a) = match (track_p(s, p, "track", "timeline.place")?, track_p(s, p, "audioTrack", "timeline.place")?) {
-                    (Some(t), Some(_)) if is_audio(t) => {
-                        return Err(bad("timeline.place", "`track` names an audio track and `audioTrack` is given as well: name the sound's track once"));
-                    }
-                    (_, Some(t)) if !is_audio(t) => return Err(bad("timeline.place", "`audioTrack` names a video track")),
-                    (Some(t), None) if is_audio(t) && !pi.has_audio() => {
-                        return Err(bad("timeline.place", "`track` names an audio track and this item has no sound"));
-                    }
-                    (Some(t), None) if is_audio(t) => (None, Some(t)),
-                    (Some(_), None) if !pi.has_video() => {
-                        return Err(bad("timeline.place", "`track` names a video track and this item has no picture: name an audio track"));
-                    }
-                    (v, a) => (v.or(tg.video_dest), a.or(tg.audio_dest)),
-                };
-                let full = match &pi.kind {
-                    // Settings ▸ Timeline ▸ Still Image Default Duration
-                    ItemKind::Media(m)
-                        if matches!(m.info.kind, filmcraft_media::MediaKind::Still)
-                            || (matches!(m.info.kind, filmcraft_media::MediaKind::Synthetic) && m.info.duration.0 <= 0) =>
-                    {
-                        s.prefs.timeline.still_duration(s.sequence_rate())
-                    }
-                    _ => pi.duration(),
-                };
-                let (mi, mo) = match &pi.kind {
-                    ItemKind::Media(m) => (m.mark_in, m.mark_out.map(|o| o + pi.frame_rate().frame_duration())),
-                    ItemKind::Subclip { range, .. } => (Some(range.start), Some(range.end())),
-                    _ => (None, None),
-                };
-                let sin = p.get("sourceIn").and_then(Value::as_i64).map(Tick).or(mi).unwrap_or_default();
-                let dur = p.get("duration").and_then(Value::as_i64).map(Tick).unwrap_or_else(|| mo.unwrap_or(full) - sin);
-                let ids = place_item(s, item, TimeRange::new(sin, dur), at, v, a, bool_p(p, "insert").unwrap_or(false), "Place Clip", None)?;
-                Ok(json!({"clips": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))
-            }
+            |s, p| on_new_tracks(s, p, "timeline.place", place_clip)
         ),
         cmd!("timeline.select", "Select Clips", [], None, r#"{"clips":[id],"add":bool,"toggle":bool}"#, has_seq, |s, p| {
             let clips: Vec<ClipId> =
@@ -1853,11 +1918,19 @@ fn build() -> Vec<CommandSpec> {
             "Move Clips",
             [],
             None,
-            r#"{"moves":[{"clip":id,"track":id|"V2","time":ticks}],"insert":bool,"linked":bool?}"#,
+            r#"{"moves":[{"clip":id,"track":id|"V2","time":ticks}],"insert":bool,"linked":bool?,"addTracks":bool (tracks named past the last are added)?}"#,
             has_seq,
-            move_clips
+            |s, p| on_new_tracks(s, p, "timeline.move", move_clips)
         ),
-        cmd!("timeline.copyTo", "Copy Clips", [], None, r#"{"moves":[{"clip":id,"track":id|"V2","time":ticks}],"insert":bool}"#, has_seq, copy_clips),
+        cmd!(
+            "timeline.copyTo",
+            "Copy Clips",
+            [],
+            None,
+            r#"{"moves":[{"clip":id,"track":id|"V2","time":ticks}],"insert":bool,"addTracks":bool (tracks named past the last are added)?}"#,
+            has_seq,
+            |s, p| on_new_tracks(s, p, "timeline.copyTo", copy_clips)
+        ),
         cmd!(
             "timeline.trim",
             "Trim Edit",

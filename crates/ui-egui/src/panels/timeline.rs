@@ -48,6 +48,8 @@ pub struct TlState {
     /// display gain: scanning the whole source per clip per frame cost more than drawing.
     peak_max: HashMap<ItemId, (usize, f32)>,
     zoom_anchor: Option<(f64, f32)>,
+    /// A track being renamed from its header menu: the track and the name typed so far.
+    pub renaming: Option<(TrackId, String)>,
 }
 
 impl TlState {
@@ -345,9 +347,26 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let visible = (layout.tick_at(content.min.x - 2.0), layout.tick_at(content.max.x + 2.0));
     let selection: Vec<ClipId> = app.session.state.selection.clone();
     let mut previews: HashMap<ClipId, (Tick, Tick, Option<TrackId>)> = HashMap::new(); // live drag preview: (start, dur, track)
-    preview_drag(app, &seq, &layout, &mut previews);
+    let mut onto_new: Vec<(ClipId, TrackKind, usize)> = Vec::new();
+    preview_drag(app, &seq, &layout, &mut previews, &mut onto_new);
     // an Alt-drag copies: the clips stay and their copies follow the pointer
     let copying = matches!(app.tl.drag, Some(Drag::Move { .. })) && ui.input(|i| i.modifiers.alt);
+    // clips dragged past the last track: ghosts where the new track will be
+    for (cid, kind, index) in &onto_new {
+        let (Some((start, dur, _)), Some((_, it))) = (previews.get(cid).copied(), seq.find_item(*cid)) else { continue };
+        let h = if *kind == TrackKind::Video { app.ui.timeline.video_track_h } else { app.ui.timeline.audio_track_h };
+        let Some(lane) = new_track_rect(&layout, *kind, *index, h) else { continue };
+        let area = if *kind == TrackKind::Video { vclip } else { aclip.union(Rect::from_min_size(aclip.left_bottom(), vec2(aclip.width(), MASTER_H))) };
+        let shown = lane.intersect(area).intersect(content);
+        if shown.height() <= 0.0 {
+            continue;
+        }
+        let p = painter.with_clip_rect(shown);
+        p.rect_filled(shown, 0.0, Color32::from_white_alpha(10));
+        let body = Rect::from_min_max(pos2(layout.x_of(start), lane.min.y + 1.0), pos2(layout.x_of(start + dur), lane.max.y - 1.0));
+        draw_clip(app, &ctx, &p, body, it, *kind, true, &t, rate);
+        app.auto.add(&format!("timeline.newTrackGhost.{}", cid.0), body.intersect(shown), "New track");
+    }
     let mut copies: Vec<(ClipId, Tick, Tick, Option<TrackId>)> = Vec::new();
     if copying {
         copies = previews.drain().map(|(c, (s, d, t))| (c, s, d, t)).collect();
@@ -964,6 +983,7 @@ fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, rows:
     let tg = app.session.targeting();
     let mut actions: Vec<(String, Value)> = Vec::new();
     let mut vo_action = None;
+    let mut header_cmd: Option<HeaderCmd> = None;
     for r in rows {
         let Some(tr) = seq.track(r.track) else { continue };
         let clip_rect = if r.kind == TrackKind::Video { vclip } else { aclip };
@@ -976,6 +996,15 @@ fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, rows:
         p.rect_filled(hrect, 0.0, t.tl_header_bg);
         p.line_segment([pos2(hrect.min.x, hrect.max.y - 0.5), pos2(hrect.max.x, hrect.max.y - 0.5)], Stroke::new(1.0, t.separator));
         let label = format!("{}{}", if r.kind == TrackKind::Video { "V" } else { "A" }, r.index + 1);
+        // right-click anywhere on the header (under its buttons): the track menu, as in Premiere
+        let bg = ui.interact(visible, egui::Id::new(("hdr-bg", r.track.0)), Sense::click());
+        app.auto.add(&format!("timeline.track.{label}.header"), visible, &tr.name);
+        // a right-click on any part of the header, its buttons too (they take the click itself)
+        let right_click = ui.input(|i| i.pointer.secondary_clicked() && i.pointer.interact_pos().is_some_and(|p| visible.contains(p)));
+        egui::Popup::menu(&bg)
+            .open_memory(right_click.then_some(egui::SetOpenCommand::Bool(true)))
+            .at_pointer_fixed()
+            .show(|ui| track_menu(ui, &mut app.auto, r, &label, &mut header_cmd));
         let btn_rect = |x0: f32| Rect::from_min_max(pos2(hrect.min.x + x0, hrect.min.y + 1.0), pos2(hrect.min.x + x0 + 24.0, hrect.max.y - 2.0));
         // 1. source patch (absent when unpatched)
         let patched = if r.kind == TrackKind::Video { tg.video_dest == Some(r.track) } else { tg.audio_dest == Some(r.track) };
@@ -1073,8 +1102,29 @@ fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, rows:
             let kr = small(x + 64.0, upper_y);
             super::timeline_automation::header_button(app, ui, seq, r, kr, visible, &label, t);
         }
-        // 5. name on the lower line (or inline when short)
-        if hrect.height() >= 40.0 {
+        // 5. name on the lower line (or inline when short); an editor while renaming
+        let renaming = app.tl.renaming.as_ref().is_some_and(|(id, _)| *id == r.track);
+        if renaming {
+            let y = if hrect.height() >= 40.0 { hrect.min.y + 34.0 } else { hrect.center().y };
+            let er = Rect::from_min_max(pos2(hrect.min.x + 90.0, y - 9.0), pos2(hrect.max.x - 6.0, y + 9.0)).intersect(visible);
+            if let Some((_, name)) = app.tl.renaming.as_mut() {
+                let te = ui.put(er, egui::TextEdit::singleline(name).id(egui::Id::new(("rename-track", r.track.0))).font(Tokens::ui(11.0)));
+                app.auto.add(&format!("timeline.track.{label}.rename"), er, "Track name");
+                if !te.has_focus() && !te.lost_focus() {
+                    te.request_focus();
+                }
+                let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+                if esc {
+                    app.tl.renaming = None;
+                } else if te.lost_focus() || enter {
+                    let name = name.trim().to_string();
+                    if !name.is_empty() && name != tr.name {
+                        actions.push(("timeline.setTrack".into(), json!({"track": r.track.0, "name": name})));
+                    }
+                    app.tl.renaming = None;
+                }
+            }
+        } else if hrect.height() >= 40.0 {
             p.text(pos2(hrect.min.x + 94.0, hrect.min.y + 34.0), Align2::LEFT_CENTER, &tr.name, Tokens::ui(11.0), t.text_dim);
         }
         // resize track height by dragging the header's bottom edge
@@ -1109,6 +1159,76 @@ fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, rows:
     }
     if let Some(a) = vo_action {
         super::voiceover::run(app, &ui.ctx().clone(), a);
+    }
+    if let Some(cmd) = header_cmd {
+        run_header_cmd(app, &ui.ctx().clone(), seq, cmd);
+    }
+}
+
+/// What the track header menu asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderCmd {
+    Rename(TrackId),
+    /// One track of this kind right after the clicked one (number of tracks before it).
+    AddTrack(TrackKind, usize),
+    AddSubmix,
+    /// The Add Tracks dialog, new tracks after the clicked one.
+    AddTracks(TrackKind, usize),
+    Delete(TrackId),
+    DeleteTracks,
+}
+
+/// Premiere's track header context menu (automation ids `timeline.trackMenu.<key>`).
+fn track_menu(ui: &mut egui::Ui, auto: &mut crate::automation::Registry, r: &Row, label: &str, out: &mut Option<HeaderCmd>) {
+    let mut item = |ui: &mut egui::Ui, key: &str, text: &str, cmd: HeaderCmd| {
+        let b = ui.button(text);
+        auto.add(&format!("timeline.trackMenu.{key}"), b.rect, text);
+        if b.clicked() {
+            *out = Some(cmd);
+            ui.close();
+        }
+    };
+    ui.label(egui::RichText::new(label).weak());
+    item(ui, "rename", "Rename", HeaderCmd::Rename(r.track));
+    ui.separator();
+    item(ui, "addTrack", "Add Track", HeaderCmd::AddTrack(r.kind, r.index + 1));
+    if r.kind == TrackKind::Audio {
+        item(ui, "addSubmix", "Add Audio Submix Track", HeaderCmd::AddSubmix);
+    }
+    item(ui, "addTracks", "Add Tracks…", HeaderCmd::AddTracks(r.kind, r.index + 1));
+    ui.separator();
+    item(ui, "deleteTrack", "Delete Track", HeaderCmd::Delete(r.track));
+    item(ui, "deleteTracks", "Delete Tracks…", HeaderCmd::DeleteTracks);
+}
+
+fn run_header_cmd(app: &mut FilmcraftApp, ctx: &egui::Context, seq: &Sequence, cmd: HeaderCmd) {
+    let r = match cmd {
+        HeaderCmd::Rename(track) => {
+            app.tl.renaming = seq.track(track).map(|t| (track, t.name.clone()));
+            Ok(Value::Null)
+        }
+        HeaderCmd::AddTrack(TrackKind::Video, after) => {
+            app.session.execute("sequence.addTracks", json!({"video": 1, "audio": 0, "videoAfter": after})).map_err(|e| e.to_string())
+        }
+        HeaderCmd::AddTrack(TrackKind::Audio, after) => {
+            app.session.execute("sequence.addTracks", json!({"video": 0, "audio": 1, "audioAfter": after})).map_err(|e| e.to_string())
+        }
+        HeaderCmd::AddSubmix => app.session.execute("mixer.addSubmix", json!({})).map_err(|e| e.to_string()),
+        HeaderCmd::AddTracks(kind, after) => {
+            let r = crate::menus::invoke(app, ctx, "sequence.addTracks", json!({}));
+            // new tracks go right after the track that was clicked
+            if kind == TrackKind::Video {
+                app.ui.add_tracks.video_after = after;
+            } else {
+                app.ui.add_tracks.audio_after = after;
+            }
+            r
+        }
+        HeaderCmd::Delete(track) => app.session.execute("sequence.deleteTrack", json!({"track": track.0})).map_err(|e| e.to_string()),
+        HeaderCmd::DeleteTracks => crate::menus::invoke(app, ctx, "sequence.deleteTracks", json!({})),
+    };
+    if let Err(e) = r {
+        app.ui.status = e;
     }
 }
 
@@ -1552,14 +1672,31 @@ pub fn locate(app: &FilmcraftApp, clip: u64, edge: Option<&str>) -> Option<(f32,
     Some((x, y))
 }
 
-fn preview_drag(app: &FilmcraftApp, seq: &Sequence, _layout: &Layout, out: &mut HashMap<ClipId, (Tick, Tick, Option<TrackId>)>) {
+/// The preview's stand-in track for a clip dragged onto a track that does not exist yet.
+const NEW_TRACK: TrackId = TrackId(u64::MAX);
+
+/// A drag's preview: each moving clip's (start, duration, track). A clip headed for a new track
+/// has [`NEW_TRACK`] as its track and its place in `new_tracks` (kind, 0-based index).
+fn preview_drag(
+    app: &FilmcraftApp,
+    seq: &Sequence,
+    _layout: &Layout,
+    out: &mut HashMap<ClipId, (Tick, Tick, Option<TrackId>)>,
+    new_tracks: &mut Vec<(ClipId, TrackKind, usize)>,
+) {
     let Some(d) = &app.tl.drag else { return };
     match d {
         Drag::Move { clips, offset, track_delta, .. } => {
             for c in clips {
                 if let Some((tid, it)) = seq.find_item(*c) {
-                    let dest = shift_track(seq, tid, *track_delta);
-                    out.insert(*c, ((it.start + *offset).max(Tick::ZERO), it.duration, dest));
+                    let dest = match dest_track(seq, tid, *track_delta) {
+                        Dest::Track(t) => t,
+                        Dest::New(kind, i) => {
+                            new_tracks.push((*c, kind, i));
+                            NEW_TRACK
+                        }
+                    };
+                    out.insert(*c, ((it.start + *offset).max(Tick::ZERO), it.duration, Some(dest)));
                 }
             }
         }
@@ -1597,17 +1734,64 @@ fn preview_drag(app: &FilmcraftApp, seq: &Sequence, _layout: &Layout, out: &mut 
     }
 }
 
-fn shift_track(seq: &Sequence, tid: TrackId, delta: i32) -> Option<TrackId> {
-    if delta == 0 {
-        return Some(tid);
-    }
-    for tracks in [&seq.video_tracks, &seq.audio_tracks] {
-        if let Some(i) = tracks.iter().position(|t| t.id == tid) {
-            let ni = (i as i32 + delta).clamp(0, tracks.len() as i32 - 1) as usize;
-            return Some(tracks[ni].id);
+/// Where a clip on `tid` lands when dragged `delta` tracks: an existing track of its kind, or one
+/// past the last (dragged below the last audio track or above the top video track, which
+/// Premiere answers with a new track on drop).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dest {
+    Track(TrackId),
+    /// A new track at this 0-based index (past the last of `kind`).
+    New(TrackKind, usize),
+}
+
+impl Dest {
+    /// The track as `timeline.move` names it: an id, or "V4" / "A5" for a track to add.
+    fn param(self) -> Value {
+        match self {
+            Dest::Track(t) => json!(t.0),
+            Dest::New(kind, i) => json!(format!("{}{}", if kind == TrackKind::Video { 'V' } else { 'A' }, i + 1)),
         }
     }
-    Some(tid)
+}
+
+/// At most this many tracks past the last can be asked for by one drag.
+const MAX_NEW_TRACKS: usize = 1;
+
+fn dest_track(seq: &Sequence, tid: TrackId, delta: i32) -> Dest {
+    if delta == 0 {
+        return Dest::Track(tid);
+    }
+    for (kind, tracks) in [(TrackKind::Video, &seq.video_tracks), (TrackKind::Audio, &seq.audio_tracks)] {
+        if let Some(i) = tracks.iter().position(|t| t.id == tid) {
+            let ni = (i as i64 + i64::from(delta)).clamp(0, (tracks.len() + MAX_NEW_TRACKS - 1) as i64) as usize;
+            return match tracks.get(ni) {
+                Some(t) => Dest::Track(t.id),
+                None => Dest::New(kind, ni),
+            };
+        }
+    }
+    Dest::Track(tid)
+}
+
+/// The 0-based index one past the last track of `kind` when `y` is in the empty space beyond it
+/// (below the last audio track, above the top video track).
+fn past_last(layout: &Layout, kind: TrackKind, y: f32) -> Option<usize> {
+    let last = layout.rows.iter().filter(|r| r.kind == kind).max_by_key(|r| r.index)?;
+    let beyond = match kind {
+        TrackKind::Video => y < last.rect.min.y && y > layout.ruler.max.y && y < layout.split_y,
+        TrackKind::Audio => y > last.rect.max.y && y > layout.split_y,
+    };
+    beyond.then_some(last.index + 1)
+}
+
+/// Where a new track (0-based `index` of `kind`) would be drawn: next to the last one.
+fn new_track_rect(layout: &Layout, kind: TrackKind, index: usize, h: f32) -> Option<Rect> {
+    let last = layout.rows.iter().filter(|r| r.kind == kind).max_by_key(|r| r.index)?;
+    let steps = index.checked_sub(last.index)? as f32;
+    Some(match kind {
+        TrackKind::Audio => Rect::from_min_size(pos2(last.rect.min.x, last.rect.max.y + (steps - 1.0) * h), vec2(last.rect.width(), h)),
+        TrackKind::Video => Rect::from_min_size(pos2(last.rect.min.x, last.rect.min.y - steps * h), vec2(last.rect.width(), h)),
+    })
 }
 
 /// The clip context menu: groups (separated by rules) of (label, command id). Entries marked `…`
@@ -1985,6 +2169,8 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 let start_row = layout.rows.iter().find(|r| r.track == start_track);
                 let track_delta = match (cur_row, start_row) {
                     (Some(c), Some(s)) if c.kind == s.kind => c.index as i32 - s.index as i32,
+                    // in the empty space past the last track: a new track there
+                    (None, Some(s)) => past_last(layout, s.kind, p.y).map_or(0, |n| n as i32 - s.index as i32),
                     _ => 0,
                 };
                 Some(Drag::Move { clips, grab_tick, start_track, offset, track_delta })
@@ -2047,11 +2233,11 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             Drag::Move { clips, offset, track_delta, .. } if offset != Tick::ZERO || track_delta != 0 => {
                 let moves: Vec<Value> = clips
                     .iter()
-                    .filter_map(|c| seq.find_item(*c).map(|(tid, it)| json!({"clip": c.0, "track": shift_track(seq, tid, track_delta).unwrap_or(tid).0, "time": (it.start + offset).max(Tick::ZERO).0})))
+                    .filter_map(|c| seq.find_item(*c).map(|(tid, it)| json!({"clip": c.0, "track": dest_track(seq, tid, track_delta).param(), "time": (it.start + offset).max(Tick::ZERO).0})))
                     .collect();
                 // Alt (Option) held on release copies the clips there instead (Premiere)
                 let cmd = if mods.alt { "timeline.copyTo" } else { "timeline.move" };
-                Some(app.session.execute(cmd, json!({"moves": moves, "insert": mods.command, "linked": false})))
+                Some(app.session.execute(cmd, json!({"moves": moves, "insert": mods.command, "linked": false, "addTracks": true})))
             }
             Drag::Trim { clip, edge, mode, delta } if delta != Tick::ZERO => Some(app.session.execute(
                 "timeline.trim",
@@ -2182,26 +2368,58 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         && layout.content.contains(p)
     {
         let row = layout.row_at(p.y).cloned();
+        // in the empty space above the top video track or below the last audio track: a new track
+        let past = if row.is_some() { None } else { [TrackKind::Video, TrackKind::Audio].into_iter().find_map(|k| past_last(layout, k, p.y).map(|i| (k, i))) };
         let t = snap(app, seq, layout, rate.snap_nearest(layout.tick_at(p.x).max(Tick::ZERO)), &[]);
         let still = app.session.prefs.timeline.still_duration(rate);
         let is_still = app.session.project.item(item).and_then(|i| i.as_media()).is_some_and(|m| m.info.kind == filmcraft_media::MediaKind::Still);
         let dur = app.session.project.item(item).map(|i| i.duration()).filter(|d| d.0 > 0 && !is_still).unwrap_or(still);
-        if let Some(row) = &row {
-            let r = Rect::from_min_max(pos2(layout.x_of(t), row.rect.min.y + 1.0), pos2(layout.x_of(t + dur), row.rect.max.y - 1.0));
+        let lane = match (&row, past) {
+            (Some(row), _) => Some(row.rect),
+            (None, Some((kind, index))) => {
+                let h = if kind == TrackKind::Video { app.ui.timeline.video_track_h } else { app.ui.timeline.audio_track_h };
+                new_track_rect(layout, kind, index, h)
+            }
+            _ => None,
+        };
+        if let Some(lane) = lane {
+            let r = Rect::from_min_max(pos2(layout.x_of(t), lane.min.y + 1.0), pos2(layout.x_of(t + dur), lane.max.y - 1.0));
             ui.painter().rect_filled(r, 3.0, Color32::from_white_alpha(40));
             ui.painter().rect_stroke(r, 3.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
             if mods.command {
                 ui.painter().text(r.left_top() + vec2(4.0, -2.0), Align2::LEFT_BOTTOM, "Insert", Tokens::ui(10.0), Color32::WHITE);
+            } else if past.is_some() {
+                ui.painter().text(r.left_top() + vec2(4.0, -2.0), Align2::LEFT_BOTTOM, "New Track", Tokens::ui(10.0), Color32::WHITE);
             }
         }
+        // the track numbers past the last as `timeline.place` names them (it adds those tracks)
+        let new_name = |kind: TrackKind, have: usize| json!(format!("{}{}", if kind == TrackKind::Video { 'V' } else { 'A' }, have + 1));
+        let tracks = match (&row, past) {
+            (Some(row), _) => Some(match row.kind {
+                TrackKind::Video => (json!(row.track.0), seq.audio_tracks.get(row.index).or(seq.audio_tracks.first()).map_or(Value::Null, |t| json!(t.id.0))),
+                TrackKind::Audio => (seq.video_tracks.get(row.index).or(seq.video_tracks.first()).map_or(Value::Null, |t| json!(t.id.0)), json!(row.track.0)),
+            }),
+            // the other stream goes on the track with the same number, or on a new one too
+            (None, Some((TrackKind::Video, i))) => Some((
+                new_name(TrackKind::Video, i),
+                seq.audio_tracks.get(i).map_or_else(|| new_name(TrackKind::Audio, seq.audio_tracks.len()), |t| json!(t.id.0)),
+            )),
+            (None, Some((TrackKind::Audio, i))) => Some((
+                seq.video_tracks.get(i).map_or_else(|| new_name(TrackKind::Video, seq.video_tracks.len()), |t| json!(t.id.0)),
+                new_name(TrackKind::Audio, i),
+            )),
+            _ => None,
+        };
+        // past the last track: no new track for a stream the item does not have
+        let streams = app.session.project.item(item).map_or((true, true), |i| (i.has_video(), i.has_audio()));
+        let tracks = tracks.map(|(vt, at)| match past {
+            Some(_) => (if streams.0 { vt } else { Value::Null }, if streams.1 { at } else { Value::Null }),
+            None => (vt, at),
+        });
         if ctx.input(|i| i.pointer.any_released())
-            && let Some(row) = row
+            && let Some((vt, at)) = tracks
         {
-            let (vt, at) = match row.kind {
-                TrackKind::Video => (Some(row.track.0), seq.audio_tracks.get(row.index).or(seq.audio_tracks.first()).map(|t| t.id.0)),
-                TrackKind::Audio => (seq.video_tracks.get(row.index).or(seq.video_tracks.first()).map(|t| t.id.0), Some(row.track.0)),
-            };
-            let r = app.session.execute("timeline.place", json!({"item": item.0, "track": vt, "audioTrack": at, "time": t.0, "insert": mods.command}));
+            let r = app.session.execute("timeline.place", json!({"item": item.0, "track": vt, "audioTrack": at, "time": t.0, "insert": mods.command, "addTracks": past.is_some()}));
             if let Err(e) = r {
                 app.ui.status = e.to_string();
             }
