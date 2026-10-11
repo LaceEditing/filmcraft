@@ -33,6 +33,7 @@ use crate::common::scaled;
 use crate::prproj::{FRAME_HOLD_AT, META_MEDIA, META_SEQUENCE, parse_i64, source_frame, time};
 use crate::prproj_fx::{self, Ctx, Target};
 use crate::prproj_graph::{self, Index};
+use crate::prproj_mask;
 use crate::xml::{child, child_text, escape, path_text};
 use crate::{Error, Format, ImportOptions, Report, Result};
 
@@ -200,24 +201,55 @@ impl<'a, 'i> Writer<'a, 'i> {
 
     /// The bytes of a binary value, stored in the element or in another one with its hash.
     fn binary(&mut self, el: Node<'a, 'i>) -> Option<Vec<u8>> {
-        let text = match el.text().map(str::trim).filter(|t| !t.is_empty()) {
-            Some(t) => t,
-            None => {
-                let hash = el.attribute("BinaryHash")?;
-                let root = self.root;
-                let map = self.payloads.get_or_insert_with(|| {
-                    let mut m = HashMap::new();
-                    for n in root.descendants().filter(Node::is_element) {
-                        if let (Some(h), Some(t)) = (n.attribute("BinaryHash"), n.text().map(str::trim).filter(|t| !t.is_empty())) {
-                            m.entry(h).or_insert(t);
-                        }
-                    }
-                    m
-                });
-                map.get(hash).copied()?
+        let root = self.root;
+        crate::prproj::binary_in(self.payloads.get_or_insert_with(|| crate::prproj::payloads(root)), el)
+    }
+
+    /// Write what changed in an effect's masks: Feather, Opacity, Expansion and Inverted are
+    /// written; a changed shape, or masks added or removed in FilmCraft, are reported (Premiere
+    /// keeps its own).
+    fn masks(&mut self, comp: &prproj_fx::Component<'a, 'i>, e: &filmcraft_project::EffectInstance, ctx: &Ctx, copies: &HashMap<&'a str, usize>, clip: &str) {
+        if e.masks.is_empty() && prproj_mask::components(&self.ix, comp.node).is_empty() {
+            return;
+        }
+        let root = self.root;
+        let map = self.payloads.get_or_insert_with(|| crate::prproj::payloads(root));
+        let each = prproj_mask::read_each(&self.ix, comp.node, ctx, &mut |n| crate::prproj::binary_in(map, n));
+        let carried: Vec<(Node<'a, 'i>, filmcraft_project::Mask)> = each.into_iter().filter_map(|(n, m)| m.ok().map(|m| (n, m))).collect();
+        let effect = comp.label().to_string();
+        if carried.len() != e.masks.len() {
+            self.report.warn(format!(
+                "\"{clip}\": masks added to or removed from \"{effect}\" in FilmCraft are not written to Premiere projects yet; Premiere keeps its own"
+            ));
+            return;
+        }
+        for ((node, pr), fc) in carried.iter().zip(&e.masks) {
+            if prproj_mask::same(pr, fc) {
+                continue;
             }
-        };
-        crate::prproj_text::base64(text)
+            if !prproj_mask::same_shape(pr, fc) {
+                self.report.warn(format!(
+                    "\"{clip}\": a mask shape changed on \"{effect}\" in FilmCraft is not written to Premiere projects yet; Premiere keeps its own"
+                ));
+            }
+            let params: [(&str, &filmcraft_project::Param, prproj_fx::Conv); 3] = [
+                (prproj_mask::FEATHER, &fc.feather, prproj_fx::Conv::Float),
+                (prproj_mask::OPACITY, &fc.opacity, prproj_fx::Conv::Float),
+                (prproj_mask::EXPANSION, &fc.expansion, prproj_fx::Conv::Float),
+            ];
+            let inverted = filmcraft_project::Param::new(filmcraft_project::ParamValue::Bool(fc.inverted));
+            for (id, value, conv) in params.into_iter().chain(std::iter::once((prproj_mask::INVERTED, &inverted, prproj_fx::Conv::Bool))) {
+                let Some(pnode) = prproj_mask::param(&self.ix, *node, id) else { continue };
+                let Some(want) = prproj_fx::from_param(value, conv, ctx) else { continue };
+                let have = prproj_fx::decode(pnode, conv);
+                if have.as_ref().is_some_and(|h| prproj_fx::same(h, &want, ctx)) {
+                    continue;
+                }
+                let t = prproj_fx::encode(pnode, have.as_ref(), &want, ctx);
+                let pi = self.inst_of(pnode, copies);
+                self.write_param(pi, pnode, &t);
+            }
+        }
     }
 
     /// Whether FilmCraft's text layer differs from the Premiere title it was imported from in what
@@ -886,6 +918,9 @@ impl<'a, 'i> Writer<'a, 'i> {
                 let pi = self.inst_of(m.node, copies);
                 self.write_param(pi, m.node, &t);
             }
+            if let (Some(e), Target::Effect(_) | Target::Opacity) = (instance, target) {
+                self.masks(comp, e, &ctx, copies, &c.name);
+            }
         }
         // effects added in FilmCraft: a copy of a component of the same effect elsewhere in the
         // project (Premiere's own component layout), with FilmCraft's values
@@ -926,8 +961,15 @@ impl<'a, 'i> Writer<'a, 'i> {
                 ));
                 continue;
             };
-            let model_copies = self.clone_owned(model.node, &[]);
+            // the model's own masks are not the new effect's
+            let model_copies = self.clone_owned(model.node, &["SubComponents"]);
             let ci = self.inst_of(model.node, &model_copies);
+            if let Some(sub) = child(model.node, "SubComponents") {
+                self.remove(ci, sub);
+            }
+            if !e.masks.is_empty() {
+                self.report.warn(format!("\"{}\": the masks of \"{}\" added in FilmCraft are not written to Premiere projects yet", c.name, def.name));
+            }
             if let Some(idn) = self.ix.at(model.node, &["Component", "ID"]).or_else(|| self.ix.at(model.node, &["AudioComponent", "Component", "ID"])) {
                 self.set_text(ci, idn, &next_component_id.to_string());
             }
@@ -1010,7 +1052,9 @@ impl<'a, 'i> Writer<'a, 'i> {
             .children()
             .filter(|n| n.has_tag_name(tag))
             .filter_map(|n| prproj_fx::component(&self.ix, n))
-            .find(|c| matches!(c.target(), Target::Effect(d) if d.id == def.id))
+            .filter(|c| matches!(c.target(), Target::Effect(d) if d.id == def.id))
+            // one without masks, so the copy has none to strip
+            .min_by_key(|c| !prproj_mask::components(&self.ix, c.node).is_empty())
     }
 
     // -----------------------------------------------------------------------------------------

@@ -128,7 +128,17 @@ pub(crate) enum Conv {
     /// A colour as one integer: four 16-bit channels A, R, G, B, high byte first (observed:
     /// `0xff00_4800_e000_0000` is Ultra Key's default green, `0xff00_0000_0000_0000` black).
     Color,
+    /// A number FilmCraft holds multiplied by this factor (Premiere's Gaussian Blur "Amount" ↔
+    /// FilmCraft's Blurriness).
+    Scale(f64),
 }
+
+/// Match name of Premiere's current Gaussian Blur (the one that is not "Legacy").
+pub(crate) const IMPACT_BLUR: &str = "AE.Impact_Blur_FX";
+/// Blurriness per unit of that blur's Amount. PROVISIONAL: taken as Amount ≈ σ in pixels (how the
+/// effect is used in the projects seen: 2–3 to soften, 20 to hide a face); not yet measured
+/// against a Premiere render. FilmCraft's Blurriness is σ / 0.285 (see the README).
+pub(crate) const IMPACT_BLUR_AMOUNT: f64 = 1.0 / 0.285;
 
 /// One Premiere parameter mapped onto a FilmCraft parameter.
 pub(crate) struct Mapping<'a, 'i> {
@@ -166,6 +176,16 @@ pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Ma
         }
         Target::Opacity => add(named("Opacity"), "opacity", "opacity", Conv::Float),
         Target::Volume => add(named("Level"), "volume", "level", Conv::Db),
+        Target::Effect(def) if def.id == "gaussian_blur" && c.match_name == IMPACT_BLUR => {
+            // Premiere's current Gaussian Blur: Amount (and Thickness, the same with Uniform Blur
+            // on, as in every project seen) is the strength; the rest has no FilmCraft equivalent
+            add(named("Amount"), "gaussian_blur", "blurriness", Conv::Scale(IMPACT_BLUR_AMOUNT));
+            for (name, neutral) in [("Uniform Blur", "true"), ("Chromatic Aberration", "0")] {
+                if named(name).and_then(start_value).is_some_and(|v| v.trim_end_matches('.') != neutral) {
+                    unmapped.push(name.to_string());
+                }
+            }
+        }
         Target::Effect(def) => {
             // a name Premiere uses for several parameters of one effect (Lumetri's "Intensity")
             // cannot be mapped by name; each FilmCraft parameter takes at most one value
@@ -257,7 +277,7 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
-    fn clip_time(&self, t: i64) -> i64 {
+    pub(crate) fn clip_time(&self, t: i64) -> i64 {
         let d = t.saturating_sub(self.source_in).clamp(-MAX_TIME, MAX_TIME);
         if self.speed == 1.0 { d } else { ((d as f64 / self.speed).round() as i64).clamp(-MAX_TIME, MAX_TIME) }
     }
@@ -275,7 +295,7 @@ impl Ctx {
 fn parse_val(s: &str, conv: Conv) -> Option<Val> {
     let s = s.trim();
     match conv {
-        Conv::Float | Conv::Db => s.parse::<f64>().ok().filter(|v| v.is_finite()).map(Val::F),
+        Conv::Float | Conv::Db | Conv::Scale(_) => s.parse::<f64>().ok().filter(|v| v.is_finite()).map(Val::F),
         Conv::Bool => match s {
             "true" | "1" => Some(Val::B(true)),
             "false" | "0" => Some(Val::B(false)),
@@ -364,6 +384,7 @@ fn to_value(v: &Val, conv: Conv, ctx: &Ctx) -> ParamValue {
         (Val::F(x), Conv::Db) => ParamValue::Float(if *x > 0.0 { (20.0 * (x / UNITY_LEVEL).log10()).max(-200.0) } else { -200.0 }),
         (Val::F(x), Conv::Choice(_)) => ParamValue::Choice(x.round().max(0.0) as u32),
         (Val::C(c), _) => ParamValue::Color(unpack_color(*c)),
+        (Val::F(x), Conv::Scale(k)) => ParamValue::Float(x * k),
         (Val::F(x), _) => ParamValue::Float(*x),
         (Val::B(b), _) => ParamValue::Bool(*b),
         (Val::P(x, y), Conv::FramePoint) => ParamValue::Vec2(Vec2::new(x * ctx.frame.0, y * ctx.frame.1)),
@@ -376,6 +397,7 @@ fn from_value(v: &ParamValue, conv: Conv, ctx: &Ctx) -> Option<Val> {
     Some(match (v, conv) {
         (ParamValue::Float(db), Conv::Db) => Val::F(UNITY_LEVEL * 10f64.powf(db / 20.0)),
         (ParamValue::Float(x), Conv::Float) => Val::F(*x),
+        (ParamValue::Float(x), Conv::Scale(k)) if k != 0.0 && k.is_finite() => Val::F(x / k),
         (ParamValue::Choice(n), Conv::Choice(len)) if (*n as usize) < len => Val::F(*n as f64),
         (ParamValue::Color(c), Conv::Color) => Val::C(pack_color(*c)),
         (ParamValue::Bool(b), Conv::Bool) => Val::B(*b),

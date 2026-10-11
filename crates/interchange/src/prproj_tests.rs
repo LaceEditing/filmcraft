@@ -426,3 +426,164 @@ fn premiere_titles_come_in_as_graphics_with_their_text() {
     assert!(!report.to_string().contains("Source Text"), "{report}");
     assert!(!report.to_string().contains("no file path"), "not offline: {report}");
 }
+
+/// A mask component as Premiere saves one (`AE.ADBE AEMask2`): the path by hash, Position /
+/// Anchor Point, Feather, Expansion, Inverted and Type (parameters found by `ParameterID`).
+fn mask_xml(id: u32, path_hash: &str, path_keys: Option<&str>, pos: &str, anchor: &str, feather: f64, expansion: f64, inverted: bool, kind: u32) -> String {
+    let p = |n: u32| id + n;
+    let keys = path_keys.map(|k| format!("<Keyframes>{k}</Keyframes>")).unwrap_or_default();
+    format!(
+        r#"
+  <VideoFilterComponent ObjectID="{id}"><Component><Params><Param Index="0" ObjectRef="{p1}"/><Param Index="1" ObjectRef="{p2}"/><Param Index="2" ObjectRef="{p3}"/><Param Index="3" ObjectRef="{p4}"/><Param Index="4" ObjectRef="{p5}"/><Param Index="5" ObjectRef="{p6}"/><Param Index="6" ObjectRef="{p7}"/></Params><DisplayName>Mask2</DisplayName><InstanceName>01</InstanceName></Component><MatchName>AE.ADBE AEMask2</MatchName></VideoFilterComponent>
+  <ArbVideoComponentParam ObjectID="{p1}"><Name>Path</Name><ParameterControlType>22</ParameterControlType><ParameterID>7</ParameterID><StartKeyframePosition>-91445760000000000</StartKeyframePosition>{keys}<StartKeyframeValue Encoding="base64" BinaryHash="{path_hash}"/></ArbVideoComponentParam>
+  <PointComponentParam ObjectID="{p2}"><Name>Position</Name><ParameterID>9</ParameterID><StartKeyframe>-91445760000000000,{pos},0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe></PointComponentParam>
+  <PointComponentParam ObjectID="{p3}"><Name>Anchor Point</Name><ParameterID>10</ParameterID><StartKeyframe>-91445760000000000,{anchor},0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe></PointComponentParam>
+  <VideoComponentParam ObjectID="{p4}"><Name>Feather</Name><ParameterID>14</ParameterID><StartKeyframe>-91445760000000000,{feather}.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="{p5}"><Name>Expansion</Name><ParameterID>16</ParameterID><StartKeyframe>-91445760000000000,{expansion}.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="{p6}"><ParameterID>17</ParameterID><StartKeyframe>-91445760000000000,{inverted},0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="{p7}"><Name>Type</Name><ParameterControlType>10</ParameterControlType><ParameterID>22</ParameterID><StartKeyframe>-91445760000000000,{kind},0,0,0,0,0,0</StartKeyframe></VideoComponentParam>"#,
+        p1 = p(1),
+        p2 = p(2),
+        p3 = p(3),
+        p4 = p(4),
+        p5 = p(5),
+        p6 = p(6),
+        p7 = p(7),
+    )
+}
+
+/// The test project with masks: a moved ellipse on the second clip's Gaussian Blur, an Object
+/// Mask on its Opacity, and an inverted rectangle whose path is keyed on a Tint of the first clip.
+pub(crate) fn doc_with_masks() -> String {
+    use filmcraft_project::MaskPath;
+    const ELLIPSE: &str = "AgAAAAEAAABWeQAAAAIAAAAEAAAAAQAAAELE7T5glO4+VsyYPmCU7j4XXiE/YJTuPgEAAADNzkM/gNkZP83OQz9EwwY/zc5DP73vLD8BAAAAQsTtPtFoPD8XXiE/0Wg8P1bMmD7RaDw/AQAAANjVJz6A2Rk/2NUnPr3vLD/Y1Sc+RMMGPwE=";
+    let rect = |x0: f64, x1: f64| base64_encode(&crate::prproj_mask::encode(&MaskPath::rect(x0, 0.1, x1, 0.3), 7));
+    let keys = format!("{},{};{},{};", 10 * S, rect(0.1, 0.2), 12 * S, rect(0.5, 0.6));
+    let extra = [
+        mask_xml(500, "ellipse-1", None, "0.5:0.6", "0.46439:0.600975", 44.0, -56.0, false, 1),
+        mask_xml(520, "object-1", None, "0.5:0.5", "0.5:0.5", 0.0, 0.0, false, 4),
+        mask_xml(540, "rect-1", Some(&keys), "0.5:0.5", "0.5:0.5", 13.0, 4.0, true, 2),
+    ]
+    .concat();
+    let tail = format!(
+        r#"{extra}
+  <VideoFilterComponent ObjectID="560"><Component><Params><Param Index="0" ObjectRef="561"/></Params><ID>4</ID><DisplayName>Tint</DisplayName></Component><SubComponents><SubComponent Index="0" ObjectRef="540"/></SubComponents><MatchName>AE.ADBE Tint</MatchName></VideoFilterComponent>
+  <VideoComponentParam ObjectID="561"><Name>Amount to Tint</Name><StartKeyframe>-91445760000000000,100.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <Blob ObjectID="570"><Data Encoding="base64" BinaryHash="ellipse-1">{ELLIPSE}</Data></Blob>
+  <Blob ObjectID="571"><Data Encoding="base64" BinaryHash="object-1">AgAAAAAAAAA=</Data></Blob>
+  <Blob ObjectID="572"><Data Encoding="base64" BinaryHash="rect-1">{r}</Data></Blob>
+</PremiereData>"#,
+        r = rect(0.1, 0.2)
+    );
+    doc()
+        .replace(
+            r#"<DisplayName>Gaussian Blur (Legacy)</DisplayName></Component>"#,
+            r#"<DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><SubComponents><SubComponent Index="0" ObjectRef="500"/></SubComponents>"#,
+        )
+        .replace(
+            r#"<DisplayName>Opacity</DisplayName></Component>"#,
+            r#"<DisplayName>Opacity</DisplayName></Component><SubComponents><SubComponent Index="0" ObjectRef="520"/></SubComponents>"#,
+        )
+        .replace(
+            r#"<Component Index="1" ObjectRef="48"/></Components>"#,
+            r#"<Component Index="1" ObjectRef="48"/><Component Index="2" ObjectRef="560"/></Components>"#,
+        )
+        .replace("</PremiereData>", &tail)
+}
+
+/// Masks on effects come in (a masked Gaussian Blur used to blur the whole clip): the path in
+/// source pixels with the mask's own transform applied, Feather, Expansion, Inverted, path
+/// keyframes in clip time. Premiere's Object Masks have no path; they are reported.
+#[test]
+fn effect_masks_come_in_with_their_shape_and_settings() {
+    use filmcraft_geom::Vec2;
+    let (imp, report) = import(doc_with_masks().as_bytes(), Some("/edits/show"));
+    let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    let (first, second) = (&seq.video_tracks[0].items[0], &seq.video_tracks[0].items[1]);
+    // the ellipse, centred on the mask's Position (0.5, 0.6 of the 2560 × 1440 source)
+    let blur = second.effect("gaussian_blur").expect("the blur");
+    assert_eq!(blur.masks.len(), 1, "{report}");
+    let m = &blur.masks[0];
+    let path = m.path_at(filmcraft_time::Tick(0));
+    let c = path.centroid();
+    assert!((c - Vec2::new(1280.0, 864.0)).length() < 0.5, "{c:?}");
+    assert!((path.vertices[1].p.x - c.x - 0.300_48 * 2560.0).abs() < 0.5, "{:?}", path.vertices[1]);
+    assert_eq!((m.feather.f64_at(filmcraft_time::Tick(0)), m.expansion.f64_at(filmcraft_time::Tick(0)), m.inverted), (44.0, -56.0, false));
+    // the Object Mask is not carried over, and says so
+    assert!(second.effect("opacity").is_some_and(|o| o.masks.is_empty()));
+    assert!(report.to_string().contains("Object mask"), "{report}");
+    // the keyed rectangle: inverted, keys at clip times 0 and 2 s (source 10 s and 12 s)
+    let tint = first.effect("tint").expect("the tint");
+    let r = &tint.masks[0];
+    assert!(r.inverted);
+    assert_eq!(r.path.keyframes.iter().map(|k| k.time).collect::<Vec<_>>(), vec![filmcraft_time::Tick(0), filmcraft_time::Tick(2 * S)]);
+    let at = |t| r.path_at(t).vertices[0].p;
+    assert!((at(filmcraft_time::Tick(0)) - Vec2::new(256.0, 144.0)).length() < 1e-3);
+    assert!((at(filmcraft_time::Tick(S)) - Vec2::new(0.3 * 2560.0, 144.0)).length() < 1e-3, "halfway");
+}
+
+/// Premiere's synthetic media: an adjustment layer (a master clip marked `IsAdjustmentLayer` over
+/// "Black Video") and a Color Matte (its colour in `ImporterPrefs`) come in as FilmCraft's
+/// adjustment layer and colour matte, not as empty graphics.
+#[test]
+fn adjustment_layers_and_color_mattes_come_in_as_themselves() {
+    let extra = r#"
+  <VideoClipTrack ObjectUID="vt2"><ClipTrack><Track><Index>1</Index></Track><ClipItems><TrackItems><TrackItem Index="0" ObjectRef="700"/><TrackItem Index="1" ObjectRef="710"/></TrackItems></ClipItems></ClipTrack></VideoClipTrack>
+  <VideoClipTrackItem ObjectID="700"><ClipTrackItem><TrackItem><Start>0</Start><End>254016000000</End></TrackItem><SubClip ObjectRef="701"/></ClipTrackItem></VideoClipTrackItem>
+  <SubClip ObjectID="701"><Clip ObjectRef="702"/><MasterClip ObjectURef="adjmc"/><Name>Adjustment Layer</Name></SubClip>
+  <VideoClip ObjectID="702"><Clip><Source ObjectRef="703"/><InPoint>0</InPoint><OutPoint>254016000000</OutPoint></Clip></VideoClip>
+  <MasterClip ObjectUID="adjmc"><Clips><Clip Index="0" ObjectRef="702"/></Clips><Name>Adjustment Layer</Name><IsAdjustmentLayer>true</IsAdjustmentLayer></MasterClip>
+  <VideoMediaSource ObjectID="703"><MediaSource><Media ObjectURef="blak"/></MediaSource></VideoMediaSource>
+  <Media ObjectUID="blak"><VideoStream ObjectRef="704"/><FilePath>1112293707</FilePath><ImplementationID>42008e7a-de6f-4270-96de-7e287abb9b4b</ImplementationID><Title>Black Video</Title><Infinite>true</Infinite></Media>
+  <VideoStream ObjectID="704"><FrameRate>8467200000</FrameRate><FrameRect>0,0,1920,1080</FrameRect><IsStill>true</IsStill></VideoStream>
+  <VideoClipTrackItem ObjectID="710"><ClipTrackItem><TrackItem><Start>254016000000</Start><End>508032000000</End></TrackItem><SubClip ObjectRef="711"/></ClipTrackItem></VideoClipTrackItem>
+  <SubClip ObjectID="711"><Clip ObjectRef="712"/><MasterClip ObjectURef="colmc"/><Name>Color Matte</Name></SubClip>
+  <VideoClip ObjectID="712"><Clip><Source ObjectRef="713"/><InPoint>0</InPoint><OutPoint>254016000000</OutPoint></Clip></VideoClip>
+  <MasterClip ObjectUID="colmc"><Clips><Clip Index="0" ObjectRef="712"/></Clips><Name>Color Matte</Name></MasterClip>
+  <VideoMediaSource ObjectID="713"><MediaSource><Media ObjectURef="colr"/></MediaSource></VideoMediaSource>
+  <Media ObjectUID="colr"><VideoStream ObjectRef="714"/><ImporterPrefs Encoding="base64" BinaryHash="cp-1">/+QAAAEAAAA=</ImporterPrefs><FilePath>1129270354</FilePath><ImplementationID>42008e7a-de6f-4270-96de-7e287abb9b4b</ImplementationID><Title>Color Matte</Title><Infinite>true</Infinite></Media>
+  <VideoStream ObjectID="714"><FrameRate>8467200000</FrameRate><FrameRect>0,0,1920,1080</FrameRect><IsStill>true</IsStill></VideoStream>
+</PremiereData>"#;
+    let doc = doc()
+        .replace(
+            r#"<Tracks><Track Index="0" ObjectURef="vt1"/></Tracks>"#,
+            r#"<Tracks><Track Index="0" ObjectURef="vt1"/><Track Index="1" ObjectURef="vt2"/></Tracks>"#,
+        )
+        .replace("</PremiereData>", extra);
+    let (imp, report) = import(doc.as_bytes(), Some("/edits/show"));
+    let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    let v2 = &seq.video_tracks[1].items;
+    assert_eq!(v2.len(), 2, "{report}");
+    let adj = imp.project.item(v2[0].item).unwrap();
+    assert!(matches!(adj.kind, ItemKind::AdjustmentLayer { width: 1920, height: 1080, .. }), "{:?}", adj.kind);
+    let matte = imp.project.item(v2[1].item).unwrap();
+    let Some(MediaRef::Generator(filmcraft_media::Generator::ColorMatte { color })) = matte.as_media().map(|m| &m.media) else { panic!("{:?}", matte.kind) };
+    assert!((color[0] - 1.0).abs() < 1e-6 && (color[1] - 228.0 / 255.0).abs() < 1e-6 && color[2] == 0.0, "{color:?}");
+    // both keep their Premiere media, for writing back
+    assert!(adj.metadata.contains_key(META_MEDIA) && matte.metadata.contains_key(META_MEDIA));
+    let (out, rep) = crate::prproj_write::export(&imp.project, doc.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), doc, "an unchanged round trip is the same document ({rep})");
+}
+
+/// Premiere's current Gaussian Blur (`AE.Impact_Blur_FX`, "Amount") comes in as FilmCraft's
+/// Gaussian Blur with a Blurriness (it imported with none, so a masked blur did nothing), and
+/// an unchanged project still writes back unchanged.
+#[test]
+fn the_current_gaussian_blur_amount_comes_in() {
+    let doc = doc().replace(
+        r#"<DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName>"#,
+        r#"<DisplayName>Gaussian Blur</DisplayName></Component><MatchName>AE.Impact_Blur_FX</MatchName>"#,
+    )
+    .replace(r#"<Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>"#, r#"<Name>Amount</Name><StartKeyframe>-91445760000000000,20.,0,0,0,0,0,0</StartKeyframe><Keyframes>"#);
+    assert!(doc.contains("AE.Impact_Blur_FX") && doc.contains("<Name>Amount</Name>"));
+    let (imp, report) = import(doc.as_bytes(), Some("/edits/show"));
+    let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    let blur = seq.video_tracks[0].items[1].effect("gaussian_blur").expect("the blur");
+    let p = &blur.params["blurriness"];
+    // keyed 0 → 40 Amount: Blurriness × 1 / 0.285
+    let ParamValue::Float(end) = p.keyframes.last().unwrap().value else { panic!() };
+    assert!((end - 40.0 / 0.285).abs() < 1e-6, "{end}");
+    assert!(report.to_string().contains("approximately"), "{report}");
+    let (out, rep) = crate::prproj_write::export(&imp.project, doc.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), doc, "unchanged ({rep})");
+}

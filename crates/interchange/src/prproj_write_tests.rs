@@ -1,5 +1,5 @@
 use super::*;
-use crate::prproj::tests::{S, doc, gzip, import};
+use crate::prproj::tests::{S, doc, doc_with_masks, gzip, import};
 use filmcraft_project::{ClipId, ItemKind, Param, ParamValue, Track, TrackId};
 use filmcraft_time::Tick;
 
@@ -413,4 +413,49 @@ fn titles_round_trip_and_text_edits_are_reported() {
     assert!(report.to_string().contains("changes to its text or formatting are not written"), "{report}");
     let t = seq.video_tracks[1].items[0].effect("graphic_text").unwrap();
     assert_eq!(t.params.get("text").map(|x| x.value.clone()), Some(ParamValue::Text("50".into())), "Premiere keeps its text");
+}
+
+/// Masks survive a round trip: untouched they stay byte-identical; Feather / Opacity / Expansion /
+/// Inverted edits are written; a changed shape or an added mask is reported, not lost silently;
+/// a Gaussian Blur added in FilmCraft does not inherit its model's mask.
+#[test]
+fn masks_round_trip_and_their_settings_are_written() {
+    let plain = doc_with_masks();
+    let (imp, _) = import(plain.as_bytes(), Some("/edits/show"));
+    let (out, report) = export(&imp.project, plain.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), plain, "unchanged masks: same document ({report})");
+
+    let mut p = imp.project.clone();
+    let sid = seq_id(&p);
+    {
+        let seq = p.sequence_mut(sid).unwrap();
+        let v1 = &mut seq.video_tracks[0];
+        let m = &mut v1.items[1].effect_mut("gaussian_blur").unwrap().masks[0];
+        m.feather = Param::new(ParamValue::Float(12.0));
+        m.inverted = true;
+        // clip 1 gets a blur in FilmCraft, modelled on clip 2's masked one
+        v1.items[0].effects.push(filmcraft_project::find_effect("gaussian_blur").unwrap().instance());
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert!(!report.mentions("mask"), "{report}");
+    let back = read(&out);
+    let seq = back.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    let m = &seq.video_tracks[0].items[1].effect("gaussian_blur").unwrap().masks[0];
+    assert_eq!((m.feather.f64_at(Tick(0)), m.inverted, m.expansion.f64_at(Tick(0))), (12.0, true, -56.0));
+    let added = seq.video_tracks[0].items[0].effect("gaussian_blur").expect("blur added");
+    assert!(added.masks.is_empty(), "the model's mask was copied");
+
+    // a moved shape and an extra mask are reported
+    let mut q = imp.project.clone();
+    {
+        let seq = q.sequence_mut(sid).unwrap();
+        let blur = seq.video_tracks[0].items[1].effect_mut("gaussian_blur").unwrap();
+        let moved = blur.masks[0].path_at(Tick(0)).transformed(&filmcraft_geom::Affine::translate(10.0, 0.0));
+        blur.masks[0].path = Param::new(ParamValue::Path(moved));
+        let tint = seq.video_tracks[0].items[0].effect_mut("tint").unwrap();
+        let extra = tint.masks[0].clone();
+        tint.masks.push(extra);
+    }
+    let (_, report) = export(&q, plain.as_bytes(), &[], None).unwrap();
+    assert!(report.mentions("mask shape changed") && report.mentions("masks added to or removed from"), "{report}");
 }

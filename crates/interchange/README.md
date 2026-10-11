@@ -147,6 +147,27 @@ committed).
   "50" with a 26-pixel black stroke, centred in its box). Not read: shadows, backgrounds,
   gradients, per-character styles. Writing back keeps Premiere's title (its text and formatting
   are reported when changed in FilmCraft; position, scale, rotation and opacity are written).
+- Effect masks (Premiere 25–26): each mask is an `AE.ADBE AEMask2` component in its effect's
+  `SubComponents` (on Opacity, Gaussian Blur, Tint, Invert, …), parameters found by `ParameterID`:
+  7 Path (binary: `u32` 2, `u32` 1, `u32` id, `u8` 0, `u32` 2, `u32` n, then n × (`u32` 1 smooth /
+  0 corner, `f32` x, y, in-handle x, y, out-handle x, y, normalised to the source frame), `u8` 1;
+  an empty mask is `2, 0`; keyframes `time,base64;…`), 9 Position / 10 Anchor Point (normalised),
+  26 / 27 Scale Height / Width (%), 12 Rotation, 14 Feather and 16 Expansion (source pixels), 15
+  Opacity (%), 17 Inverted, 21 Blend Mode (only 0 seen), 22 Type (0 / 3 free-form, 1 ellipse, 2
+  rectangle, 4 Object Mask). A vertex is drawn at `Position + Rotation · Scale · (v − Anchor)`;
+  the import applies that transform to the path at every keyframe time. Object Masks (Premiere's
+  automatic subject masks) have no path and are reported. Read from 6 625 masks in 67 projects;
+  a masked legacy Gaussian Blur checked against a Premiere export (only the masked text blurred).
+  Writing back writes Feather, Opacity, Expansion and Inverted; a changed shape or an added /
+  removed mask is reported. `prproj_mask.rs`.
+- Gaussian Blur (Legacy): Premiere's Blurriness is about 0.285 × Blurriness pixels of Gaussian σ
+  in linear light (Blurriness 30 = σ 8.54 px, fitted to a Premiere export; a gamma-space blur fits
+  60 times worse), which FilmCraft's Gaussian Blur now uses.
+- Synthetic media (`ImplementationID` `42008e7a-…`, `FilePath` a four-character code): `COLR`
+  Color Matte (colour = the first three bytes of `ImporterPrefs`, R G B), `BLAK` Black Video,
+  `BARS` Bars and Tone, `TRNV` Transparent Video become FilmCraft's generators; a master clip with
+  `IsAdjustmentLayer` true (over a Black Video) becomes an adjustment layer; `GRFV` is a graphic
+  (title).
 - Markers: `Clip/MarkerOwner/Markers` (before `Clip/Source`) → `Markers` object (class
   `bee50706-…`) → `Markers/Marker` (`First` = GUID, `Second` → `Marker` object with a
   `DVAMarker` JSON value: `mStartTime.ticks`, `mDuration.ticks`, `mName`, `mComment`, `mType`).

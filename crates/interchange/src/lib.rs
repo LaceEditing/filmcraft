@@ -38,6 +38,7 @@ pub mod otio;
 mod prproj;
 mod prproj_fx;
 mod prproj_graph;
+mod prproj_mask;
 pub mod prproj_new;
 mod prproj_text;
 mod prproj_write;

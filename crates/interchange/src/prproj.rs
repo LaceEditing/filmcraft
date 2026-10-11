@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use filmcraft_media::MediaKind;
+use filmcraft_media::generators::Generator;
 use filmcraft_project::{
     BinId, ClipId, ItemId, ItemKind, Label, Marker, MarkerId, MarkerKind, Param, ParamValue, Sequence, TrackKind, Transition, TransitionAlign, TransitionId,
 };
@@ -34,6 +35,7 @@ use roxmltree::Node;
 use crate::common::{Builder, MediaSpec, empty_sequence, file_name, is_absolute, kind_from_ext, resolve_path, set_param, settings_for, transition_effect};
 use crate::prproj_fx::{self, Ctx, MAX_TIME, Target};
 use crate::prproj_graph::{self, Index, TICKS_PER_SECOND};
+use crate::prproj_mask;
 use crate::xml::{child, child_text, path_text};
 use crate::{Error, Format, ImportOptions, Imported, Report, Result};
 
@@ -100,6 +102,8 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
         links: HashMap::new(),
         nested: HashSet::new(),
         unmapped: BTreeMap::new(),
+        mask_skips: BTreeMap::new(),
+        impact_blurs: 0,
     };
     imp.collect_links(root);
     match root.children().find(|n| n.has_tag_name("RootProjectItem")) {
@@ -121,6 +125,24 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
     for (effect, params) in std::mem::take(&mut imp.unmapped) {
         let list: Vec<&str> = params.iter().map(String::as_str).collect();
         imp.report.warn(format!("effect \"{effect}\": parameter(s) {} not carried over (kept as they are when exporting back to Premiere)", list.join(", ")));
+    }
+    if imp.impact_blurs > 0 {
+        imp.report.info(format!(
+            "{} Gaussian Blur effect(s): Premiere's blur Amount was converted to Blurriness approximately (not yet measured against Premiere)",
+            imp.impact_blurs
+        ));
+    }
+    for ((effect, why), n) in std::mem::take(&mut imp.mask_skips) {
+        let masks = if n == 1 { "mask" } else { "masks" };
+        match why {
+            prproj_mask::Skipped::Object => imp.report.warn(format!(
+                "effect \"{effect}\": {n} Object {masks} (Premiere's automatic subject masks) can't be carried over; the effect applies to the whole clip (kept as they are when exporting back to Premiere)"
+            )),
+            prproj_mask::Skipped::Empty => imp.report.info(format!("effect \"{effect}\": {n} {masks} without a shape skipped")),
+            prproj_mask::Skipped::Unreadable => {
+                imp.report.warn(format!("effect \"{effect}\": {n} {masks} could not be read; the effect applies to the whole clip"))
+            }
+        }
     }
     let mut top: Vec<ItemId> = seqs.iter().map(|(_, id)| *id).filter(|id| !imp.nested.contains(id)).collect();
     if top.is_empty() {
@@ -164,6 +186,10 @@ struct Imp<'a, 'i, 'r> {
     nested: HashSet<ItemId>,
     /// Effect → parameters that could not be mapped (reported once per effect).
     unmapped: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Effect masks that could not be carried over, by effect name and reason.
+    mask_skips: BTreeMap<(String, prproj_mask::Skipped), usize>,
+    /// Premiere Gaussian Blurs (the current one) whose Amount was converted approximately.
+    impact_blurs: usize,
 }
 
 impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
@@ -220,7 +246,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 return;
             }
             if let Some(media) = prproj_graph::clip_media(&self.ix, clip) {
-                if let Some(id) = self.media(media, Some(name), bin)
+                if let Some(id) = self.media(media, Some(name), bin, Some(master))
                     && let Some(m) = self.b.p.item_mut(id).and_then(|i| i.as_media_mut())
                     && m.markers.is_empty()
                 {
@@ -280,13 +306,21 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     }
 
     /// The media item for a `<Media>` object (deduplicated by its UID and by its file).
-    fn media(&mut self, media: Node<'a, 'i>, name: Option<&str>, bin: Option<BinId>) -> Option<ItemId> {
+    /// The item for a Premiere media object. `master` is the master clip it was reached through
+    /// (it says whether the clip is an adjustment layer).
+    fn media(&mut self, media: Node<'a, 'i>, name: Option<&str>, bin: Option<BinId>, master: Option<Node<'a, 'i>>) -> Option<ItemId> {
         let key = media.attribute("ObjectUID").or_else(|| media.attribute("ObjectID"))?;
-        if let Some(id) = self.b.find_media(key) {
+        let adjustment = master.and_then(|m| child_text(m, "IsAdjustmentLayer")).is_some_and(|v| v.trim() == "true");
+        let adj_key = format!("adjustment:{key}");
+        if let Some(id) = self.b.find_media(if adjustment { adj_key.as_str() } else { key }) {
             return Some(id);
         }
         if child_text(media, "ImplementationID").is_some_and(|i| i.trim().eq_ignore_ascii_case(GRAPHIC_IMPORTER)) {
-            return Some(self.graphic(media, key));
+            return Some(match synthetic_kind(child_text(media, "FilePath")) {
+                _ if adjustment => self.adjustment_layer(media, name, bin, &adj_key),
+                Some(g) => self.generator(media, name, bin, key, g),
+                None => self.graphic(media, key),
+            });
         }
         let path = self.media_path(media);
         if path.is_empty() {
@@ -361,28 +395,66 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         id
     }
 
+    /// A Premiere adjustment layer (a master clip marked `IsAdjustmentLayer` over a synthetic
+    /// "Black Video"): FilmCraft's adjustment layer, its effects applying to the tracks below.
+    fn adjustment_layer(&mut self, media: Node<'a, 'i>, name: Option<&str>, bin: Option<BinId>, key: &str) -> ItemId {
+        let v = self.ix.follow(media, &["VideoStream"]);
+        let (width, height) = v.and_then(|v| frame_rect(child_text(v, "FrameRect"))).unwrap_or((1920, 1080));
+        let rate = v.and_then(|v| child_text(v, "FrameRate")).and_then(parse_i64).and_then(rate_of).unwrap_or(FrameRate::FPS_30);
+        let duration = v.and_then(|v| time(child_text(v, "Duration"))).filter(|d| *d > 0).map_or(Tick(MAX_TIME), Tick);
+        let id = self.b.p.add_item(name.unwrap_or("Adjustment Layer"), Label::Lavender, ItemKind::AdjustmentLayer { width, height, rate, duration }, bin);
+        self.b.register_media(key, id);
+        if let Some(uid) = media.attribute("ObjectUID")
+            && let Some(it) = self.b.p.item_mut(id)
+        {
+            it.metadata.insert(META_MEDIA.to_string(), uid.to_string());
+        }
+        id
+    }
+
+    /// Premiere's synthetic media (Color Matte, Black Video, Bars and Tone, Transparent Video) as
+    /// FilmCraft's generators of the same name. A Color Matte's colour is the first three bytes
+    /// (R, G, B) of the media's `ImporterPrefs`.
+    fn generator(&mut self, media: Node<'a, 'i>, name: Option<&str>, bin: Option<BinId>, key: &str, kind: Synthetic) -> ItemId {
+        let g = match kind {
+            Synthetic::ColorMatte => {
+                let prefs = child(media, "ImporterPrefs").and_then(|n| self.binary(n));
+                let color = prefs
+                    .and_then(|b| b.get(..3).map(|c| [c[0], c[1], c[2]]))
+                    .map_or([0.0, 0.0, 0.0, 1.0], |[r, g, b]| [f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0]);
+                Generator::ColorMatte { color }
+            }
+            Synthetic::Black => Generator::BlackVideo,
+            Synthetic::Bars => Generator::BarsAndTone,
+            Synthetic::Transparent => Generator::TransparentVideo,
+        };
+        let mut spec = MediaSpec::default();
+        if let Some(v) = self.ix.follow(media, &["VideoStream"]) {
+            let (w, h) = frame_rect(child_text(v, "FrameRect")).unwrap_or((1920, 1080));
+            let rate = child_text(v, "FrameRate").and_then(parse_i64).and_then(rate_of).unwrap_or(FrameRate::FPS_30);
+            spec.video = Some((w, h, rate));
+            spec.duration = time(child_text(v, "Duration")).filter(|d| *d > 0).map(Tick);
+        }
+        if let Some(a) = self.ix.follow(media, &["AudioStream"]) {
+            let sr = child_text(a, "FrameRate").and_then(parse_i64).filter(|t| *t > 0).map(|t| (TICKS_PER_SECOND / t) as u32).unwrap_or(48_000);
+            spec.audio = Some((sr, 2));
+        }
+        let title = name.or_else(|| child_text(media, "Title")).unwrap_or("Generated").to_string();
+        let id = self.b.generator_media(key, &title, g, &spec, bin);
+        if let Some(uid) = media.attribute("ObjectUID")
+            && let Some(it) = self.b.p.item_mut(id)
+        {
+            it.metadata.insert(META_MEDIA.to_string(), uid.to_string());
+        }
+        id
+    }
+
     /// The bytes of a binary value (`Encoding="base64"`), stored in the element or, when another
     /// element with the same `BinaryHash` holds them, there.
     fn binary(&mut self, el: Node<'a, 'i>) -> Option<Vec<u8>> {
-        let own = el.text().map(str::trim).filter(|t| !t.is_empty());
-        let text = match own {
-            Some(t) => t,
-            None => {
-                let hash = el.attribute("BinaryHash")?;
-                let root = self.root;
-                let map = self.payloads.get_or_insert_with(|| {
-                    let mut m = HashMap::new();
-                    for n in root.descendants().filter(Node::is_element) {
-                        if let (Some(h), Some(t)) = (n.attribute("BinaryHash"), n.text().map(str::trim).filter(|t| !t.is_empty())) {
-                            m.entry(h).or_insert(t);
-                        }
-                    }
-                    m
-                });
-                map.get(hash).copied()?
-            }
-        };
-        crate::prproj_text::base64(text)
+        let root = self.root;
+        let map = self.payloads.get_or_insert_with(|| payloads(root));
+        binary_in(map, el)
     }
 
     /// A Premiere text layer as a FilmCraft text layer: the decoded `Source Text` (text, font,
@@ -554,7 +626,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             }
             id
         } else if let Some(media) = prproj_graph::clip_media(&self.ix, clip) {
-            self.media(media, None, None)
+            let master = self.ix.follow(sub, &["MasterClip"]);
+            self.media(media, None, None, master)
         } else {
             None
         };
@@ -616,6 +689,9 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 Target::Effect(def) => {
                     // an effect FilmCraft has: one instance per Premiere component, in order
                     ti.effects.push(def.instance());
+                    if c.match_name == prproj_fx::IMPACT_BLUR {
+                        self.impact_blurs += 1;
+                    }
                 }
                 Target::Motion | Target::Opacity | Target::Volume => {}
             }
@@ -634,6 +710,33 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                     set_param(ti, m.effect, m.param, p);
                 }
             }
+            self.masks(ti, c, target, ctx);
+        }
+    }
+
+    /// The masks of an effect (and of Opacity, where they cut out the clip). Without them a
+    /// masked effect would apply to the whole frame.
+    fn masks(&mut self, ti: &mut filmcraft_project::TrackItem, c: &prproj_fx::Component<'a, 'i>, target: Target, ctx: &Ctx) {
+        let id = match target {
+            Target::Effect(def) => def.id,
+            Target::Opacity => "opacity",
+            _ => return,
+        };
+        if prproj_mask::components(&self.ix, c.node).is_empty() {
+            return;
+        }
+        let root = self.root;
+        let map = self.payloads.get_or_insert_with(|| payloads(root));
+        let read = prproj_mask::read(&self.ix, c.node, ctx, &mut |n| binary_in(map, n));
+        for why in read.skipped {
+            *self.mask_skips.entry((c.label().to_string(), why)).or_insert(0) += 1;
+        }
+        if read.masks.is_empty() {
+            return;
+        }
+        // the instance pushed for this component is the last one with this id
+        if let Some(e) = ti.effects.iter_mut().rev().find(|e| e.effect == id) {
+            e.masks = read.masks;
         }
     }
 
@@ -676,6 +779,50 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     }
 }
 
+/// Premiere's synthetic media FilmCraft has a generator for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Synthetic {
+    ColorMatte,
+    Black,
+    Bars,
+    Transparent,
+}
+
+/// The synthetic media a `FilePath` type code names (a four-character code as a number:
+/// `COLR` Color Matte, `BLAK` Black Video, `BARS` Bars and Tone, `TRNV` Transparent Video).
+/// Graphics (`GRFV`) and anything else are `None`.
+fn synthetic_kind(path: Option<&str>) -> Option<Synthetic> {
+    let code: u32 = path?.trim().parse().ok()?;
+    match &code.to_be_bytes() {
+        b"COLR" => Some(Synthetic::ColorMatte),
+        b"BLAK" => Some(Synthetic::Black),
+        b"BARS" => Some(Synthetic::Bars),
+        b"TRNV" => Some(Synthetic::Transparent),
+        _ => None,
+    }
+}
+
+/// Every inline binary payload of the document by its `BinaryHash` (the first one wins).
+pub(crate) fn payloads<'a>(root: Node<'a, '_>) -> HashMap<&'a str, &'a str> {
+    let mut m = HashMap::new();
+    for n in root.descendants().filter(Node::is_element) {
+        if let (Some(h), Some(t)) = (n.attribute("BinaryHash"), n.text().map(str::trim).filter(|t| !t.is_empty())) {
+            m.entry(h).or_insert(t);
+        }
+    }
+    m
+}
+
+/// The bytes of a base64 element: its own text, else the payload stored under its `BinaryHash`.
+pub(crate) fn binary_in(payloads: &HashMap<&str, &str>, el: Node<'_, '_>) -> Option<Vec<u8>> {
+    let own = el.text().map(str::trim).filter(|t| !t.is_empty());
+    let text = match own {
+        Some(t) => t,
+        None => payloads.get(el.attribute("BinaryHash")?).copied()?,
+    };
+    crate::prproj_text::base64(text)
+}
+
 /// Whether the importer brings a Premiere track item into FilmCraft. The writer keeps every item
 /// that it does not (FilmCraft never showed it, so it cannot have been edited away).
 pub(crate) fn importable(ix: &Index<'_, '_>, item: Node<'_, '_>) -> bool {
@@ -702,7 +849,9 @@ pub(crate) fn source_frame(p: &filmcraft_project::Project, item: ItemId) -> Opti
     match &p.item(item)?.kind {
         filmcraft_project::ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width as f64, v.height as f64)),
         filmcraft_project::ItemKind::Sequence(s) => Some((s.settings.width as f64, s.settings.height as f64)),
-        filmcraft_project::ItemKind::Graphic { width, height, .. } => Some((*width as f64, *height as f64)),
+        filmcraft_project::ItemKind::Graphic { width, height, .. } | filmcraft_project::ItemKind::AdjustmentLayer { width, height, .. } => {
+            Some((*width as f64, *height as f64))
+        }
         _ => None,
     }
 }

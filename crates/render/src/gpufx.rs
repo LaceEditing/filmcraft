@@ -290,7 +290,7 @@ impl FxOp {
             "invert" => FxOp::Invert { channel: choice(e, "channel"), blend: f(e, "blend", cx) / 100.0 },
             "posterize" => FxOp::Posterize { n: f(e, "levels", cx).max(2.0) - 1.0 },
             "gaussian_blur" | "gaussian_blur_legacy" => {
-                let r = f(e, "blurriness", cx) * cx.px_scale * 0.5;
+                let r = f(e, "blurriness", cx) * cx.px_scale * 0.285;
                 let dims = choice(e, "dimensions");
                 let (rx, ry) = gaussian_boxes(w, h, if dims == 2 { 0.0 } else { r }, if dims == 1 { 0.0 } else { r });
                 FxOp::Gaussian { rx, ry, repeat: b(e, "repeat_edge") }
