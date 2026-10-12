@@ -241,6 +241,40 @@ fn learn_layouts(s: &Session, bytes: &[u8], at_defaults: bool) -> usize {
     n
 }
 
+/// The `.prproj` files under `root` (or `root` itself), skipping symbolic links (a drive can
+/// have links back up to `/`), hidden folders and Premiere's auto-save copies; bounded.
+fn prproj_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    const MAX_DIRS: usize = 200_000;
+    const MAX_FILES: usize = 5_000;
+    if root.is_file() {
+        return if is_prproj(&root.to_string_lossy()) { vec![root.to_path_buf()] } else { Vec::new() };
+    }
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut dirs = 0;
+    while let Some(dir) = stack.pop() {
+        dirs += 1;
+        if dirs > MAX_DIRS || files.len() >= MAX_FILES {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.filter_map(|e| e.ok()) {
+            // the entry's own type: a link is not followed
+            let Ok(t) = e.file_type() else { continue };
+            let name = e.file_name().to_string_lossy().to_string();
+            if t.is_dir() {
+                if !name.starts_with('.') && name != "Adobe Premiere Pro Auto-Save" {
+                    stack.push(e.path());
+                }
+            } else if t.is_file() && is_prproj(&name) {
+                files.push(e.path());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 /// `file.learnPremiereLayouts {path, atDefaults?}`: learn the effect and transition layouts of a
 /// Premiere project, or of every `.prproj` under a folder. `atDefaults` (or a file name with
 /// "Layout Kit"): the effects are at Premiere's default settings, so effects with settings
@@ -248,20 +282,7 @@ fn learn_layouts(s: &Session, bytes: &[u8], at_defaults: bool) -> usize {
 pub fn learn_layouts_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let path = p.get("path").and_then(Value::as_str).ok_or_else(|| EngineError::Other("file.learnPremiereLayouts: need `path`".into()))?.to_string();
     let at_defaults = p.get("atDefaults").and_then(Value::as_bool).unwrap_or(false);
-    let mut files = Vec::new();
-    let mut stack = vec![std::path::PathBuf::from(&path)];
-    while let Some(p) = stack.pop() {
-        if p.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&p) {
-                stack.extend(entries.filter_map(|e| e.ok()).map(|e| e.path()));
-            }
-        } else if is_prproj(&p.to_string_lossy()) {
-            files.push(p);
-        }
-        if files.len() > 5_000 {
-            break;
-        }
-    }
+    let files = prproj_files_under(std::path::Path::new(&path));
     let mut learned = 0;
     for f in &files {
         if let Ok(bytes) = std::fs::read(f) {

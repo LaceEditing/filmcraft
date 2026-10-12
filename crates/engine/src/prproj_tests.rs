@@ -310,4 +310,12 @@ fn effect_layouts_are_learned_from_premiere_projects() {
     let r = s.execute("file.learnPremiereLayouts", json!({"path": models.to_string_lossy()})).unwrap();
     assert!(r["learned"].as_u64().unwrap() > 0, "{r}");
     assert!(std::fs::read_to_string(lib.join("effect.tint.prproj")).unwrap().contains("FilmCraftLayoutAtDefaults=\"true\""));
+    // a link back up the tree (drives have them, even to `/`) is not followed
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&dir, models.join("loop")).unwrap();
+        std::os::unix::fs::symlink("/", models.join("root")).unwrap();
+        let r = s.execute("file.learnPremiereLayouts", json!({"path": models.to_string_lossy()})).unwrap();
+        assert_eq!(r["projects"], 2, "{r}");
+    }
 }
