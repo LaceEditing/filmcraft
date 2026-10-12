@@ -488,3 +488,29 @@ fn track_header_menu_adds_renames_and_deletes_tracks() {
     assert!(matches!(d.app().dialog, Some(filmcraft_ui_egui::Dialog::AddTracks)));
     assert_eq!(d.app().ui.add_tracks.video_after, 1);
 }
+
+/// Cmd/Ctrl+C and Cmd/Ctrl+V arrive from the window as Copy / Paste events (the key press is
+/// dropped), so they never copied or pasted clips. They do now, into any open sequence.
+#[test]
+fn copy_and_paste_keys_work_across_sequences() {
+    let mut d = Driver::new();
+    let [a, _, _] = three_clips(&mut d);
+    let y = d.y(a);
+    d.click(d.x(24.0), y, json!({}));
+    assert!(d.selected().contains(&a));
+    // the window's Copy event enters through the input hook, as it does in the app
+    d.harness.input_mut().events.push(egui::Event::Copy);
+    d.frames(3);
+    assert_eq!(d.app().session.state.clipboard.len(), 2, "picture and sound copied");
+    // a second sequence: paste at its start
+    d.exec("file.newSequence", json!({"name": "Other", "video": 2, "audio": 2}));
+    d.ok("ui.set", json!({"focused": "Timeline"}));
+    d.exec("playhead.set", json!({"seconds": 0}));
+    d.harness.input_mut().events.push(egui::Event::Paste(String::new()));
+    d.frames(3);
+    let app = d.app();
+    let active = app.session.state.active_sequence.unwrap();
+    assert_eq!(app.session.project.item(active).unwrap().name, "Other");
+    let q = app.session.active_sequence().unwrap();
+    assert_eq!((q.video_tracks[0].items.len(), q.audio_tracks[0].items.len()), (1, 1), "pasted into the other sequence");
+}

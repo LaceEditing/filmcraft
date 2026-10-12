@@ -83,12 +83,63 @@ impl Driver {
 
 #[test]
 fn ctrl_s_saves_a_premiere_project_as_prproj() {
+    // the default: Save writes into the Premiere Pro project the sequences came from (a backup
+    // of the original is kept), without asking
     let dir = std::env::temp_dir().join(format!("fc-prproj-save-ui-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("show.prproj");
     std::fs::write(&src, prproj()).unwrap();
     let mut s = Session::default();
     s.prefs_path = Some(dir.join("preferences.json"));
+    assert_eq!(s.prefs.general.save_premiere_projects, "premiereOriginal", "the default");
+    s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = channel();
+    let mut app = FilmcraftApp::new(s).with_control(rx);
+    let n = asked.clone();
+    app.hooks.pick_save_as = Some(Box::new(move |_, _, _| {
+        n.fetch_add(1, Ordering::Relaxed);
+        None
+    }));
+    let n = asked.clone();
+    app.hooks.pick_save = Some(Box::new(move |_| {
+        n.fetch_add(1, Ordering::Relaxed);
+        None
+    }));
+    let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).build_eframe(move |_cc| app);
+    let mut d = Driver { harness, tx };
+    d.frames(4);
+    // an edit, then Ctrl+S
+    d.ok("engine.execute", json!({"command": "playhead.set", "params": {"seconds": 4.0}}));
+    d.ok("engine.execute", json!({"command": "sequence.addEditAllTracks", "params": {}}));
+    assert!(d.harness.state().session.is_dirty());
+    d.ok("ui.key", json!({"key": "Cmd+S"}));
+    d.frames(3);
+    assert_eq!(asked.load(Ordering::Relaxed), 0, "no dialog: Save knows where");
+    let first = std::fs::read_to_string(&src).expect("the .prproj is there");
+    assert_ne!(first, prproj(), "written into the original");
+    assert_eq!(std::fs::read_to_string(dir.join("show.prproj.before-filmcraft")).unwrap(), prproj(), "the original is kept as a backup");
+    assert!(!d.harness.state().session.is_dirty(), "saved");
+    // another edit; Ctrl+S writes there again
+    d.ok("engine.execute", json!({"command": "playhead.set", "params": {"seconds": 6.0}}));
+    d.ok("engine.execute", json!({"command": "sequence.addEditAllTracks", "params": {}}));
+    d.ok("ui.key", json!({"key": "Cmd+S"}));
+    d.frames(3);
+    assert_eq!(asked.load(Ordering::Relaxed), 0, "still not asked");
+    assert_ne!(std::fs::read_to_string(&src).unwrap(), first, "written again with the new edit");
+    assert!(!d.harness.state().session.is_dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ctrl_s_with_the_copy_preference_asks_once_and_keeps_the_original() {
+    let dir = std::env::temp_dir().join(format!("fc-prproj-copy-ui-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("show.prproj");
+    std::fs::write(&src, prproj()).unwrap();
+    let mut s = Session::default();
+    s.prefs_path = Some(dir.join("preferences.json"));
+    s.prefs.general.save_premiere_projects = "premiereCopy".into();
     s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
     let asked = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = channel();
@@ -103,23 +154,19 @@ fn ctrl_s_saves_a_premiere_project_as_prproj() {
     let mut d = Driver { harness, tx };
     d.frames(4);
     let out = dir.join("show (FilmCraft).prproj");
-    // an edit, then Ctrl+S
     d.ok("engine.execute", json!({"command": "playhead.set", "params": {"seconds": 4.0}}));
     d.ok("engine.execute", json!({"command": "sequence.addEditAllTracks", "params": {}}));
-    assert!(d.harness.state().session.is_dirty());
     d.ok("ui.key", json!({"key": "Cmd+S"}));
     d.frames(3);
     assert_eq!(asked.load(Ordering::Relaxed), 1, "asked where, once");
     let first = std::fs::read(&out).expect("the .prproj was written");
     assert!(!d.harness.state().session.is_dirty(), "saved");
-    // another edit; Ctrl+S writes there again without asking
     d.ok("engine.execute", json!({"command": "playhead.set", "params": {"seconds": 6.0}}));
     d.ok("engine.execute", json!({"command": "sequence.addEditAllTracks", "params": {}}));
     d.ok("ui.key", json!({"key": "Cmd+S"}));
     d.frames(3);
     assert_eq!(asked.load(Ordering::Relaxed), 1, "not asked again");
     assert_ne!(std::fs::read(&out).unwrap(), first, "written again with the new edit");
-    assert!(!d.harness.state().session.is_dirty());
     assert_eq!(std::fs::read_to_string(&src).unwrap(), prproj(), "the original is untouched");
     let _ = std::fs::remove_dir_all(&dir);
 }

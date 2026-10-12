@@ -193,6 +193,15 @@ pub fn panel_menu_popup(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
             // the Timeline's tabs are its open sequences: Close Panel closes the active one and
             // keeps the panel (Premiere's wording and behaviour)
             if p == PanelKind::Timeline && app.session.state.active_sequence.is_some() {
+                let r = ui.button("Sequence Settings…");
+                app.auto.add("panel.menu.Timeline.sequenceSettings", r.rect, "Sequence Settings…");
+                if r.clicked() {
+                    if let Err(e) = crate::menus::invoke(app, ui.ctx(), "sequence.settings", serde_json::json!({})) {
+                        app.ui.status = e;
+                    }
+                    close = true;
+                }
+                ui.separator();
                 let r = ui.button("Close Panel");
                 app.auto.add("panel.menu.Timeline.close", r.rect, "Close Panel");
                 if r.clicked() {

@@ -207,7 +207,7 @@ fn graphic_eq_and_dynamics_editors() {
     // Dynamics: the transfer curve and section toggles
     d.exec("effects.apply", json!({"clips": [clip], "effect": "dynamics_rack"}));
     d.frames(3);
-    d.click("effectControls.effect.graphic_eq_30");
+    d.click("effectControls.effect.graphic_eq_30.fold");
     d.click("effectControls.effect.dynamics_rack.edit");
     d.frames(3);
     // Premiere's four sections: switches, knobs and meters

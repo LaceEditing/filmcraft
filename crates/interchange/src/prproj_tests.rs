@@ -570,11 +570,15 @@ fn adjustment_layers_and_color_mattes_come_in_as_themselves() {
 /// an unchanged project still writes back unchanged.
 #[test]
 fn the_current_gaussian_blur_amount_comes_in() {
-    let doc = doc().replace(
-        r#"<DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName>"#,
-        r#"<DisplayName>Gaussian Blur</DisplayName></Component><MatchName>AE.Impact_Blur_FX</MatchName>"#,
-    )
-    .replace(r#"<Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>"#, r#"<Name>Amount</Name><StartKeyframe>-91445760000000000,20.,0,0,0,0,0,0</StartKeyframe><Keyframes>"#);
+    let doc = doc()
+        .replace(
+            r#"<DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName>"#,
+            r#"<DisplayName>Gaussian Blur</DisplayName></Component><MatchName>AE.Impact_Blur_FX</MatchName>"#,
+        )
+        .replace(
+            r#"<Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>"#,
+            r#"<Name>Amount</Name><StartKeyframe>-91445760000000000,20.,0,0,0,0,0,0</StartKeyframe><Keyframes>"#,
+        );
     assert!(doc.contains("AE.Impact_Blur_FX") && doc.contains("<Name>Amount</Name>"));
     let (imp, report) = import(doc.as_bytes(), Some("/edits/show"));
     let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();

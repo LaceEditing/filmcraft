@@ -550,7 +550,7 @@ fn mode_p(p: &Value) -> Option<AutomationMode> {
     str_p(p, "mode").and_then(AutomationMode::from_name)
 }
 
-pub(crate) fn channels_name(c: AudioChannels) -> &'static str {
+pub fn channels_name(c: AudioChannels) -> &'static str {
     match c {
         AudioChannels::Mono => "Mono",
         AudioChannels::Stereo => "Stereo",

@@ -810,12 +810,15 @@ impl<'a, 'i> Writer<'a, 'i> {
                 .at(obj, &["ClipTrackItem", "TrackItem"])
                 .map(|t| time(child_text(t, "End")).unwrap_or(0) - time(child_text(t, "Start")).unwrap_or(0))
                 .unwrap_or(0);
-            let timing_changed = old_in != c.source_in.0 || (old_speed - new_speed).abs() > 1e-12 || old_dur != c.duration.0;
-            if old_in != c.source_in.0 {
-                self.set_child(clip_inst, body, "InPoint", &c.source_in.0.to_string());
+            let timing_changed = old_in != c.source_in.0.max(0) || (old_speed - new_speed).abs() > 1e-12 || old_dur != c.duration.0;
+            // a clip of endless media (an adjustment layer, a graphic) extended left of where it
+            // was made has a negative In point in FilmCraft; Premiere's In points start at 0
+            let source_in = c.source_in.0.max(0);
+            if old_in != source_in {
+                self.set_child(clip_inst, body, "InPoint", &source_in.to_string());
             }
             if timing_changed {
-                let out = c.source_in.0.saturating_add(scaled(c.duration, c.speed).0);
+                let out = source_in.saturating_add(scaled(c.duration, c.speed).0);
                 self.set_child(clip_inst, body, "OutPoint", &out.to_string());
             }
             if (old_speed - new_speed).abs() > 1e-12 {

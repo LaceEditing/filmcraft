@@ -78,7 +78,7 @@ impl Default for GeneralPrefs {
             show_compatibility_issues: true,
             show_project_bin_in_tab: true,
             show_mask_tracker_preview: true,
-            save_premiere_projects: "premiereCopy".into(),
+            save_premiere_projects: "premiereOriginal".into(),
             recent_projects: Vec::new(),
         }
     }
@@ -604,8 +604,8 @@ const fn float(min: f64, max: f64, decimals: usize, unit: &'static str) -> Kind 
 
 const STARTUP: &[(&str, &str)] = &[("showHome", "Show Home"), ("openMostRecent", "Open Most Recent"), ("emptyProject", "Start with an Empty Project")];
 const SAVE_PREMIERE: &[(&str, &str)] = &[
-    ("premiereCopy", "As a Premiere Pro project, beside the original"),
-    ("premiereOriginal", "As a Premiere Pro project, over the original (a backup is kept)"),
+    ("premiereOriginal", "Into the Premiere Pro project it came from (a backup is kept)"),
+    ("premiereCopy", "As a new Premiere Pro project beside the original"),
     ("filmcraft", "As a FilmCraft project (.fcproj)"),
 ];
 const OPENING: &[(&str, &str)] = &[("showOpenDialog", "Show Open Dialog"), ("showHome", "Show Home")];

@@ -163,9 +163,17 @@ fn builtins_apply_and_user_presets_persist() {
     let all = l["presets"].as_array().unwrap();
     assert!(all.len() >= 8);
     assert!(all.iter().all(|p| p["builtin"] == true));
+    // a preset goes on a clip of its kind: the audio settings presets on the first sound clip
+    let sound = s.active_sequence().unwrap().audio_tracks[0].items[0].id;
     for p in all {
         let name = p["name"].as_str().unwrap();
-        s.execute("presets.apply", json!({"preset": name, "clips": [clips[0].0]})).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let audio = crate::presets::builtin_presets()
+            .into_iter()
+            .find(|b| b.name == name)
+            .and_then(|b| b.effects.first().and_then(|e| e.def()).map(|d| d.kind == filmcraft_project::EffectKind::Audio))
+            .unwrap_or(false);
+        let target = if audio { sound } else { clips[0] };
+        s.execute("presets.apply", json!({"preset": name, "clips": [target.0]})).unwrap_or_else(|e| panic!("{name}: {e}"));
     }
     // Fade Out anchors to the out point
     let it = item(&s, clips[0]);
@@ -237,4 +245,27 @@ fn effect_settings_presets_from_inserts_and_clips() {
     assert!(ins.param("boost").is_some_and(|p| p.keyframes.is_empty()));
     assert!(s.execute("presets.saveSettings", json!({"name": "(Default)", "strip": "A1", "slot": 0})).is_err(), "reserved name");
     assert!(s.execute("presets.saveSettings", json!({"name": "x", "strip": "A1", "slot": 4})).is_err());
+}
+
+/// The built-in audio settings presets (the Fx editors' Presets menus): each holds one effect
+/// that exists, with parameters the effect has, and applies through `presets.applySettings`.
+#[test]
+fn builtin_audio_settings_presets_are_valid_and_apply() {
+    let audio: Vec<_> = crate::presets::builtin_presets().into_iter().filter(|p| p.source_duration == Tick::ZERO).collect();
+    assert!(audio.len() >= 20, "{}", audio.len());
+    for p in &audio {
+        let [e] = p.effects.as_slice() else { panic!("{}: one effect", p.name) };
+        let def = filmcraft_project::find_effect(&e.effect).unwrap_or_else(|| panic!("{}: unknown effect {}", p.name, e.effect));
+        for id in e.params.keys() {
+            assert!(def.params.iter().any(|d| d.id == id), "{}: {} has no parameter {id}", p.name, e.effect);
+        }
+    }
+    let (mut s, _) = demo();
+    let c = s.active_sequence().unwrap().audio_tracks[0].items[0].id;
+    s.execute("effects.apply", json!({"clips": [c.0], "effect": "dynamics_rack"})).unwrap();
+    let idx = item(&s, c).effects.iter().position(|e| e.effect == "dynamics_rack").unwrap();
+    s.execute("presets.applySettings", json!({"preset": "Auto Gate", "clip": c.0, "index": idx})).unwrap();
+    let e = item(&s, c).effects[idx].clone();
+    assert_eq!(e.params["gate_on"].value, ParamValue::Bool(true));
+    assert_eq!(e.params["gate_threshold"].value, ParamValue::Float(-45.0));
 }

@@ -2419,7 +2419,10 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         if ctx.input(|i| i.pointer.any_released())
             && let Some((vt, at)) = tracks
         {
-            let r = app.session.execute("timeline.place", json!({"item": item.0, "track": vt, "audioTrack": at, "time": t.0, "insert": mods.command, "addTracks": past.is_some()}));
+            let r = app.session.execute(
+                "timeline.place",
+                json!({"item": item.0, "track": vt, "audioTrack": at, "time": t.0, "insert": mods.command, "addTracks": past.is_some()}),
+            );
             if let Err(e) = r {
                 app.ui.status = e.to_string();
             }
@@ -2461,17 +2464,20 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             if ctx.input(|i| i.pointer.any_released()) {
                 let is_transition = filmcraft_project::find_effect(&effect)
                     .is_some_and(|d| matches!(d.kind, filmcraft_project::EffectKind::VideoTransition | filmcraft_project::EffectKind::AudioTransition));
+                // dropped on a selected clip: every selected clip gets it (Premiere)
+                let sel = &app.session.state.selection;
+                let targets: Vec<u64> = if sel.contains(&clip) { sel.iter().map(|c| c.0).collect() } else { vec![clip.0] };
                 let r = if let Some(name) = effect.strip_prefix("preset:") {
-                    app.session.execute("presets.apply", json!({"preset": name, "clips": [clip.0]}))
+                    app.session.execute("presets.apply", json!({"preset": name, "clips": targets}))
                 } else if is_transition {
                     let edge = if p.x - layout.x_of(it.start) < layout.x_of(it.end()) - p.x { "in" } else { "out" };
                     app.session.execute("effects.apply", json!({"effect": effect, "clip": clip.0, "edge": edge}))
                 } else {
-                    app.session.execute("effects.apply", json!({"effect": effect, "clips": [clip.0]}))
+                    app.session.execute("effects.apply", json!({"effect": effect, "clips": targets}))
                 };
                 if let Err(e) = r {
                     app.ui.status = e.to_string();
-                } else {
+                } else if !app.session.state.selection.contains(&clip) {
                     let _ = app.session.execute("timeline.select", json!({"clips": [clip.0]}));
                 }
                 crate::panels::clear_drag(ui);

@@ -138,7 +138,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let key = format!("{}:{}", clip.0, idx);
             let open = !app.ui.collapsed_fx.contains(&key);
             let (r, resp) = bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::click());
-            if resp.hovered() {
+            let selected = app.ui.fx_selected.contains(&(clip.0, idx));
+            if selected {
+                bui.painter().rect_filled(r, 0.0, t.row_selected);
+            } else if resp.hovered() {
                 bui.painter().rect_filled(r, 0.0, t.hover);
             }
             icons::paint(
@@ -166,6 +169,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 actions.push(("effects.reset".into(), json!({"clip": clip.0, "index": idx})));
             }
             app.auto.add(&format!("effectControls.effect.{}", e.effect), r, def.name);
+            app.auto.add(
+                &format!("effectControls.effect.{}.fold", e.effect),
+                Rect::from_min_size(r.min, vec2(20.0, r.height())),
+                if open { "fold" } else { "unfold" },
+            );
             // summary keyframes: every time any parameter of the effect has one
             let mut times: Vec<Tick> = e.params.values().flat_map(|p| p.keyframes.iter().map(|k| k.time)).collect();
             times.sort_unstable();
@@ -183,17 +191,35 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 ));
             }
             if resp.clicked() && !fxresp.clicked() && !rresp.clicked() {
-                if open {
-                    app.ui.collapsed_fx.push(key.clone());
+                let mods = bui.input(|i| i.modifiers);
+                let on_chevron = resp.interact_pointer_pos().is_some_and(|p| p.x < r.min.x + 20.0);
+                if on_chevron {
+                    if open {
+                        app.ui.collapsed_fx.push(key.clone());
+                    } else {
+                        app.ui.collapsed_fx.retain(|k| *k != key);
+                    }
                 } else {
-                    app.ui.collapsed_fx.retain(|k| *k != key);
+                    // the name selects the effect (Cmd/Ctrl adds or removes, Shift extends from
+                    // the last one), as in Premiere; a preset can be saved from several at once
+                    select_effect(app, clip.0, idx, mods, &it);
                 }
+            }
+            // a right-click on an unselected effect selects it alone first
+            if resp.secondary_clicked() && !selected {
+                app.ui.fx_selected = vec![(clip.0, idx)];
             }
             let mut save_preset = false;
             let fx_id = e.effect.clone();
+            let picked: Vec<usize> = {
+                let mut v: Vec<usize> = app.ui.fx_selected.iter().filter(|(c, _)| *c == clip.0).map(|(_, i)| *i).collect();
+                v.sort_unstable();
+                if v.contains(&idx) { v } else { vec![idx] }
+            };
             resp.context_menu(|ui| {
-                let sp = ui.button("Save Preset…");
-                app.auto.add(&format!("effectControls.effect.{fx_id}.savePreset"), sp.rect, "Save Preset…");
+                let label = if picked.len() > 1 { format!("Save Preset… ({} effects)", picked.len()) } else { "Save Preset…".to_string() };
+                let sp = ui.button(&label);
+                app.auto.add(&format!("effectControls.effect.{fx_id}.savePreset"), sp.rect, &label);
                 if sp.clicked() {
                     save_preset = true;
                     ui.close();
@@ -204,7 +230,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             });
             if save_preset {
-                crate::panels::presets::open_save(app, clip.0, vec![idx], def.name);
+                let name = if picked.len() > 1 { format!("{} + {}", def.name, picked.len() - 1) } else { def.name.to_string() };
+                crate::panels::presets::open_save(app, clip.0, picked.clone(), &name);
             }
             if !open {
                 continue;
@@ -243,6 +270,33 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if let Err(e) = app.session.execute(&cmd, p) {
             app.ui.status = e.to_string();
         }
+    }
+}
+
+/// Effect Controls selection: a click selects the effect, Cmd/Ctrl-click toggles it, Shift-click
+/// selects the range from the last picked effect (in the panel's order: fixed effects first).
+fn select_effect(app: &mut FilmcraftApp, clip: u64, idx: usize, mods: egui::Modifiers, it: &TrackItem) {
+    let sel = &mut app.ui.fx_selected;
+    sel.retain(|(c, _)| *c == clip);
+    if mods.command || mods.ctrl {
+        if let Some(i) = sel.iter().position(|x| *x == (clip, idx)) {
+            sel.remove(i);
+        } else {
+            sel.push((clip, idx));
+        }
+    } else if mods.shift && !sel.is_empty() {
+        let mut order: Vec<usize> = (0..it.effects.len()).collect();
+        order.sort_by_key(|i| !it.effects[*i].def().is_some_and(|d| d.intrinsic));
+        let at = |i: usize| order.iter().position(|o| *o == i).unwrap_or(0);
+        let last = sel.last().map_or(idx, |(_, i)| *i);
+        let (a, b) = (at(last).min(at(idx)), at(last).max(at(idx)));
+        for o in &order[a..=b] {
+            if !sel.contains(&(clip, *o)) {
+                sel.push((clip, *o));
+            }
+        }
+    } else {
+        *sel = vec![(clip, idx)];
     }
 }
 

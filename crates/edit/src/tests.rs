@@ -705,3 +705,29 @@ fn shorter_head_closes_the_stretch_after_the_cut_on_sync_locked_tracks() {
         assert_eq!(fx.spans(v1), vec![(0, 10), (10, 10), (20, 10)], "unchanged on failure");
     }
 }
+
+/// A clip of media without an end (adjustment layer, graphic, still, generator) has no start
+/// either: its In edge drags left past where it was made (as in Premiere), the source In going
+/// negative; a clip of real media still stops at the media's start.
+#[test]
+fn endless_media_extends_left_past_its_source_in() {
+    let mut fx = Fx::new();
+    let it = fx.item(100, 50, 0);
+    let id = it.id;
+    fx.seq.video_tracks[0].items.push(it);
+    let endless = |_: ItemId| -> Option<Tick> { None };
+    let mut next = fx.next;
+    let mut ctx = EditCtx { next_id: &mut next, media_duration: &endless, media_start: &|_| Tick::ZERO, min_duration: f(1) };
+    let d = trim(&mut fx.seq, id, Edge::In, TrimMode::Regular, f(-40), &mut ctx).unwrap();
+    assert_eq!(d, f(-40));
+    let it = fx.seq.video_tracks[0].items.iter().find(|i| i.id == id).unwrap();
+    assert_eq!((it.start, it.duration, it.source_in), (f(60), f(90), f(-40)));
+    // real media: no head room at source In 0
+    let mut fx = Fx::new();
+    let it = fx.item(100, 50, 0);
+    let id = it.id;
+    fx.seq.video_tracks[0].items.push(it);
+    let mut next = fx.next;
+    let mut ctx = Fx::ctx(&mut next);
+    assert_eq!(trim(&mut fx.seq, id, Edge::In, TrimMode::Regular, f(-40), &mut ctx).unwrap(), Tick::ZERO);
+}

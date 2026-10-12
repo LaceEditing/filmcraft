@@ -178,3 +178,69 @@ fn timeline_has_a_tab_per_open_sequence() {
     assert!(d.has_timeline());
     assert!(d.has(&format!("timeline.tab.{main}")));
 }
+
+/// Sequence ▸ Sequence Settings… (also on a sequence's Project panel and tab menus) opens a
+/// dialog with the active sequence's settings; OK applies them. There was no way to change
+/// them in the app before.
+#[test]
+fn sequence_settings_dialog_edits_the_active_sequence() {
+    let mut d = Driver::new();
+    let before = d.app().session.active_sequence().unwrap().settings.clone();
+    d.menu("sequence.settings");
+    assert!(matches!(d.app().dialog, Some(filmcraft_ui_egui::Dialog::SequenceSettings)), "the dialog opened");
+    assert!(d.has("sequenceSettings.ok"));
+    assert_eq!((d.app().ui.sequence_settings.width, d.app().ui.sequence_settings.height), (before.width, before.height), "filled from the sequence");
+    d.app().ui.sequence_settings.width = 1280;
+    d.app().ui.sequence_settings.height = 720;
+    d.app().ui.sequence_settings.fps = 25.0;
+    d.app().ui.sequence_settings.name = "Renamed".into();
+    d.click("sequenceSettings.ok");
+    assert!(d.app().dialog.is_none(), "closed");
+    let app = d.app();
+    let active = app.session.state.active_sequence.unwrap();
+    let q = app.session.active_sequence().unwrap();
+    assert_eq!((q.settings.width, q.settings.height, q.settings.frame_rate.as_f64()), (1280, 720, 25.0));
+    assert_eq!(app.session.project.item(active).unwrap().name, "Renamed");
+    // the sequence tab's right-click menu (the panel menu, as in Premiere) reaches it too
+    let tab = format!("timeline.tab.{}", active.0);
+    assert!(d.has(&tab));
+    d.ok("ui.click", json!({"id": tab, "button": "right"}));
+    d.frames(2);
+    d.click("panel.menu.Timeline.sequenceSettings");
+    assert!(matches!(d.app().dialog, Some(filmcraft_ui_egui::Dialog::SequenceSettings)));
+    d.click("sequenceSettings.cancel");
+    assert!(d.app().dialog.is_none());
+}
+
+/// Closing the window with unsaved changes asks first (Save / Don't Save / Cancel); it used to
+/// close at once, leaving the changes to the recovery journal and the next launch's prompt.
+#[test]
+fn closing_with_unsaved_changes_asks_first() {
+    let mut d = Driver::new();
+    d.exec("playhead.set", json!({"seconds": 2.0}));
+    d.exec("sequence.addEditAllTracks", json!({}));
+    assert!(d.app().session.is_dirty());
+    let close = |d: &mut Driver| {
+        // the window's one close request (the harness keeps viewport events: clear it after)
+        d.harness.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+        d.frames(2);
+        if let Some(v) = d.harness.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
+            v.events.clear();
+        }
+        d.frames(1);
+    };
+    close(&mut d);
+    assert!(matches!(d.app().dialog, Some(filmcraft_ui_egui::Dialog::CloseConfirm)), "the prompt opened");
+    assert!(!d.app().close_confirmed);
+    d.click("closeConfirm.cancel");
+    assert!(d.app().dialog.is_none() && !d.app().close_confirmed, "Cancel keeps the window");
+    close(&mut d);
+    d.click("closeConfirm.dontSave");
+    assert!(d.app().close_confirmed, "Don't Save lets the window close");
+    assert!(d.app().dialog.is_none());
+    // a clean project closes without asking
+    let mut d = Driver::new();
+    assert!(!d.app().session.is_dirty());
+    close(&mut d);
+    assert!(d.app().dialog.is_none());
+}

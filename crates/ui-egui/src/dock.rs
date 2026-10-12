@@ -910,7 +910,8 @@ pub fn draw_group_chrome(
                 activate(tab, &mut actions);
                 actions.push(DockAction::Focus(*p));
             }
-            // a right-click shows the tab and opens its panel menu (as in Premiere)
+            // a right-click shows the tab and opens its panel menu (as in Premiere; a sequence
+            // tab's menu starts with Sequence Settings…)
             if resp.secondary_clicked() {
                 activate(tab, &mut actions);
                 actions.push(DockAction::Focus(*p));

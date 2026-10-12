@@ -382,6 +382,11 @@ pub struct UiState {
     pub lumetri_grid_folder: Option<String>,
     /// Collapsed effect sections in Effect Controls ("clip:index").
     pub collapsed_fx: Vec<String>,
+    /// Effect Controls: the selected effects of the shown clip as (clip id, effect index). Click
+    /// selects one, Cmd/Ctrl-click adds or removes, Shift-click extends; Save Preset… saves them
+    /// together. Not persisted.
+    #[serde(skip)]
+    pub fx_selected: Vec<(u64, usize)>,
     pub show_menu_bar: bool,
     pub dark: bool,
     /// Lumetri scopes visible in the Program monitor area.
@@ -436,6 +441,8 @@ pub struct UiState {
     /// Add Tracks dialog draft.
     #[serde(default)]
     pub add_tracks: AddTracksDraft,
+    /// Sequence ▸ Sequence Settings… (filled from the active sequence when it opens).
+    pub sequence_settings: SequenceSettingsDraft,
     /// Delete Tracks dialog draft.
     #[serde(default)]
     pub delete_tracks: DeleteTracksDraft,
@@ -715,6 +722,19 @@ pub struct AudioGainDraft {
     pub all_peaks_db: f64,
 }
 
+/// Sequence Settings…: name, frame size, frame rate, audio sample rate and master.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SequenceSettingsDraft {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub sample_rate: u32,
+    /// "Stereo" | "Mono" | "5.1" | "Adaptive"
+    pub mix: String,
+}
+
 /// The Add Tracks dialog (Sequence ▸ Add Tracks…): for video, audio and audio submix tracks, how
 /// many to add and where (`*_after`: how many tracks of the kind come before the new ones; 0 is
 /// "Before First Track"), and the type of the audio and submix tracks (`standard` / `stereo`,
@@ -793,6 +813,7 @@ impl Default for UiState {
             expanded_fx: vec!["Video Transitions".into(), "Video Transitions/Dissolve".into()],
             lumetri_grid_folder: None,
             collapsed_fx: vec![],
+            fx_selected: vec![],
             show_menu_bar: true,
             dark: true,
             show_scopes: false,
@@ -812,6 +833,7 @@ impl Default for UiState {
             settings: None,
             audio_gain: AudioGainDraft::default(),
             add_tracks: AddTracksDraft::default(),
+            sequence_settings: SequenceSettingsDraft::default(),
             delete_tracks: DeleteTracksDraft::default(),
             gfx_edit: None,
             pen_points: vec![],

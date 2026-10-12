@@ -222,7 +222,7 @@ pub fn builtin_presets() -> Vec<EffectPreset> {
         effect("tint", &[("black", ParamValue::Color([0.08, 0.04, 0.02, 1.0])), ("white", ParamValue::Color([1.0, 0.93, 0.8, 1.0])), ("amount", f(35.0))]);
     let mut pip = effect("motion", &[("scale", f(35.0)), ("position", ParamValue::Vec2(Vec2::new(1530.0, 270.0)))]);
     pip.enabled = true;
-    vec![
+    let mut v = vec![
         preset("Blur In", "Gaussian Blur from 60 to 0 over the first second", KeyframeMode::AnchorToIn, 10.0, vec![blur_in]),
         preset("Blur Out", "Gaussian Blur from 0 to 60 over the last second", KeyframeMode::AnchorToOut, 10.0, vec![blur_out]),
         preset("Fade In", "Opacity 0 → 100 % over the first second", KeyframeMode::AnchorToIn, 10.0, vec![fade_in]),
@@ -232,6 +232,115 @@ pub fn builtin_presets() -> Vec<EffectPreset> {
         preset("Spotlight", "Brightens inside a feathered circular mask", KeyframeMode::Scale, 10.0, vec![spotlight]),
         preset("Warm Tint", "Warm highlights, brown shadows", KeyframeMode::Scale, 10.0, vec![warm]),
         preset("PiP 35% Upper Right", "Picture-in-picture: 35 % scale in the upper right", KeyframeMode::Scale, 10.0, vec![pip]),
+    ];
+    v.extend(audio_settings_presets());
+    v
+}
+
+/// Settings presets of the audio effects (the Fx editors' Presets menus and the Effects panel):
+/// one effect each, no keyframes. Starting points of our own for the usual jobs; a preset is
+/// applied with `presets.applySettings` and tuned from there.
+fn audio_settings_presets() -> Vec<EffectPreset> {
+    let f = ParamValue::Float;
+    let b = ParamValue::Bool;
+    let one = |name: &str, desc: &str, e: EffectInstance| preset(name, desc, KeyframeMode::Scale, 0.0, vec![e]);
+    let dyn_rack = |gate: bool, gate_thr: f64, comp_thr: f64, ratio: f64, attack: f64, release: f64, makeup: f64| {
+        effect(
+            "dynamics_rack",
+            &[
+                ("gate_on", b(gate)),
+                ("gate_threshold", f(gate_thr)),
+                ("gate_attack", f(2.0)),
+                ("gate_release", f(150.0)),
+                ("gate_hold", f(60.0)),
+                ("comp_on", b(true)),
+                ("comp_threshold", f(comp_thr)),
+                ("comp_ratio", f(ratio)),
+                ("comp_attack", f(attack)),
+                ("comp_release", f(release)),
+                ("comp_makeup", f(makeup)),
+            ],
+        )
+    };
+    let comp = |id: &str, thr: f64, ratio: f64, attack: f64, release: f64, output: f64| {
+        effect(id, &[("threshold", f(thr)), ("ratio", f(ratio)), ("attack", f(attack)), ("release", f(release)), ("output", f(output))])
+    };
+    let mut multiband_voice = effect("multiband_compressor", &[("xo1", f(150.0)), ("xo2", f(1500.0)), ("xo3", f(6000.0)), ("output", f(2.0))]);
+    for (band, thr, ratio) in [("b1", -24.0, 3.0), ("b2", -20.0, 3.0), ("b3", -18.0, 2.5), ("b4", -22.0, 3.0)] {
+        multiband_voice.params.insert(format!("{band}_threshold"), Param::new(f(thr)));
+        multiband_voice.params.insert(format!("{band}_ratio"), Param::new(f(ratio)));
+    }
+    let mut multiband_master = effect("multiband_compressor", &[("output", f(1.0)), ("lim_on", b(true)), ("lim_threshold", f(-1.0))]);
+    for band in ["b1", "b2", "b3", "b4"] {
+        multiband_master.params.insert(format!("{band}_threshold"), Param::new(f(-14.0)));
+        multiband_master.params.insert(format!("{band}_ratio"), Param::new(f(2.0)));
+    }
+    let eq_voice = effect(
+        "parametric_eq",
+        &[
+            ("hp_on", b(true)),
+            ("hp_freq", f(90.0)),
+            ("low_on", b(true)),
+            ("low_freq", f(250.0)),
+            ("low_gain", f(-2.0)),
+            ("high_on", b(true)),
+            ("high_freq", f(6000.0)),
+            ("high_gain", f(2.0)),
+        ],
+    );
+    let eq_rumble = effect("parametric_eq", &[("hp_on", b(true)), ("hp_freq", f(80.0))]);
+    let eq_phone = effect("parametric_eq", &[("hp_on", b(true)), ("hp_freq", f(300.0)), ("lp_on", b(true)), ("lp_freq", f(3400.0))]);
+    vec![
+        one("Auto Gate", "Dynamics: gate closed below −45 dB, light 2:1 compression", dyn_rack(true, -45.0, -18.0, 2.0, 10.0, 150.0, 0.0)),
+        one("Voice Leveler", "Dynamics: 3:1 compression from −22 dB with 4 dB make-up", dyn_rack(false, -50.0, -22.0, 3.0, 8.0, 120.0, 4.0)),
+        one("Gate and Compress", "Dynamics: gate at −40 dB, then 3:1 compression", dyn_rack(true, -40.0, -20.0, 3.0, 8.0, 120.0, 3.0)),
+        one(
+            "Voice Over",
+            "Dynamics Processing: 4:1 from −20 dB, fast attack",
+            effect("dynamics", &[("threshold", f(-20.0)), ("ratio", f(4.0)), ("attack", f(5.0)), ("release", f(100.0))]),
+        ),
+        one(
+            "Gentle Compression",
+            "Dynamics Processing: 2:1 from −16 dB",
+            effect("dynamics", &[("threshold", f(-16.0)), ("ratio", f(2.0)), ("attack", f(15.0)), ("release", f(200.0))]),
+        ),
+        one("Broadcast Voice", "Tube-modeled Compressor: 4:1 from −18 dB with 3 dB of gain", comp("tube_compressor", -18.0, 4.0, 5.0, 120.0, 3.0)),
+        one("Warm Vocal", "Tube-modeled Compressor: 2.5:1 from −14 dB", comp("tube_compressor", -14.0, 2.5, 20.0, 250.0, 2.0)),
+        one("Drum Punch", "Tube-modeled Compressor: 6:1 from −12 dB with a slow attack", comp("tube_compressor", -12.0, 6.0, 30.0, 80.0, 4.0)),
+        one("Podcast Voice", "Single-band Compressor: 3:1 from −20 dB with 3 dB of gain", comp("single_band_compressor", -20.0, 3.0, 8.0, 150.0, 3.0)),
+        one("Music Bed", "Single-band Compressor: 2:1 from −14 dB", comp("single_band_compressor", -14.0, 2.0, 25.0, 300.0, 1.0)),
+        one("Loud and Even", "Single-band Compressor: 8:1 from −24 dB with 6 dB of gain", comp("single_band_compressor", -24.0, 8.0, 3.0, 100.0, 6.0)),
+        one("Multiband Voice", "Multiband Compressor: crossovers for speech, 3:1 per band", multiband_voice),
+        one("Multiband Master", "Multiband Compressor: gentle 2:1 on every band with the limiter at −1 dB", multiband_master),
+        one("Voice Clarity", "Parametric EQ: high-pass at 90 Hz, a little less mud, a little more air", eq_voice),
+        one("Remove Rumble", "Parametric EQ: high-pass at 80 Hz", eq_rumble),
+        one("Telephone", "Parametric EQ: 300 Hz to 3.4 kHz band-pass", eq_phone),
+        one("Limit to −1 dB", "Hard Limiter: True Peak ceiling at −1 dB", effect("hard_limiter", &[("detect", ParamValue::Choice(1)), ("max", f(-1.0))])),
+        one(
+            "Limit to −3 dB",
+            "Hard Limiter: True Peak ceiling at −3 dB with 3 dB of boost",
+            effect("hard_limiter", &[("detect", ParamValue::Choice(1)), ("max", f(-3.0)), ("boost", f(3.0))]),
+        ),
+        one(
+            "De-ess Voice",
+            "DeEsser: 6.5 kHz, up to 10 dB of reduction",
+            effect("deesser", &[("frequency", f(6500.0)), ("threshold", f(-18.0)), ("reduction", f(10.0))]),
+        ),
+        one(
+            "Small Room",
+            "Studio Reverb: a small, fairly dry room",
+            effect("studio_reverb", &[("room", f(25.0)), ("decay", f(30.0)), ("damping", f(60.0)), ("dry", f(95.0)), ("wet", f(15.0))]),
+        ),
+        one(
+            "Large Hall",
+            "Studio Reverb: a large hall with a long tail",
+            effect("studio_reverb", &[("room", f(85.0)), ("decay", f(80.0)), ("damping", f(35.0)), ("dry", f(85.0)), ("wet", f(45.0))]),
+        ),
+        one(
+            "Vocal Plate",
+            "Studio Reverb: a bright, medium plate for voice",
+            effect("studio_reverb", &[("room", f(50.0)), ("decay", f(55.0)), ("damping", f(30.0)), ("dry", f(90.0)), ("wet", f(30.0))]),
+        ),
     ]
 }
 

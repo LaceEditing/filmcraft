@@ -206,16 +206,18 @@ fn set_first_video_clip(s: &mut Session, secs: i64) {
     .unwrap();
 }
 
-/// Settings ▸ General ▸ Save a project opened from Premiere Pro: Save (Ctrl+S) writes a .prproj
-/// beside the original (the first Save asks where, later ones write there), over the original
-/// with a backup, or a FilmCraft project.
+/// Settings ▸ General ▸ Save a project opened from Premiere Pro: Save (Ctrl+S) writes over the
+/// original with a backup (the default), a .prproj beside the original (the first Save asks
+/// where, later ones write there), or a FilmCraft project.
 #[test]
 fn save_writes_a_premiere_project_for_projects_opened_from_one() {
     let dir = tmp_dir("prproj-save");
     let src = dir.join("show.prproj");
     std::fs::write(&src, prproj()).unwrap();
     let mut s = session(&dir);
-    assert_eq!(s.prefs.general.save_premiere_projects, "premiereCopy", "the default");
+    assert_eq!(s.prefs.general.save_premiere_projects, "premiereOriginal", "the default: Ctrl+S saves the project it came from");
+    // beside the original: the first Save asks where
+    s.prefs.general.save_premiere_projects = "premiereCopy".into();
     s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
     set_first_video_clip(&mut s, 4);
     assert!(s.is_dirty());

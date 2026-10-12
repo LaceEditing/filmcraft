@@ -64,7 +64,13 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             return;
         }
-        Dialog::NewSequence | Dialog::Preferences | Dialog::Recovery | Dialog::RevertConfirm => {}
+        Dialog::SequenceSettings => {
+            if !sequence_settings(app, ctx) {
+                app.dialog = None;
+            }
+            return;
+        }
+        Dialog::NewSequence | Dialog::Preferences | Dialog::Recovery | Dialog::RevertConfirm | Dialog::CloseConfirm => {}
     }
     if !open {
         app.dialog = None;
@@ -277,6 +283,121 @@ fn add_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
         keep = false;
     }
     app.ui.add_tracks = d;
+    keep
+}
+
+/// A frame rate as the Sequence Settings menu shows it: up to three decimals, no trailing zeros.
+fn fps_label(fps: f64) -> String {
+    let s = format!("{fps:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Sequence ▸ Sequence Settings…: name, frame size, frame rate, audio sample rate and master.
+/// Returns whether the dialog stays open. Automation ids: `sequenceSettings.name`, `.width`,
+/// `.height`, `.fps`, `.sampleRate`, `.mix`, `.ok`, `.cancel`.
+fn sequence_settings(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
+    let mut d = app.ui.sequence_settings.clone();
+    let mut keep = true;
+    let mut apply = false;
+    let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
+    const RATES: [f64; 9] = [23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0, 120.0];
+    const MIXES: [&str; 4] = ["Stereo", "Mono", "5.1", "Adaptive"];
+    egui::Window::new("Sequence Settings").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        ui.set_min_width(340.0);
+        let label_w = 110.0;
+        let row_h = ui.spacing().interact_size.y;
+        let label = |ui: &mut egui::Ui, text: &str| {
+            ui.allocate_ui_with_layout(egui::vec2(label_w, row_h), egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(text));
+        };
+        ui.horizontal(|ui| {
+            label(ui, "Sequence Name");
+            let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(ui.available_width()));
+            elems.push(("sequenceSettings.name".into(), r.rect, d.name.clone()));
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Video").strong());
+        ui.horizontal(|ui| {
+            label(ui, "Frame Size");
+            let w = ui.add(egui::DragValue::new(&mut d.width).range(16..=16384).suffix(" horizontal"));
+            elems.push(("sequenceSettings.width".into(), w.rect, d.width.to_string()));
+            let h = ui.add(egui::DragValue::new(&mut d.height).range(16..=16384).suffix(" vertical"));
+            elems.push(("sequenceSettings.height".into(), h.rect, d.height.to_string()));
+        });
+        ui.horizontal(|ui| {
+            label(ui, "Timebase");
+            let shown = format!("{} frames/second", fps_label(d.fps));
+            let r = egui::ComboBox::from_id_salt("sequence-settings-fps").selected_text(&shown).width(ui.available_width()).show_ui(ui, |ui| {
+                for f in RATES {
+                    let text = format!("{} frames/second", fps_label(f));
+                    let o = ui.selectable_label((d.fps - f).abs() < 1e-6, &text);
+                    elems.push((format!("sequenceSettings.fps.option.{f}"), o.rect, text));
+                    if o.clicked() {
+                        d.fps = f;
+                    }
+                }
+            });
+            elems.push(("sequenceSettings.fps".into(), r.response.rect, shown));
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Audio").strong());
+        ui.horizontal(|ui| {
+            label(ui, "Sample Rate");
+            let shown = format!("{} Hz", d.sample_rate);
+            let r = egui::ComboBox::from_id_salt("sequence-settings-rate").selected_text(&shown).width(ui.available_width()).show_ui(ui, |ui| {
+                for sr in [44_100u32, 48_000, 96_000] {
+                    let text = format!("{sr} Hz");
+                    let o = ui.selectable_value(&mut d.sample_rate, sr, &text);
+                    elems.push((format!("sequenceSettings.sampleRate.option.{sr}"), o.rect, text));
+                }
+            });
+            elems.push(("sequenceSettings.sampleRate".into(), r.response.rect, shown));
+        });
+        ui.horizontal(|ui| {
+            label(ui, "Master");
+            let shown = d.mix.clone();
+            let r = egui::ComboBox::from_id_salt("sequence-settings-mix").selected_text(&shown).width(ui.available_width()).show_ui(ui, |ui| {
+                for m in MIXES {
+                    let o = ui.selectable_value(&mut d.mix, m.to_string(), m);
+                    elems.push((format!("sequenceSettings.mix.option.{m}"), o.rect, m.to_string()));
+                }
+            });
+            elems.push(("sequenceSettings.mix".into(), r.response.rect, shown));
+        });
+        ui.add_space(10.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let o = ui.add(egui::Button::new(egui::RichText::new("OK").color(egui::Color32::WHITE)).fill(app.tokens.accent));
+            elems.push(("sequenceSettings.ok".into(), o.rect, "OK".into()));
+            if o.clicked() {
+                apply = true;
+            }
+            let c = ui.button("Cancel");
+            elems.push(("sequenceSettings.cancel".into(), c.rect, "Cancel".into()));
+            if c.clicked() {
+                keep = false;
+            }
+        });
+    });
+    for (id, r, l) in elems {
+        app.auto.add(&id, r, &l);
+    }
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        keep = false;
+    }
+    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input() {
+        apply = true;
+    }
+    if apply {
+        let name = d.name.trim();
+        let mut params = serde_json::json!({"width": d.width, "height": d.height, "fps": d.fps, "sampleRate": d.sample_rate, "mix": d.mix});
+        if !name.is_empty() {
+            params["name"] = serde_json::json!(name);
+        }
+        if let Err(e) = app.session.execute("sequence.settings", params) {
+            app.ui.status = e.to_string();
+        }
+        keep = false;
+    }
+    app.ui.sequence_settings = d;
     keep
 }
 

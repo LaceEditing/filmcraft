@@ -150,3 +150,42 @@ fn keyframes_set_in_the_panel_interpolate() {
     assert_eq!(keys.len(), 2, "{keys:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Effect Controls: clicking an effect's name selects it, Cmd/Ctrl-click adds another, and
+/// Save Preset… on the selection saves them together (it used to take one effect only).
+#[test]
+fn several_effects_select_and_save_as_one_preset() {
+    let dir = data_dir("multi-select");
+    let (mut d, clip) = Driver::with_clip(&dir);
+    d.exec("effects.apply", json!({"clips": [clip], "effect": "Gaussian Blur"}));
+    d.exec("effects.apply", json!({"clips": [clip], "effect": "Tint"}));
+    // fold the fixed effects so both rows are in view
+    let fixed: Vec<String> = d.app().session.active_sequence().unwrap().video_tracks[0].items[0]
+        .effects
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.def().is_some_and(|d| d.intrinsic))
+        .map(|(i, _)| format!("{clip}:{i}"))
+        .collect();
+    d.app().ui.collapsed_fx.extend(fixed);
+    d.frames(3);
+    d.ok("ui.click", json!({"id": "effectControls.effect.gaussian_blur"}));
+    d.frames(2);
+    assert_eq!(d.app().ui.fx_selected.len(), 1);
+    d.ok("ui.click", json!({"id": "effectControls.effect.tint", "modifiers": {"command": true}}));
+    d.frames(2);
+    assert_eq!(d.app().ui.fx_selected.len(), 2, "Cmd-click added the second effect");
+    d.ok("ui.click", json!({"id": "effectControls.effect.tint", "button": "right"}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": "effectControls.effect.tint.savePreset"}));
+    d.frames(2);
+    let draft = d.app().ui.save_preset.clone().expect("the Save Preset dialog");
+    assert_eq!(draft.effects.len(), 2, "both effects go into the preset");
+    d.app().ui.save_preset = None;
+    d.frames(2);
+    // a plain click selects one again
+    d.ok("ui.click", json!({"id": "effectControls.effect.gaussian_blur"}));
+    d.frames(2);
+    assert_eq!(d.app().ui.fx_selected.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

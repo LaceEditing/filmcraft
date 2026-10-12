@@ -335,6 +335,27 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
             filmcraft_engine::find_command(id).map_or(Ok(()), |c| (c.enabled)(&app.session))?;
             return crate::panels::remix::open(app, ctx);
         }
+        // Sequence Settings… from the menu (or a sequence's context menu) opens the dialog with
+        // the active sequence's settings; with params it changes them directly.
+        "sequence.settings" if params.as_object().is_none_or(|m| m.is_empty()) => {
+            filmcraft_engine::find_command(id).map_or(Ok(()), |c| (c.enabled)(&app.session))?;
+            let Some(sid) = app.session.state.active_sequence else { return Err("no sequence is open".into()) };
+            let (name, seq) = match app.session.project.item(sid) {
+                Some(it) => (it.name.clone(), it.as_sequence().cloned()),
+                None => return Err("no sequence is open".into()),
+            };
+            let Some(seq) = seq else { return Err("no sequence is open".into()) };
+            app.ui.sequence_settings = crate::state::SequenceSettingsDraft {
+                name,
+                width: seq.settings.width,
+                height: seq.settings.height,
+                fps: seq.settings.frame_rate.as_f64(),
+                sample_rate: seq.settings.sample_rate,
+                mix: filmcraft_engine::mixer::channels_name(seq.settings.audio_master).to_string(),
+            };
+            app.dialog = Some(crate::Dialog::SequenceSettings);
+            return Ok(json!({"dialog": "sequenceSettings"}));
+        }
         // Add Tracks… from the menu opens the dialog (new tracks after the last ones, as Premiere
         // offers); with params it adds the tracks directly.
         "sequence.addTracks" if params.as_object().is_none_or(|m| m.is_empty()) => {

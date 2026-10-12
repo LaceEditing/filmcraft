@@ -530,8 +530,10 @@ pub fn clamp_trim(seq: &Sequence, clip: ClipId, edge: Edge, mode: TrimMode, delt
     let mut d = delta;
     match edge {
         Edge::In => {
-            // extending left (d<0) needs media before source_in; shortening needs min duration
-            let max_ext = Tick((head(ctx, it).0 as f64 / speed).floor() as i64);
+            // extending left (d<0) needs media before source_in; shortening needs min duration.
+            // Media without an end (adjustment layers, graphics, stills, generators) has no start
+            // either: its clips extend left as far as the track allows, as in Premiere.
+            let max_ext = if media.is_none() { Tick(i64::MAX / 4) } else { Tick((head(ctx, it).0 as f64 / speed).floor() as i64) };
             let lo = if mode == TrimMode::Regular { (-(it.start - prev_end)).max(-max_ext) } else { -max_ext };
             let hi = it.duration - ctx.min_duration;
             d = d.clamp(if it.frame_hold.is_some() { Tick::MIN } else { lo }, hi);

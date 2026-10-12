@@ -104,6 +104,50 @@ pub fn show_recovery(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     open && !app.session.recovery_candidates().is_empty()
 }
 
+/// "Save changes to '<project>' before closing?": Save (then close once the save went through),
+/// Don't Save (close; the changes stay in the recovery journal), Cancel. Automation ids
+/// `closeConfirm.save`, `closeConfirm.dontSave`, `closeConfirm.cancel`.
+pub fn show_close(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
+    let t = app.tokens;
+    let name = app.session.project.name.clone();
+    let mut open = true;
+    let mut close_now = false;
+    let r = egui::Modal::new(egui::Id::new("close-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
+        ui.set_width(460.0);
+        Frame::new().inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 20 }).show(ui, |ui| {
+            ui.label(RichText::new("Close").size(18.0).strong().color(t.text));
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("Save changes to '{name}' before closing?")).size(13.5).color(t.text));
+            ui.add_space(18.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if button(app, ui, "closeConfirm.save", "Save", true) {
+                    match crate::menus::invoke(app, ctx, "file.save", json!({})) {
+                        // a save that needed a dialog and was cancelled leaves the project dirty
+                        Ok(_) if !app.session.is_dirty() => close_now = true,
+                        Ok(_) => {}
+                        Err(e) => app.ui.status = e,
+                    }
+                    open = false;
+                }
+                if button(app, ui, "closeConfirm.dontSave", "Don't Save", false) {
+                    close_now = true;
+                    open = false;
+                }
+                if button(app, ui, "closeConfirm.cancel", "Cancel", false) {
+                    open = false;
+                }
+            });
+        });
+    });
+    if close_now {
+        app.close_confirmed = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+    open && !r.should_close()
+}
+
 pub fn show_revert(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let t = app.tokens;
     let file = app.session.path.as_deref().and_then(|p| std::path::Path::new(p).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -139,6 +183,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context, d: Dialog) -> Option<bo
         Dialog::Preferences => Some(crate::panels::settings::show(app, ctx)),
         Dialog::Recovery => Some(show_recovery(app, ctx)),
         Dialog::RevertConfirm => Some(show_revert(app, ctx)),
+        Dialog::CloseConfirm => Some(show_close(app, ctx)),
         _ => None,
     }
 }

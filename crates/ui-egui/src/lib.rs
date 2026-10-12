@@ -118,6 +118,10 @@ pub enum Dialog {
     DeleteTracks,
     /// Sequence ▸ Add Tracks….
     AddTracks,
+    /// Sequence ▸ Sequence Settings….
+    SequenceSettings,
+    /// "Save changes before closing?" (the window's close button with unsaved changes).
+    CloseConfirm,
 }
 
 #[derive(Default)]
@@ -203,6 +207,9 @@ pub struct FilmcraftApp {
     /// Fault injection for robustness tests: the next UI pass panics.
     #[doc(hidden)]
     pub panic_next_frame: bool,
+    /// The window may close now: the user chose Save / Don't Save in the close prompt, or a
+    /// forced `app.quit`. Until then a close request with unsaved changes opens the prompt.
+    pub close_confirmed: bool,
     fonts_ready: bool,
     pub integrated_titlebar: bool,
     pub last_timeline_width: f32,
@@ -425,6 +432,7 @@ impl FilmcraftApp {
             styled: false,
             ui_error: None,
             panic_next_frame: false,
+            close_confirmed: false,
             fonts_ready: false,
             integrated_titlebar: false,
             last_timeline_width: 1000.0,
@@ -1030,10 +1038,19 @@ impl FilmcraftApp {
                 r
             }
             "file.saveAs" | "file.save" | "file.saveCopy" => {
-                let suggested =
-                    if id == "file.saveCopy" { format!("{} copy.fcproj", self.session.project.name) } else { format!("{}.fcproj", self.session.project.name) };
-                let Some(path) = self.hooks.pick_save.as_mut().and_then(|f| f(&suggested)) else { return Ok(Value::Null) };
-                let cmd = if id == "file.saveCopy" { "file.saveCopy" } else { "file.saveAs" };
+                let name = &self.session.project.name;
+                let copy = id == "file.saveCopy";
+                // a project from Premiere Pro saves as a Premiere Pro project unless told otherwise
+                let premiere = filmcraft_engine::interchange::premiere_save_mode(&self.session).is_some();
+                let path = if premiere {
+                    let suggested = if copy { format!("{name} copy.prproj") } else { format!("{name}.prproj") };
+                    self.hooks.pick_save_as.as_mut().and_then(|f| f("Premiere Pro Project", &["prproj", "fcproj"], &suggested))
+                } else {
+                    let suggested = if copy { format!("{name} copy.fcproj") } else { format!("{name}.fcproj") };
+                    self.hooks.pick_save.as_mut().and_then(|f| f(&suggested))
+                };
+                let Some(path) = path else { return Ok(Value::Null) };
+                let cmd = if copy { "file.saveCopy" } else { "file.saveAs" };
                 self.session.execute(cmd, json!({"path": path})).map_err(|e| e.to_string())
             }
             "file.open" => {
@@ -1303,6 +1320,12 @@ impl FilmcraftApp {
         self.auto.begin_frame();
         self.frames.set_context(&ctx);
         self.session.poll_persistence();
+        // Closing the window with unsaved changes asks first, as Premiere does (the changes used
+        // to go to the recovery journal silently, and the next launch asked about them).
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed && self.session.is_dirty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = Some(Dialog::CloseConfirm);
+        }
         panels::trim_monitor::advance(self, &ctx);
         if self.session.persistence.is_some() && self.session.is_dirty() {
             // Keep polling the auto-save worker (status, "also save the project" results).
@@ -1579,7 +1602,25 @@ impl FilmcraftApp {
 }
 
 impl eframe::App for FilmcraftApp {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // egui-winit turns Cmd/Ctrl+X, +C and +V into Cut / Copy / Paste events and drops the key
+        // press, so Edit ▸ Cut / Copy / Paste never fired from the keyboard outside a text field.
+        // Outside one (and outside a title being typed), give the shortcuts their key presses back.
+        if !ctx.text_edit_focused() && self.ui.gfx_edit.is_none() {
+            let held = ctx.input(|i| i.modifiers);
+            let press = |key: egui::Key| {
+                let modifiers = egui::Modifiers { command: true, ctrl: !cfg!(target_os = "macos"), mac_cmd: cfg!(target_os = "macos"), ..held };
+                egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+            };
+            for e in raw_input.events.iter_mut() {
+                match e {
+                    egui::Event::Copy => *e = press(egui::Key::C),
+                    egui::Event::Cut => *e = press(egui::Key::X),
+                    egui::Event::Paste(_) => *e = press(egui::Key::V),
+                    _ => {}
+                }
+            }
+        }
         if !self.synthetic.is_empty() {
             // Pointer events go one per frame so egui sees press → moves → release as a real drag
             // (all in one frame reads as a click); key/text runs go together up to a key release.
