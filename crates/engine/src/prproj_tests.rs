@@ -272,11 +272,12 @@ fn save_says_what_the_premiere_project_could_not_hold() {
     let r = s.execute("file.save", json!({})).unwrap();
     assert_eq!(r["unsaved"], json!([]), "{r}");
     assert!(!s.drain_events().iter().any(|e| matches!(e, crate::Event::SaveNotes { .. })));
-    // a sequence made here cannot go into the Premiere project yet
-    s.execute("file.newSequence", json!({"name": "Made Here"})).unwrap();
+    // an effect no Premiere project FilmCraft has seen has a layout for cannot be written yet
+    let audio = s.project.sequences().next().and_then(|i| i.as_sequence()).unwrap().audio_tracks[0].items[0].id;
+    s.execute("effects.apply", json!({"clips": [audio.0], "effect": "dynamics"})).unwrap();
     let r = s.execute("file.save", json!({})).unwrap();
     let unsaved = r["unsaved"].as_array().cloned().unwrap_or_default();
-    assert!(unsaved.iter().any(|n| n.as_str().is_some_and(|n| n.contains("\"Made Here\""))), "{r}");
+    assert!(unsaved.iter().any(|n| n.as_str().is_some_and(|n| n.contains("Dynamics"))), "{r}");
     let notes = s.drain_events().into_iter().find_map(|e| match e {
         crate::Event::SaveNotes { path, notes } => Some((path, notes)),
         _ => None,
@@ -284,5 +285,29 @@ fn save_says_what_the_premiere_project_could_not_hold() {
     let (path, notes) = notes.expect("a SaveNotes event");
     assert_eq!(path, src.to_string_lossy());
     assert_eq!(notes.len(), unsaved.len());
-    assert!(s.log.entries.iter().any(|e| e.level == crate::panels::Level::Warning && e.message.contains("Made Here")));
+    assert!(s.log.entries.iter().any(|e| e.level == crate::panels::Level::Warning && e.message.contains("Dynamics")));
+}
+
+/// Opening a Premiere project keeps its effect and transition layouts; Learn Effect Layouts reads
+/// a folder of projects, and a "Layout Kit" project's effects count as at default settings.
+#[test]
+fn effect_layouts_are_learned_from_premiere_projects() {
+    let dir = tmp_dir("prproj-layouts");
+    let models = dir.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    // the interchange tests' project has a Tint, a legacy Gaussian Blur and a Cross Dissolve
+    let with_fx = filmcraft_interchange::prproj_test_document();
+    std::fs::write(models.join("graded.prproj"), &with_fx).unwrap();
+    let mut s = session(&dir);
+    let r = s.execute("file.learnPremiereLayouts", json!({"path": models.to_string_lossy()})).unwrap();
+    assert_eq!(r["projects"], 1, "{r}");
+    let lib = dir.join("Premiere Layouts");
+    let names: Vec<String> = std::fs::read_dir(&lib).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    assert!(names.iter().any(|n| n == "effect.tint.prproj") && names.iter().any(|n| n.starts_with("transition.video.cross dissolve")), "{names:?}");
+    // learning the same again adds nothing; a layout kit replaces them (at defaults)
+    assert_eq!(s.execute("file.learnPremiereLayouts", json!({"path": models.to_string_lossy()})).unwrap()["learned"], 0);
+    std::fs::write(models.join("FilmCraft Layout Kit.prproj"), &with_fx).unwrap();
+    let r = s.execute("file.learnPremiereLayouts", json!({"path": models.to_string_lossy()})).unwrap();
+    assert!(r["learned"].as_u64().unwrap() > 0, "{r}");
+    assert!(std::fs::read_to_string(lib.join("effect.tint.prproj")).unwrap().contains("FilmCraftLayoutAtDefaults=\"true\""));
 }

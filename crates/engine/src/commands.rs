@@ -1060,6 +1060,15 @@ fn build() -> Vec<CommandSpec> {
             |s| if s.project.items.values().any(|i| i.as_sequence().is_some()) { Ok(()) } else { Err("The project has no sequence".into()) },
             |s, p| crate::interchange::export_prproj(s, p)
         ),
+        cmd!(
+            "file.learnPremiereLayouts",
+            "Learn Effect Layouts from Premiere Projects…",
+            ["File"],
+            None,
+            r#"{"path":str,"atDefaults":bool?} (a .prproj or a folder of them; atDefaults: a layout kit, its effects at default settings)"#,
+            always,
+            |s, p| crate::interchange::learn_layouts_cmd(s, p)
+        ),
         cmd!("file.open", "Open Project…", ["File"], Some("Cmd+O"), r#"{"path":str}"#, always, |s, p| {
             let path = str_p(p, "path").ok_or_else(|| bad("file.open", "need `path`"))?.to_string();
             open_project(s, &path)

@@ -440,6 +440,43 @@ pub fn export_prproj(project: &Project, original: &[u8], sequences: &[ItemId], d
     prproj_write::export(project, original, sequences, dest_dir)
 }
 
+/// One effect or transition layout of a Premiere project: what it is (`effect.<id>`,
+/// `transition.video.<name>`…, usable as a file name), whether the model clip animated a
+/// parameter, whether it was learned at default settings, and the layout as a small Premiere
+/// document (a model for [`export_prproj_with`]).
+#[derive(Clone, Debug)]
+pub struct PrprojLayout {
+    pub key: String,
+    pub animated: bool,
+    pub at_defaults: bool,
+    pub document: Vec<u8>,
+}
+
+/// Every effect and transition layout `bytes` (a `.prproj`) has that FilmCraft can model clips on.
+/// `at_defaults`: the project's effects are at Premiere's default settings (a layout kit), so
+/// effects with settings FilmCraft does not map are kept too.
+pub fn prproj_layouts(bytes: &[u8], at_defaults: bool) -> Vec<PrprojLayout> {
+    prproj_new::layouts_in(bytes, at_defaults)
+        .into_iter()
+        .filter_map(|(need, animated, g)| {
+            prproj_new::layout_document(&g, at_defaults).map(|d| PrprojLayout { key: need.key(), animated, at_defaults, document: d.into_bytes() })
+        })
+        .collect()
+}
+
+/// The `.prproj` the interchange tests use (one sequence with Motion, Opacity, Tint, a legacy
+/// Gaussian Blur, a Cross Dissolve and markers), for other crates' tests.
+#[doc(hidden)]
+pub fn prproj_test_document() -> String {
+    prproj::test_document()
+}
+
+/// Every effect component in a `.prproj` (development aid): its label and what FilmCraft makes of it
+/// (`model` when clips can be modelled on it, else why not).
+pub fn prproj_effect_census(bytes: &[u8]) -> Vec<(String, String)> {
+    prproj_new::effect_census(bytes)
+}
+
 /// [`export_prproj`], borrowing the layout of an effect or transition added in FilmCraft that the
 /// project has no other instance of from `models` (other Premiere projects, as `.prproj` bytes).
 pub fn export_prproj_with(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir: Option<&str>, models: &[Vec<u8>]) -> Result<(Vec<u8>, Report)> {

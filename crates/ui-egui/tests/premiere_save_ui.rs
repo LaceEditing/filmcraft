@@ -197,8 +197,10 @@ fn ctrl_s_shows_what_the_premiere_project_could_not_hold() {
     d.ok("ui.key", json!({"key": "Cmd+S"}));
     d.frames(3);
     assert!(!ids(&mut d).iter().any(|i| i.starts_with("saveNotes.")));
-    // a sequence made here: the notice lists it
-    d.ok("engine.execute", json!({"command": "file.newSequence", "params": {"name": "Made Here"}}));
+    // an effect no Premiere project FilmCraft has seen has a layout for: the notice lists it
+    let seq = d.ok("engine.execute", json!({"command": "sequence.inspect", "params": {}}));
+    let audio = seq["audio"][0]["items"][0]["clip"].clone();
+    d.ok("engine.execute", json!({"command": "effects.apply", "params": {"clips": [audio], "effect": "dynamics"}}));
     d.ok("ui.key", json!({"key": "Cmd+S"}));
     d.frames(3);
     let shown = ids(&mut d);

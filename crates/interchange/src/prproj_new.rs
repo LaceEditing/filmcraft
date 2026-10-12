@@ -22,7 +22,7 @@
 //! of whose parameters FilmCraft maps are borrowed, so no setting of the borrowed clip leaks in.
 //!
 //! Not written (each listed in the report): effects and transitions with no model, graphics /
-//! titles, adjustment layers, generated media, captions and track effects.
+//! titles, generated media other than colour mattes and black video, captions and track effects.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
@@ -288,17 +288,21 @@ fn playable(p: &Project, item: ItemId) -> std::result::Result<ItemId, &'static s
     // project could point a subclip at itself
     for _ in 0..16 {
         let Some(it) = p.item(id) else { return Err("missing items") };
+        // colour mattes, black video and adjustment layers are Premiere synthetic media
+        if is_synthetic(it) {
+            return Ok(id);
+        }
         return match &it.kind {
             ItemKind::Media(m) => match m.media {
                 MediaRef::File { .. } => Ok(id),
-                MediaRef::Generator(_) => Err("generated media (bars, colour mattes…)"),
+                MediaRef::Generator(_) => Err("generated media other than colour mattes and black video (bars, counting leaders…)"),
             },
             ItemKind::Sequence(_) => Ok(id),
             ItemKind::Subclip { parent, .. } => {
                 id = *parent;
                 continue;
             }
-            ItemKind::AdjustmentLayer { .. } => Err("adjustment layers"),
+            ItemKind::AdjustmentLayer { .. } => Ok(id),
             ItemKind::Graphic { .. } => Err("graphics and titles"),
         };
     }
@@ -372,47 +376,98 @@ pub(crate) fn find_models(models: &[Vec<u8>], needs: &BTreeSet<Need>) -> Vec<Gra
         if needs.iter().all(|n| best.get(n).is_some_and(|b| b.0 == 0)) {
             break;
         }
-        let Ok((raw, _)) = prproj_graph::decompress(bytes) else { continue };
-        let Ok(text) = std::str::from_utf8(&raw) else { continue };
-        let Ok(doc) = crate::xml::parse(text) else { continue };
-        let root = doc.root_element();
-        if root.tag_name().name() != "PremiereData" {
-            continue;
-        }
-        let ix = prproj_graph::Index::new(root);
-        let mut payloads: Option<HashMap<&str, &str>> = None;
-        for n in root.children().filter(Node::is_element) {
-            let tag = n.tag_name().name();
-            let need = match tag {
-                "VideoFilterComponent" | "AudioFilterComponent" => {
-                    let Some(c) = crate::prproj_fx::component(&ix, n) else { continue };
-                    let target = c.target();
-                    let crate::prproj_fx::Target::Effect(def) = target else { continue };
-                    // every setting maps onto FilmCraft's, so none of the model's leaks in
-                    let (_, unmapped) = crate::prproj_fx::mappings(&c, target);
-                    if !unmapped.iter().all(|name| holds_no_setting(&c, name)) {
-                        continue;
-                    }
-                    Need::Effect(def.id)
-                }
-                "VideoTransitionTrackItem" | "AudioTransitionTrackItem" => {
-                    let Some(name) = crate::xml::path_text(n, &["TransitionTrackItem", "DisplayName"]) else { continue };
-                    Need::Transition(name.trim().to_lowercase(), tag.starts_with("Audio"))
-                }
-                _ => continue,
-            };
-            if !needs.contains(&need) || best.get(&need).is_some_and(|b| b.0 == 0) {
-                continue;
-            }
-            let payloads = payloads.get_or_insert_with(|| binary_payloads(root));
-            let Some((objects, animated)) = extract(&ix, text, n, payloads) else { continue };
-            let score = u8::from(animated);
-            if best.get(&need).is_none_or(|b| score < b.0) {
-                best.insert(need.clone(), (score, Graft { what: need, objects }));
-            }
-        }
+        scan_models(bytes, &|n| needs.contains(n), &mut best);
     }
     best.into_values().map(|(_, g)| g).collect()
+}
+
+/// Every effect and transition layout `bytes` (a Premiere project) has that FilmCraft can model
+/// clips on, one per effect / transition type: (what, whether a parameter is animated, layout).
+/// `at_defaults`: the project's effects are at their default settings (a layout kit made for
+/// FilmCraft), so effects with settings FilmCraft does not map are kept too.
+pub(crate) fn layouts_in(bytes: &[u8], at_defaults: bool) -> Vec<(Need, bool, Graft)> {
+    let mut best: BTreeMap<Need, (u8, Graft)> = BTreeMap::new();
+    scan(bytes, &|_| true, &mut best, at_defaults);
+    best.into_iter().map(|(n, (score, g))| (n, score > 0, g)).collect()
+}
+
+/// The root attribute of a layout FilmCraft keeps that was learned at default settings.
+pub(crate) const AT_DEFAULTS: &str = "FilmCraftLayoutAtDefaults";
+
+/// Each effect component of `bytes`: its label and whether clips can be modelled on it.
+pub(crate) fn effect_census(bytes: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok((raw, _)) = prproj_graph::decompress(bytes) else { return out };
+    let Ok(text) = std::str::from_utf8(&raw) else { return out };
+    let Ok(doc) = crate::xml::parse(text) else { return out };
+    let root = doc.root_element();
+    let ix = prproj_graph::Index::new(root);
+    for n in root.children().filter(|n| n.has_tag_name("VideoFilterComponent") || n.has_tag_name("AudioFilterComponent")) {
+        let Some(c) = crate::prproj_fx::component(&ix, n) else { continue };
+        let target = c.target();
+        let verdict = match target {
+            crate::prproj_fx::Target::Effect(def) => {
+                let (_, unmapped) = crate::prproj_fx::mappings(&c, target);
+                let left: Vec<&String> = unmapped.iter().filter(|name| !holds_no_setting(&c, name)).collect();
+                if left.is_empty() { format!("model ({})", def.id) } else { format!("{} unmapped: {left:?}", def.id) }
+            }
+            crate::prproj_fx::Target::Unsupported => "no FilmCraft effect".into(),
+            _ => continue,
+        };
+        out.push((format!("{} [{}]", c.label(), c.match_name), verdict));
+    }
+    out
+}
+
+/// Add the layouts of `bytes` that `want` to `best` where they are better (not animated) or new.
+fn scan_models(bytes: &[u8], want: &dyn Fn(&Need) -> bool, best: &mut BTreeMap<Need, (u8, Graft)>) {
+    scan(bytes, want, best, false);
+}
+
+/// [`scan_models`]; `at_defaults` (or a kept layout marked so): settings FilmCraft does not map
+/// are at Premiere's defaults, so such effects are models too.
+fn scan(bytes: &[u8], want: &dyn Fn(&Need) -> bool, best: &mut BTreeMap<Need, (u8, Graft)>, at_defaults: bool) {
+    let Ok((raw, _)) = prproj_graph::decompress(bytes) else { return };
+    let Ok(text) = std::str::from_utf8(&raw) else { return };
+    let Ok(doc) = crate::xml::parse(text) else { return };
+    let root = doc.root_element();
+    if root.tag_name().name() != "PremiereData" {
+        return;
+    }
+    let at_defaults = at_defaults || root.attribute(AT_DEFAULTS) == Some("true");
+    let ix = prproj_graph::Index::new(root);
+    let mut payloads: Option<HashMap<&str, &str>> = None;
+    for n in root.children().filter(Node::is_element) {
+        let tag = n.tag_name().name();
+        let need = match tag {
+            "VideoFilterComponent" | "AudioFilterComponent" => {
+                let Some(c) = crate::prproj_fx::component(&ix, n) else { continue };
+                let target = c.target();
+                let crate::prproj_fx::Target::Effect(def) = target else { continue };
+                // every setting maps onto FilmCraft's, so none of the model's leaks in (or the
+                // model is at Premiere's defaults)
+                let (_, unmapped) = crate::prproj_fx::mappings(&c, target);
+                if !at_defaults && !unmapped.iter().all(|name| holds_no_setting(&c, name)) {
+                    continue;
+                }
+                Need::Effect(def.id)
+            }
+            "VideoTransitionTrackItem" | "AudioTransitionTrackItem" => {
+                let Some(name) = crate::xml::path_text(n, &["TransitionTrackItem", "DisplayName"]) else { continue };
+                Need::Transition(name.trim().to_lowercase(), tag.starts_with("Audio"))
+            }
+            _ => continue,
+        };
+        if !want(&need) || best.get(&need).is_some_and(|b| b.0 == 0) {
+            continue;
+        }
+        let payloads = payloads.get_or_insert_with(|| binary_payloads(root));
+        let Some((objects, animated)) = extract(&ix, text, n, payloads) else { continue };
+        let score = u8::from(animated);
+        if best.get(&need).is_none_or(|b| score < b.0) {
+            best.insert(need.clone(), (score, Graft { what: need, objects }));
+        }
+    }
 }
 
 /// Whether every parameter of `c` named `name` is something other than a setting: a group
@@ -510,19 +565,20 @@ fn extract(ix: &prproj_graph::Index<'_, '_>, text: &str, root: Node<'_, '_>, pay
 // ---------------------------------------------------------------------------------------------
 
 /// A media file's or sequence's objects that clips refer to.
-#[derive(Clone, Default)]
-struct Sources {
-    master: String,
-    name: String,
-    video: Option<u64>,
-    audio: Option<u64>,
-    markers: u64,
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Sources {
+    pub(crate) master: String,
+    pub(crate) name: String,
+    pub(crate) video: Option<u64>,
+    pub(crate) audio: Option<u64>,
+    /// The master clip's markers (0: none yet; one is made for a template that needs it).
+    pub(crate) markers: u64,
     /// Picture size (video).
-    size: (u32, u32),
+    pub(crate) size: (u32, u32),
     /// The audio clips' layout: mono or stereo.
-    mono: bool,
+    pub(crate) mono: bool,
     /// Ticks per audio sample.
-    sample: i64,
+    pub(crate) sample: i64,
 }
 
 struct Seed<'p> {
@@ -687,6 +743,9 @@ impl<'p> Seed<'p> {
                 }
                 self.media(it.id, &it.name, path, &info, &m.markers, rate);
             }
+        }
+        for it in project.items.values().filter(|i| is_synthetic(i)) {
+            self.synthetic(it.id);
         }
         // sequences: UIDs first (a sequence's clips can play another one)
         let seqs: Vec<ItemId> = project.items.values().filter(|i| i.as_sequence().is_some()).map(|i| i.id).collect();
@@ -1427,7 +1486,286 @@ pub(crate) fn premiere_path(path: &str, map: &[(String, String)]) -> String {
     format!("{}\\{rest}", to.trim_end_matches('\\'))
 }
 
-/// The document without the objects nothing reachable from the project refers to (the templates).
+// ---------------------------------------------------------------------------------------------
+// Additions to a project opened from Premiere
+// ---------------------------------------------------------------------------------------------
+
+/// What a project opened from Premiere gets built from scratch when it is saved (see
+/// `prproj_write::export_with`): sequences, media and synthetic items made in FilmCraft, and a
+/// template clip for each (item, kind) a sequence plays that no clip in the document plays yet.
+#[derive(Debug, Default)]
+pub(crate) struct AddRequest {
+    pub(crate) sequences: Vec<ItemId>,
+    /// Media files no asset in the project can serve as a model for.
+    pub(crate) media: Vec<ItemId>,
+    /// Adjustment layers, colour mattes and black video.
+    pub(crate) synthetic: Vec<ItemId>,
+    /// (item, video) pairs that need a template clip.
+    pub(crate) templates: Vec<(ItemId, bool)>,
+    /// The objects of items the document already has (for their templates).
+    pub(crate) existing: HashMap<ItemId, Sources>,
+}
+
+impl AddRequest {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sequences.is_empty() && self.media.is_empty() && self.synthetic.is_empty() && self.templates.is_empty()
+    }
+}
+
+/// The objects built for an [`AddRequest`].
+pub(crate) struct Added {
+    /// Top-level objects, to go before `</PremiereData>`.
+    pub(crate) text: String,
+    /// New items → their `Media` / `Sequence` UID (the writer's `premiere.*` metadata).
+    pub(crate) media_uid: Vec<(ItemId, String)>,
+    pub(crate) sequence_uid: Vec<(ItemId, String)>,
+    /// New items → their `ClipProjectItem` UID (for the bins).
+    pub(crate) project_items: HashMap<ItemId, String>,
+    /// Ids of the template objects (copied by the writer, then dropped).
+    pub(crate) templates: Range<u64>,
+}
+
+/// Build what `req` asks for with object ids from `next_id` and UUIDs from `seed` (the same
+/// request gives the same objects).
+pub(crate) fn add_to_existing(project: &Project, opts: &CreateOptions, req: &AddRequest, next_id: u64, seed: u64) -> Added {
+    let mut s = Seed::new(project, opts);
+    s.next_id = next_id;
+    s.hash = seed | 1;
+    s.sources = req.existing.clone();
+    let rate = project.sequences().filter_map(|i| i.as_sequence()).map(|q| q.settings.frame_rate).next().unwrap_or_default();
+    for id in &req.media {
+        let Some(it) = project.item(*id) else { continue };
+        if let ItemKind::Media(m) = &it.kind
+            && let MediaRef::File { path } = &m.media
+        {
+            s.media(*id, &it.name, path, &m.info, &m.markers, rate);
+        }
+    }
+    for id in &req.synthetic {
+        s.synthetic(*id);
+    }
+    let uids: Vec<(ItemId, String)> = req.sequences.iter().map(|id| (*id, s.uuid())).collect();
+    for (id, uid) in &uids {
+        s.sequence(*id, uid);
+    }
+    let first_template = s.next_id;
+    for (item, video) in &req.templates {
+        let Some(mut src) = s.sources.get(item).cloned() else { continue };
+        if src.markers == 0 {
+            src.markers = s.markers(&[]);
+            s.sources.insert(*item, src.clone());
+        }
+        match (video, src.video, src.audio) {
+            (true, Some(source), _) => s.video_template(&src, source),
+            (false, _, Some(source)) => s.audio_template(&src, source),
+            _ => {}
+        }
+    }
+    let templates = first_template..s.next_id;
+    // the empty markers made for existing items' templates are template objects too
+    Added {
+        text: s.objs.concat(),
+        media_uid: std::mem::take(&mut s.media_uid),
+        sequence_uid: std::mem::take(&mut s.sequence_uid),
+        project_items: std::mem::take(&mut s.project_items),
+        templates,
+    }
+}
+
+/// Premiere's synthetic media importer, and the length of its media (effectively endless).
+const SYNTHETIC_IMPORTER: &str = "42008e7a-de6f-4270-96de-7e287abb9b4b";
+const SYNTHETIC_DURATION: i64 = 10_973_491_200_000_000;
+
+/// What kind of Premiere synthetic media an item is built as.
+#[derive(Clone, Copy)]
+enum Synth {
+    Matte([f32; 4]),
+    Black,
+    Bars,
+}
+
+/// `ImporterPrefs` of a new Bars and Tone (Rec 709) as Premiere saves it, with its hash.
+const BARS_PREFS: &str = "AgAAAACAO0cCAAAAAgAAAADIqikAAHpE//9/PgB/AAAADwAAcAgAAAEAAAABAAAAADiv+AEAAAAAp88K+X8AAAEBqQr5fwAA";
+const BARS_PREFS_HASH: &str = "073f2208-9c94-ecfe-928d-e63100000054";
+
+/// Whether FilmCraft can build an item as Premiere synthetic media.
+pub(crate) fn is_synthetic(item: &filmcraft_project::ProjectItem) -> bool {
+    match &item.kind {
+        ItemKind::AdjustmentLayer { .. } => true,
+        ItemKind::Media(m) => {
+            matches!(
+                &m.media,
+                MediaRef::Generator(
+                    filmcraft_media::generators::Generator::ColorMatte { .. }
+                        | filmcraft_media::generators::Generator::BlackVideo
+                        | filmcraft_media::generators::Generator::BarsAndTone
+                )
+            )
+        }
+        _ => false,
+    }
+}
+
+impl Seed<'_> {
+    /// An adjustment layer, colour matte, black video or bars and tone as Premiere writes one: a
+    /// master clip over a still "synthetic" media whose file path is a four-character code (`BLAK`
+    /// black video, under adjustment layers too; `COLR` colour matte, its colour in
+    /// `ImporterPrefs`; `BARS` bars and tone, with a stereo tone).
+    fn synthetic(&mut self, item: ItemId) {
+        let project = self.project;
+        let Some(it) = project.item(item) else { return };
+        let seq = project.sequences().filter_map(|i| i.as_sequence()).map(|q| q.settings.clone()).next();
+        let (w0, h0, rate0) = seq.as_ref().map(|q| (q.width, q.height, q.frame_rate)).unwrap_or((1920, 1080, filmcraft_time::FrameRate::FPS_30));
+        let (size, rate, adjustment, kind) = match &it.kind {
+            ItemKind::AdjustmentLayer { width, height, rate, .. } => ((*width, *height), *rate, true, Synth::Black),
+            ItemKind::Media(m) => {
+                let size = m.info.video.as_ref().map(|v| (v.width, v.height)).unwrap_or((w0, h0));
+                let rate = m.info.video.as_ref().map(|v| v.frame_rate).unwrap_or(rate0);
+                match &m.media {
+                    MediaRef::Generator(filmcraft_media::generators::Generator::ColorMatte { color }) => (size, rate, false, Synth::Matte(*color)),
+                    MediaRef::Generator(filmcraft_media::generators::Generator::BlackVideo) => (size, rate, false, Synth::Black),
+                    MediaRef::Generator(filmcraft_media::generators::Generator::BarsAndTone) => (size, rate, false, Synth::Bars),
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        let frame = rate.frame_duration().0.max(1);
+        let (fourcc, title) = match kind {
+            Synth::Matte(_) => (*b"COLR", "Color Matte"),
+            Synth::Black => (*b"BLAK", "Black Video"),
+            Synth::Bars => (*b"BARS", "Bars and Tone - Rec 709"),
+        };
+        let fourcc = u32::from_be_bytes(fourcc);
+        let name = it.name.clone();
+        let master_uid = self.uuid();
+        let media_uid = self.uuid();
+        let markers = self.markers(&[]);
+        let logging = self.obj(
+            "ClipLoggingInfo",
+            class::LOGGING,
+            &format!("<CaptureMode>2</CaptureMode>{}<MediaFrameRate>{frame}</MediaFrameRate>", el("ClipName", &name)),
+        );
+        let media_source = |s: &mut Self, c: (&str, u32), tag: &str| {
+            s.obj(
+                tag,
+                c,
+                &format!(
+                    "<MediaSource Version=\"4\"><Content Version=\"10\"></Content><Media ObjectURef=\"{media_uid}\"/></MediaSource><OriginalDuration>{SYNTHETIC_DURATION}</OriginalDuration>"
+                ),
+            )
+        };
+        let source = media_source(self, class::VIDEO_MEDIA_SOURCE, "VideoMediaSource");
+        // the master clip spans five seconds, as a new one does in Premiere
+        let range = Some((0, 5 * TICKS_PER_SECOND));
+        let mut clips = vec![self.video_clip(markers, source, range, true)];
+        // bars and tone has a stereo 1 kHz tone (Premiere's own settings, below)
+        let sample = sample_ticks(48_000);
+        let audio = matches!(kind, Synth::Bars).then(|| media_source(self, class::AUDIO_MEDIA_SOURCE, "AudioMediaSource"));
+        if let Some(a) = audio {
+            clips.push(self.audio_clip(markers, a, range, false, true));
+        }
+        let continuous = if adjustment { "<IsContinuousTime>true</IsContinuousTime>" } else { "" };
+        let stream = self.obj(
+            "VideoStream",
+            class::VIDEO_STREAM,
+            &format!(
+                "<FrameRate>{frame}</FrameRate><Duration>{SYNTHETIC_DURATION}</Duration><FrameRect>0,0,{},{}</FrameRect><CodecType>1431194446</CodecType><IsStill>true</IsStill>{continuous}{}<FieldTypeIsUncertain>true</FieldTypeIsUncertain>",
+                size.0,
+                size.1,
+                el("OriginalColorSpace", r#"{"baseColorProfile":{"colorProfileName":"BT.709 RGB Full"},"baseProfileType":1}"#)
+            ),
+        );
+        let mut streams = String::new();
+        if audio.is_some() {
+            let a = self.obj(
+                "AudioStream",
+                class::AUDIO_STREAM,
+                &format!(
+                    "<FrameRate>{sample}</FrameRate>{}<Duration>{SYNTHETIC_DURATION}</Duration><SampleType>6</SampleType>",
+                    el("AudioChannelLayout", STEREO)
+                ),
+            );
+            streams.push_str(&format!("<AudioStream ObjectRef=\"{a}\"/>"));
+        }
+        streams.push_str(&format!("<VideoStream ObjectRef=\"{stream}\"/>"));
+        let prefs = match kind {
+            // a colour matte's colour: R, G, B, 0, then 1 (as the mattes in Premiere projects have it)
+            Synth::Matte(c) => {
+                let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let bytes = [byte(c[0]), byte(c[1]), byte(c[2]), 0, 1, 0, 0, 0];
+                format!(
+                    "<ImporterPrefs Encoding=\"base64\" BinaryHash=\"{}\">{}</ImporterPrefs>",
+                    self.binary_hash(bytes.len()),
+                    crate::prproj_text::base64_encode(&bytes)
+                )
+            }
+            // Premiere's settings of a new Bars and Tone (Rec 709), as it saves them
+            Synth::Bars => format!("<ImporterPrefs Encoding=\"base64\" BinaryHash=\"{BARS_PREFS_HASH}\">{BARS_PREFS}</ImporterPrefs>"),
+            Synth::Black => String::new(),
+        };
+        let conformed = if audio.is_some() { format!("<ConformedAudioRate>{sample}</ConformedAudioRate>") } else { String::new() };
+        self.uobj(
+            &media_uid,
+            "Media",
+            class::MEDIA,
+            &format!(
+                "{streams}{prefs}<FilePath>{fourcc}</FilePath><ImplementationID>{SYNTHETIC_IMPORTER}</ImplementationID>{}<Infinite>true</Infinite>{conformed}<ActualMediaFilePath>{fourcc}</ActualMediaFilePath>",
+                el("Title", title)
+            ),
+        );
+        let groups = self.channel_groups(audio.map(|_| 2));
+        let chains = if audio.is_some() {
+            let chain = self.default_audio_chain(sample, false);
+            list("AudioComponentChains", "AudioComponentChain", &[chain], false)
+        } else {
+            String::new()
+        };
+        let adj = if adjustment { "<IsAdjustmentLayer>true</IsAdjustmentLayer>" } else { "" };
+        self.uobj(
+            &master_uid,
+            "MasterClip",
+            class::MASTER_CLIP,
+            &format!(
+                "<LoggingInfo ObjectRef=\"{logging}\"/>{chains}{}<AudioClipChannelGroups ObjectRef=\"{groups}\"/>{}{adj}<MasterClipChangeVersion>1</MasterClipChangeVersion>",
+                list("Clips", "Clip", &clips, false),
+                el("Name", &name)
+            ),
+        );
+        self.project_item(item, &name, &master_uid);
+        self.sources.insert(item, Sources { master: master_uid, name, video: Some(source), audio, markers, size, mono: false, sample });
+        self.media_uid.push((item, media_uid));
+    }
+
+    /// A `BinaryHash` for a new binary payload of `len` bytes: a unique id ending, as Premiere's
+    /// do, in the payload's length + 12 (Premiere's hash function itself is not known; the
+    /// payload is written inline, which is what is read).
+    fn binary_hash(&mut self, len: usize) -> String {
+        let u = self.uuid().replace('-', "");
+        let h = u.get(..24).unwrap_or("000000000000000000000000");
+        format!("{}-{}-{}-{}-{}{:08x}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..24], len + 12)
+    }
+}
+
+/// A layout as a small Premiere document of its own (what a layout library keeps).
+pub(crate) fn layout_document(g: &Graft, at_defaults: bool) -> Option<String> {
+    let mut next = 1;
+    let objs = graft_objects(g, &mut next)?;
+    let mark = if at_defaults { format!(" {AT_DEFAULTS}=\"true\"") } else { String::new() };
+    Some(format!("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<PremiereData Version=\"3\"{mark}>\n{}</PremiereData>\n", objs.concat()))
+}
+
+impl Need {
+    /// A file-name-safe key: `effect.gaussian_blur`, `transition.video.cross dissolve`.
+    pub(crate) fn key(&self) -> String {
+        let raw = match self {
+            Need::Effect(id) => format!("effect.{id}"),
+            Need::Transition(name, audio) => format!("transition.{}.{name}", if *audio { "audio" } else { "video" }),
+        };
+        raw.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' ') { c } else { '_' }).collect()
+    }
+}
+
 /// A borrowed layout as objects with ids from `next` (advanced past them), each with its own
 /// references renumbered; all or nothing (`None`: a part of it would leave references unresolved).
 pub(crate) fn graft_objects(g: &Graft, next: &mut u64) -> Option<Vec<String>> {
@@ -1467,6 +1805,7 @@ pub(crate) fn graft_objects(g: &Graft, next: &mut u64) -> Option<Vec<String>> {
     Some(objs)
 }
 
+/// The document without the objects nothing reachable from the project refers to (the templates).
 fn prune(text: &str) -> Result<String> {
     let doc = crate::xml::parse(text).map_err(|e| Error::Other(format!("Premiere Pro project: the written project does not parse: {e}")))?;
     let root = doc.root_element();

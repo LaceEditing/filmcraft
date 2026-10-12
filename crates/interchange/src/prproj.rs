@@ -878,3 +878,8 @@ pub(crate) fn rate_of(ticks_per_frame: i64) -> Option<FrameRate> {
 #[cfg(test)]
 #[path = "prproj_tests.rs"]
 pub(crate) mod tests;
+
+/// The interchange tests' document (see [`crate::prproj_test_document`]).
+pub(crate) fn test_document() -> String {
+    include_str!("prproj_test_document.xml").to_string()
+}

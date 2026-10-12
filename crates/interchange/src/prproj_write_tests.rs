@@ -111,8 +111,10 @@ fn edits_round_trip_through_the_premiere_project() {
     }
 }
 
+/// Media FilmCraft added that no file in the project can serve as a model for is built from
+/// scratch (as in a new project).
 #[test]
-fn clips_premiere_cannot_place_are_reported_not_written() {
+fn media_without_a_model_is_built_from_scratch() {
     let plain = doc();
     let (imp, _) = import(plain.as_bytes(), None);
     let mut p = imp.project;
@@ -135,10 +137,15 @@ fn clips_premiere_cannot_place_are_reported_not_written() {
     c.start = Tick(20 * S);
     seq.video_tracks[0].items.push(c);
     let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
-    assert!(report.mentions("new.mov") && report.mentions("mxf"), "{report}");
+    assert!(!report.mentions("not written"), "{report}");
     let back = read(&out);
     let seq = back.sequences().next().and_then(|i| i.as_sequence()).unwrap();
-    assert_eq!(seq.video_tracks[0].items.len(), 2);
+    assert_eq!(seq.video_tracks[0].items.len(), 3, "{report}");
+    let added = seq.video_tracks[0].items.iter().find(|c| c.start == Tick(20 * S)).unwrap();
+    assert_eq!(back.item(added.item).unwrap().name, "new.mov");
+    assert!(
+        matches!(&back.item(added.item).unwrap().kind, ItemKind::Media(m) if matches!(&m.media, filmcraft_project::MediaRef::File { path } if path.ends_with("new.mxf")))
+    );
 }
 
 #[test]
@@ -590,9 +597,9 @@ fn sequence_settings_are_written() {
 }
 
 /// Tracks added in FilmCraft are written even while empty; sequences and bins made in FilmCraft
-/// are not written yet and say so.
+/// are written too.
 #[test]
-fn added_tracks_are_kept_and_new_sequences_and_bins_are_reported() {
+fn added_tracks_new_sequences_and_bins_are_written() {
     let plain = doc();
     let (imp, _) = import(plain.as_bytes(), None);
     let mut p = imp.project;
@@ -608,9 +615,172 @@ fn added_tracks_are_kept_and_new_sequences_and_bins_are_reported() {
     let bin = filmcraft_project::BinId(p.alloc_id());
     p.root.children.push(filmcraft_project::BinEntry::Bin(filmcraft_project::Bin { id: bin, name: "Selects".into(), children: Vec::new() }));
     let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
-    assert!(report.mentions("sequence \"Made Here\" was made in FilmCraft") && report.mentions("bin \"Selects\" was made in FilmCraft"), "{report}");
-    assert!(!report.mentions("bin \"Footage\""), "{report}");
     let back = read(&out);
     let seq = back.sequences().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
     assert_eq!((seq.video_tracks.len(), seq.audio_tracks.len()), (2, 2), "{report}");
+    assert!(back.sequences().any(|i| i.name == "Made Here"), "{report}");
+    let bins: Vec<&str> =
+        back.root.children.iter().filter_map(|e| if let filmcraft_project::BinEntry::Bin(b) = e { Some(b.name.as_str()) } else { None }).collect();
+    assert!(bins.contains(&"Selects") && bins.contains(&"Footage"), "{bins:?} {report}");
+}
+
+/// A sequence made in FilmCraft with a clip of the project's media, an adjustment layer and a
+/// colour matte made in FilmCraft, and the media moved into a new bin: all written, and read back.
+#[test]
+fn new_sequences_synthetic_items_and_bins_are_built() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let settings = p.sequence(sid).unwrap().settings.clone();
+    let media = p.items.values().find(|i| i.name == "interview.mov").map(|i| i.id).unwrap();
+    let template = p.sequence(sid).unwrap().video_tracks[0].items[0].clone();
+    let adj = p.add_item(
+        "Grade",
+        filmcraft_project::Label::Lavender,
+        ItemKind::AdjustmentLayer { width: 1920, height: 1080, rate: filmcraft_time::FrameRate::new(30, 1), duration: Tick(i64::MAX / 4) },
+        None,
+    );
+    let info = filmcraft_media::MediaInfo {
+        name: "Orange".into(),
+        kind: filmcraft_media::MediaKind::Still,
+        duration: Tick(5 * S),
+        audio: None,
+        container: String::new(),
+        start_timecode: None,
+        file_size: None,
+        video: Some(filmcraft_media::VideoStreamInfo {
+            width: 1920,
+            height: 1080,
+            frame_rate: filmcraft_time::FrameRate::new(30, 1),
+            par: (1, 1),
+            codec: String::new(),
+            pixel_format: String::new(),
+            color: filmcraft_color::ColorInfo::REC709,
+            has_alpha: false,
+            bitrate: None,
+            hdr: None,
+        }),
+    };
+    let matte = p.add_item(
+        "Orange",
+        filmcraft_project::Label::Iris,
+        ItemKind::Media(filmcraft_project::MediaClip {
+            media: filmcraft_project::MediaRef::Generator(filmcraft_media::generators::Generator::ColorMatte { color: [1.0, 0.5, 0.0, 1.0] }),
+            info,
+            interpret: Default::default(),
+            mark_in: None,
+            mark_out: None,
+            markers: vec![],
+            offline: false,
+            proxy: None,
+            identity: None,
+        }),
+        None,
+    );
+    let new_seq = p.new_sequence("Made Here", settings, 2, 1, None);
+    {
+        let q = p.sequence_mut(new_seq).unwrap();
+        let mut c = template.clone();
+        c.id = ClipId(70_001);
+        c.origin = None;
+        c.link = None;
+        c.start = Tick(0);
+        c.effect_mut("motion").unwrap().params.insert("scale".into(), Param::new(ParamValue::Float(130.0)));
+        q.video_tracks[0].items.push(c.clone());
+        let mut a = c.clone();
+        a.id = ClipId(70_002);
+        a.item = adj;
+        a.source_in = Tick(0);
+        a.effects = filmcraft_project::effect::intrinsic_video();
+        q.video_tracks[1].items.push(a);
+        let mut m = c;
+        m.id = ClipId(70_003);
+        m.item = matte;
+        m.start = Tick(5 * S);
+        m.source_in = Tick(0);
+        m.effects = filmcraft_project::effect::intrinsic_video();
+        q.video_tracks[0].items.push(m);
+    }
+    // the media goes into a new bin "Selects"
+    fn take(b: &mut filmcraft_project::Bin, id: ItemId) -> bool {
+        let before = b.children.len();
+        b.children.retain(|e| !matches!(e, filmcraft_project::BinEntry::Item(i) if *i == id));
+        before != b.children.len()
+            || b.children.iter_mut().any(|e| match e {
+                filmcraft_project::BinEntry::Bin(c) => take(c, id),
+                _ => false,
+            })
+    }
+    assert!(take(&mut p.root, media));
+    let bin = filmcraft_project::BinId(p.alloc_id());
+    p.root.children.push(filmcraft_project::BinEntry::Bin(filmcraft_project::Bin {
+        id: bin,
+        name: "Selects".into(),
+        children: vec![filmcraft_project::BinEntry::Item(media)],
+    }));
+
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert!(!report.mentions("not written"), "{report}");
+    let back = read(&out);
+    let q = back.sequences().find(|i| i.name == "Made Here").and_then(|i| i.as_sequence()).expect("the new sequence");
+    let v1: Vec<&str> = q.video_tracks[0].items.iter().map(|c| back.item(c.item).unwrap().name.as_str()).collect();
+    assert_eq!(v1, ["interview.mov", "Orange"], "{report}");
+    assert_eq!(q.video_tracks[0].items[0].effect("motion").unwrap().params["scale"].value, ParamValue::Float(130.0));
+    assert!(matches!(back.item(q.video_tracks[1].items[0].item).unwrap().kind, ItemKind::AdjustmentLayer { .. }));
+    let orange = back.item(q.video_tracks[0].items[1].item).unwrap();
+    let ItemKind::Media(m) = &orange.kind else { panic!("{orange:?}") };
+    let filmcraft_project::MediaRef::Generator(filmcraft_media::generators::Generator::ColorMatte { color }) = &m.media else { panic!("{m:?}") };
+    assert!((color[0] - 1.0).abs() < 0.01 && (color[1] - 0.5).abs() < 0.01 && color[2].abs() < 0.01, "{color:?}");
+    // the bins: the media in "Selects", the new items at the root
+    let selects = back.root.children.iter().find_map(|e| match e {
+        filmcraft_project::BinEntry::Bin(b) if b.name == "Selects" => Some(b),
+        _ => None,
+    });
+    let in_selects: Vec<&str> = selects
+        .expect("Selects")
+        .children
+        .iter()
+        .filter_map(|e| if let filmcraft_project::BinEntry::Item(i) = e { back.item(*i).map(|x| x.name.as_str()) } else { None })
+        .collect();
+    assert_eq!(in_selects, ["interview.mov"]);
+    // saved again unchanged: the same document
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    let (again_imp, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&again_imp.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
+}
+
+/// Layouts learned from a layout kit (effects at default settings) are models even when
+/// FilmCraft does not map every setting; the settings FilmCraft changed that have no place are
+/// reported.
+#[test]
+fn layout_kit_layouts_are_models_and_unwritten_settings_are_reported() {
+    // a project with a Tint whose third setting has a name FilmCraft does not know
+    let kit = doc().replace("<Name>Amount to Tint</Name>", "<Name>Something Else</Name>");
+    assert!(crate::prproj_new::layouts_in(kit.as_bytes(), false).iter().all(|(n, _, _)| n.key() != "effect.tint"), "not a model unless at defaults");
+    let learned = crate::prproj_new::layouts_in(kit.as_bytes(), true);
+    let (_, _, tint) = learned.iter().find(|(n, _, _)| n.key() == "effect.tint").expect("learned at defaults");
+    let model = crate::prproj_new::layout_document(tint, true).unwrap();
+    assert!(model.contains(crate::prproj_new::AT_DEFAULTS));
+    // a project without a Tint adds one modelled on the kit's
+    let plain = default_chains_doc(false);
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let b = &mut p.sequence_mut(sid).unwrap().video_tracks[0].items[1];
+        let mut t = filmcraft_project::find_effect("tint").unwrap().instance();
+        t.params.insert("amount".into(), Param::new(ParamValue::Float(30.0)));
+        b.effects.insert(0, t);
+    }
+    let (out, report) = export_with(&p, plain.as_bytes(), &[], None, &[model.into_bytes()]).unwrap();
+    assert!(report.mentions("\"Tint\" on \"backwards\": Amount to Tint not written"), "{report}");
+    assert!(read(&out).sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[0].items[1].effect("tint").is_some(), "{report}");
+}
+
+/// The fixture other crates' tests use is this document.
+#[test]
+fn the_shared_test_document_is_current() {
+    assert_eq!(crate::prproj::test_document(), doc());
 }

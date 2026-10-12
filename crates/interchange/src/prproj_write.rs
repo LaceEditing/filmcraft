@@ -52,18 +52,30 @@ pub fn export(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir
 /// [`export`], borrowing the layout of an effect or transition FilmCraft added that this project
 /// has nowhere from `models` (other Premiere projects, as `.prproj` bytes).
 pub fn export_with(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir: Option<&str>, models: &[Vec<u8>]) -> Result<(Vec<u8>, Report)> {
+    if !project.sequences().any(|i| i.metadata.contains_key(META_SEQUENCE)) {
+        return Err(err("no sequence in this project came from a Premiere project"));
+    }
     let (xml, compressed) = prproj_graph::decompress(original)?;
     let text = std::str::from_utf8(&xml).map_err(|_| err("the original project is not UTF-8"))?;
+    // sequences, media and synthetic items made in FilmCraft (and template clips for what the
+    // sequences play that no clip in the document plays yet) are built first
+    let additions = add_new_items(project, text, sequences, dest_dir)?;
+    let (text, project, drop, items) = match &additions {
+        Some(a) => (a.text.as_str(), &a.project, a.templates.clone(), a.project_items.clone()),
+        None => (text, project, HashSet::new(), HashMap::new()),
+    };
     // Premiere writes no Motion, Opacity or clip Volume until a value leaves its default: a clip
     // FilmCraft changed first gets them (as Premiere adds them) and is written again; so is a
     // project that gets a borrowed layout
-    let none = HashSet::new();
-    let out = match write(project, text, sequences, dest_dir, true, !models.is_empty(), &none)? {
+    let first = Pass { first: true, borrow: !models.is_empty(), drop: &drop, items: &items };
+    let out = match write(project, text, sequences, dest_dir, &first)? {
         Written::Done(out) => out,
         Written::Needs(chains, missing) => {
             let grafts = if missing.is_empty() { Vec::new() } else { crate::prproj_new::find_models(models, &missing) };
             let (seeded, borrowed) = seed(text, &chains, &grafts)?;
-            match write(project, &seeded, sequences, dest_dir, false, false, &borrowed)? {
+            let drop: HashSet<String> = drop.union(&borrowed).cloned().collect();
+            let second = Pass { first: false, borrow: false, drop: &drop, items: &items };
+            match write(project, &seeded, sequences, dest_dir, &second)? {
                 Written::Done(mut out) => {
                     if !grafts.is_empty() {
                         out.report.info(format!("{} effect or transition layout(s) were borrowed from your other Premiere projects", grafts.len()));
@@ -79,6 +91,193 @@ pub fn export_with(project: &Project, original: &[u8], sequences: &[ItemId], des
     Ok((bytes, out.report))
 }
 
+/// How one pass of [`write`] runs.
+struct Pass<'x> {
+    /// Stop when clips need components the document lacks, or (`borrow`, there are models to look
+    /// in) effects and transitions have no layout; a second pass writes what it can.
+    first: bool,
+    borrow: bool,
+    /// Objects added only to be copied (templates, borrowed layouts), dropped from the result.
+    drop: &'x HashSet<String>,
+    /// Items built from scratch → their `ClipProjectItem` UID (for the bins).
+    items: &'x HashMap<ItemId, String>,
+}
+
+/// The document with what FilmCraft added built in, and the project as the writer sees it then.
+struct Additions {
+    text: String,
+    project: Project,
+    templates: HashSet<String>,
+    project_items: HashMap<ItemId, String>,
+}
+
+/// Build sequences, media and synthetic items made in FilmCraft into the document, with a
+/// template clip for each item and kind a sequence plays that no clip in the document plays yet.
+/// None: nothing to add.
+fn add_new_items(project: &Project, text: &str, sequences: &[ItemId], dest_dir: Option<&str>) -> Result<Option<Additions>> {
+    let doc = crate::xml::parse(text).map_err(|e| Error::parse(Format::Prproj, e))?;
+    let root = doc.root_element();
+    let ix = Index::new(root);
+    let req = plan_additions(project, &ix, root, sequences);
+    if req.is_empty() {
+        return Ok(None);
+    }
+    let next = ix.ids.keys().filter_map(|k| k.parse::<u64>().ok()).max().unwrap_or(0) + 1;
+    let opts = crate::prproj_new::CreateOptions { dest_dir: dest_dir.map(str::to_string), path_map: path_prefixes(project, &ix), models: Vec::new() };
+    let seed_hash = u64::from(prproj_graph::crc32(text.as_bytes())) << 16 ^ text.len() as u64;
+    let added = crate::prproj_new::add_to_existing(project, &opts, &req, next, seed_hash);
+    let r = root.range();
+    let src = &text[r.clone()];
+    let close = "</PremiereData>";
+    if !src.trim_end().ends_with(close) {
+        return Err(err("the project does not end with </PremiereData>"));
+    }
+    let at = r.start + src.trim_end().len() - close.len();
+    let mut out = String::with_capacity(text.len() + added.text.len());
+    out.push_str(&text[..at]);
+    out.push_str(&added.text);
+    out.push_str(&text[at..]);
+    let mut work = project.clone();
+    for (id, uid) in &added.media_uid {
+        if let Some(it) = work.item_mut(*id) {
+            it.metadata.insert(META_MEDIA.to_string(), uid.clone());
+        }
+    }
+    for (id, uid) in &added.sequence_uid {
+        if let Some(it) = work.item_mut(*id) {
+            it.metadata.insert(META_SEQUENCE.to_string(), uid.clone());
+        }
+    }
+    Ok(Some(Additions { text: out, project: work, templates: added.templates.map(|i| i.to_string()).collect(), project_items: added.project_items }))
+}
+
+/// What the document lacks for `project` (see [`add_new_items`]).
+fn plan_additions<'a, 'i>(project: &Project, ix: &Index<'a, 'i>, root: Node<'a, 'i>, sequences: &[ItemId]) -> crate::prproj_new::AddRequest {
+    let mut req = crate::prproj_new::AddRequest::default();
+    let asked = |id: &ItemId| sequences.is_empty() || sequences.contains(id);
+    req.sequences = project.sequences().filter(|i| !i.metadata.contains_key(META_SEQUENCE) && asked(&i.id)).map(|i| i.id).collect();
+    // what clips in the document already play: (media or sequence UID, video)
+    let mut played: HashSet<(&str, bool)> = HashSet::new();
+    for n in root.children().filter(|n| n.has_tag_name("VideoClipTrackItem") || n.has_tag_name("AudioClipTrackItem")) {
+        let Some(clip) = ix.follow(n, &["ClipTrackItem", "SubClip"]).and_then(|sub| ix.follow(sub, &["Clip"])) else { continue };
+        if let Some(uid) = prproj_graph::clip_media(ix, clip).or_else(|| prproj_graph::clip_sequence(ix, clip)).and_then(|t| t.attribute("ObjectUID")) {
+            played.insert((uid, n.has_tag_name("VideoClipTrackItem")));
+        }
+    }
+    let new_seqs: HashSet<ItemId> = req.sequences.iter().copied().collect();
+    let mut synthetic: BTreeSet<ItemId> = BTreeSet::new();
+    let mut media: BTreeSet<ItemId> = BTreeSet::new();
+    let mut templates: BTreeSet<(ItemId, bool)> = BTreeSet::new();
+    let written = project.sequences().filter(|i| (i.metadata.contains_key(META_SEQUENCE) && asked(&i.id)) || new_seqs.contains(&i.id));
+    for seq in written.filter_map(|i| i.as_sequence()) {
+        for t in seq.all_tracks() {
+            let video = t.kind == TrackKind::Video;
+            for c in &t.items {
+                let Some(it) = project.item(c.item) else { continue };
+                let known = it.metadata.get(META_SEQUENCE).or_else(|| it.metadata.get(META_MEDIA));
+                if new_seqs.contains(&c.item) {
+                    templates.insert((c.item, video));
+                } else if let Some(uids) = known {
+                    if !uids.split(',').any(|u| played.contains(&(u, video))) {
+                        templates.insert((c.item, video));
+                    }
+                } else if crate::prproj_new::is_synthetic(it) {
+                    synthetic.insert(c.item);
+                    templates.insert((c.item, video));
+                } else if matches!(&it.kind, ItemKind::Media(m) if matches!(m.media, filmcraft_project::MediaRef::File { .. }))
+                    && asset_model(ix, root, project, c.item).is_none()
+                {
+                    media.insert(c.item);
+                    templates.insert((c.item, video));
+                }
+            }
+        }
+    }
+    // items made in FilmCraft that no sequence uses yet still go into the bins
+    for it in project.items.values().filter(|i| !i.metadata.contains_key(META_MEDIA)) {
+        if crate::prproj_new::is_synthetic(it) {
+            synthetic.insert(it.id);
+        } else if matches!(&it.kind, ItemKind::Media(m) if matches!(m.media, filmcraft_project::MediaRef::File { .. })) && !used_by(project, it.id) {
+            media.insert(it.id);
+        }
+    }
+    // the objects of items the document has, for their templates
+    for (item, _) in &templates {
+        let Some(it) = project.item(*item) else { continue };
+        if let Some(uid) = it.metadata.get(META_SEQUENCE) {
+            if let Some(src) = existing_sources(ix, root, uid, true) {
+                req.existing.insert(*item, src);
+            }
+        } else if let Some(uids) = it.metadata.get(META_MEDIA)
+            && let Some(src) = uids.split(',').find_map(|u| existing_sources(ix, root, u, false))
+        {
+            req.existing.insert(*item, src);
+        }
+    }
+    // a template of an item the document has but whose objects were not found cannot be made
+    templates.retain(|(item, _)| new_seqs.contains(item) || synthetic.contains(item) || media.contains(item) || req.existing.contains_key(item));
+    req.synthetic = synthetic.into_iter().collect();
+    req.media = media.into_iter().collect();
+    req.templates = templates.into_iter().collect();
+    req
+}
+
+/// Whether a clip of any sequence plays `item`.
+fn used_by(project: &Project, item: ItemId) -> bool {
+    project.sequences().filter_map(|i| i.as_sequence()).flat_map(|q| q.all_tracks()).any(|t| t.items.iter().any(|c| c.item == item))
+}
+
+/// The master clip objects of the media (`sequence`: the sequence) with UID `uid`.
+fn existing_sources<'a, 'i>(ix: &Index<'a, 'i>, root: Node<'a, 'i>, uid: &str, sequence: bool) -> Option<crate::prproj_new::Sources> {
+    for pi in root.children().filter(|n| n.has_tag_name("ClipProjectItem")) {
+        let Some(master) = ix.follow(pi, &["MasterClip"]) else { continue };
+        let clips = ix.list(master, &["Clips"], "Clip");
+        let target = |c: Node<'a, 'i>| if sequence { prproj_graph::clip_sequence(ix, c) } else { prproj_graph::clip_media(ix, c) };
+        let Some(target_node) = clips.iter().find_map(|c| target(*c).filter(|t| t.attribute("ObjectUID") == Some(uid))) else { continue };
+        let source_of = |tag: &str| {
+            clips
+                .iter()
+                .filter(|c| c.has_tag_name(tag))
+                .find_map(|c| ix.at(*c, &["Clip", "Source"]).and_then(|r| r.attribute("ObjectRef")))
+                .and_then(|v| v.parse::<u64>().ok())
+        };
+        let markers = clips
+            .iter()
+            .find_map(|c| ix.at(*c, &["Clip", "MarkerOwner", "Markers"]).and_then(|r| r.attribute("ObjectRef")))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let name = child_text(master, "Name").or_else(|| path_text(pi, &["ProjectItem", "Name"])).unwrap_or("Clip").to_string();
+        let (size, mono, sample) = if sequence {
+            let size = prproj_graph::track_group(ix, target_node, "VideoTrackGroup")
+                .and_then(|g| crate::prproj::frame_rect(child_text(g, "FrameRect")))
+                .unwrap_or((1920, 1080));
+            let sample =
+                prproj_graph::track_group(ix, target_node, "AudioTrackGroup").and_then(|g| path_text(g, &["TrackGroup", "FrameRate"])).and_then(parse_i64);
+            (size, false, sample)
+        } else {
+            let size = ix.follow(target_node, &["VideoStream"]).and_then(|v| crate::prproj::frame_rect(child_text(v, "FrameRect"))).unwrap_or((1920, 1080));
+            let audio = ix.follow(target_node, &["AudioStream"]);
+            let mono = audio
+                .and_then(|a| child_text(a, "AudioChannelLayout"))
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                .and_then(|v| v.as_array().map(|a| a.len() == 1))
+                .unwrap_or(false);
+            (size, mono, audio.and_then(|a| child_text(a, "FrameRate")).and_then(parse_i64))
+        };
+        return Some(crate::prproj_new::Sources {
+            master: master.attribute("ObjectUID")?.to_string(),
+            name,
+            video: source_of("VideoClip"),
+            audio: source_of("AudioClip"),
+            markers,
+            size,
+            mono,
+            sample: sample.filter(|s| *s > 0).unwrap_or(TICKS_PER_SECOND / 48_000),
+        });
+    }
+    None
+}
+
 enum Written {
     Done(Output),
     /// Chains (by object id) that need components the document does not have yet, and effects
@@ -86,18 +285,9 @@ enum Written {
     Needs(BTreeMap<String, ChainNeed>, BTreeSet<crate::prproj_new::Need>),
 }
 
-/// One pass. `first`: stop when clips need components the document lacks, or (`borrow`, there are
-/// models to look in) effects and transitions have no layout; a second pass writes what it can.
-/// `borrowed`: objects added only to be copied, dropped from the result.
-fn write(
-    project: &Project,
-    text: &str,
-    sequences: &[ItemId],
-    dest_dir: Option<&str>,
-    first: bool,
-    borrow: bool,
-    borrowed: &HashSet<String>,
-) -> Result<Written> {
+/// One pass (see [`Pass`]).
+fn write(project: &Project, text: &str, sequences: &[ItemId], dest_dir: Option<&str>, pass: &Pass) -> Result<Written> {
+    let (first, borrow, borrowed) = (pass.first, pass.borrow, pass.drop);
     let doc = crate::xml::parse(text).map_err(|e| Error::parse(Format::Prproj, e))?;
     let root = doc.root_element();
     if root.tag_name().name() != "PremiereData" {
@@ -105,6 +295,7 @@ fn write(
     }
     let mut w = Writer::new(text, root);
     w.borrow = borrow;
+    w.new_items = pass.items.clone();
     w.displaced = displaced(text);
     w.dest_dir = dest_dir.map(str::to_string);
     w.prefixes = path_prefixes(project, &w.ix);
@@ -115,27 +306,6 @@ fn write(
     };
     if wanted.is_empty() {
         return Err(err("no sequence in this project came from a Premiere project"));
-    }
-    // what a Premiere project gets only from Premiere so far: sequences and bins made here
-    for it in project.sequences().filter(|i| !i.metadata.contains_key(META_SEQUENCE)) {
-        w.report.warn(format!("sequence \"{}\" was made in FilmCraft; new sequences are not written into Premiere projects yet", it.name));
-    }
-    let premiere_bins: HashSet<&str> =
-        root.children().filter(|n| n.has_tag_name("BinProjectItem")).filter_map(|n| path_text(n, &["ProjectItem", "Name"])).collect();
-    let mut new_bins = Vec::new();
-    let mut stack: Vec<&filmcraft_project::Bin> = vec![&project.root];
-    while let Some(b) = stack.pop() {
-        for e in &b.children {
-            if let filmcraft_project::BinEntry::Bin(c) = e {
-                if !premiere_bins.contains(c.name.as_str()) {
-                    new_bins.push(c.name.clone());
-                }
-                stack.push(c);
-            }
-        }
-    }
-    for b in new_bins {
-        w.report.warn(format!("bin \"{b}\" was made in FilmCraft; new bins are not written into Premiere projects yet"));
     }
     let mut written = Vec::new();
     for id in &wanted {
@@ -166,6 +336,7 @@ fn write(
         let Some(first) = uids.split(',').next() else { continue };
         w.owner_markers(first, false, &m.markers, &format!("\"{}\"", it.name));
     }
+    w.bins(project);
     let mut out = w.finish()?;
     if !borrowed.is_empty() {
         out.text = drop_objects(&out.text, borrowed)?;
@@ -371,6 +542,60 @@ fn insert_at_end(text: &str, parent: Node<'_, '_>, xml: &str) -> (Range<usize>, 
     }
 }
 
+/// A project item whose media has the extension and streams (and channel count) of `item`'s, to
+/// copy for media FilmCraft added; None: there is none (or `item` is not a media file).
+fn asset_model<'a, 'i>(ix: &Index<'a, 'i>, root: Node<'a, 'i>, project: &Project, item: ItemId) -> Option<Node<'a, 'i>> {
+    let it = project.item(item)?;
+    let ItemKind::Media(m) = &it.kind else { return None };
+    if !matches!(m.media, filmcraft_project::MediaRef::File { .. }) {
+        return None;
+    }
+    let info = &m.info;
+    let ext = ext_of(project, item);
+    let channels = info.audio.as_ref().map(|a| a.channels);
+    let still = info.kind == filmcraft_media::MediaKind::Still;
+    if !still && info.duration.0 <= 0 {
+        return None;
+    }
+    // a project item whose media has the same extension and streams (and channel count)
+    let mut best: Option<(u8, Node<'a, 'i>)> = None;
+    for pi in root.children().filter(|n| n.has_tag_name("ClipProjectItem")) {
+        let Some(master) = ix.follow(pi, &["MasterClip"]) else { continue };
+        let Some(media) = ix.list(master, &["Clips"], "Clip").into_iter().find_map(|c| prproj_graph::clip_media(ix, c)) else { continue };
+        let fp = child_text(media, "ActualMediaFilePath").or_else(|| child_text(media, "FilePath")).unwrap_or("");
+        if !fp.to_ascii_lowercase().ends_with(&format!(".{ext}")) {
+            continue;
+        }
+        let has_v = child(media, "VideoStream").is_some();
+        let has_a = child(media, "AudioStream").is_some();
+        if has_v != info.video.is_some() || (has_a != info.audio.is_some() && !still) {
+            continue;
+        }
+        let ch = ix
+            .follow(media, &["AudioStream"])
+            .and_then(|a| child_text(a, "AudioChannelLayout"))
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .and_then(|v| v.as_array().map(|a| a.len() as u32));
+        let score = u8::from(ch == channels) + 1;
+        if best.is_none_or(|(b, _)| score > b) {
+            best = Some((score, pi));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
+/// What one Premiere bin (or the root) should hold.
+struct BinPlan<'a, 'i> {
+    /// The Premiere bin (None: made in FilmCraft).
+    node: Option<Node<'a, 'i>>,
+    uid: String,
+    name: String,
+    items: Vec<String>,
+}
+
+/// Class id of a Premiere bin.
+const BIN_ITEM_CLASS: &str = "dbfd6653-24da-480e-a35e-ba45e9504e4b";
+
 /// Premiere's "Custom" sequence editing mode (any frame size and timebase).
 const CUSTOM_EDITING_MODE: &str = "9678af98-a7b7-4bdb-b477-7ac9c8df4a4e";
 
@@ -431,12 +656,18 @@ struct Writer<'a, 'i> {
     missing: BTreeSet<crate::prproj_new::Need>,
     /// Layouts missing here will be borrowed (on a second pass).
     borrow: bool,
+    /// Items built from scratch → their `ClipProjectItem` UID (for the bins).
+    new_items: HashMap<ItemId, String>,
+    /// Premiere track items already written (by any sequence).
+    used: HashSet<&'a str>,
 }
 
 /// A media asset copied into the project for media FilmCraft added.
 #[derive(Clone)]
 struct Asset {
     master_uid: String,
+    /// The copied `ClipProjectItem`.
+    item_uid: String,
     name: String,
     /// Per kind (video, audio): the master clip's source object id, its markers object id and
     /// its channel sources.
@@ -488,6 +719,8 @@ impl<'a, 'i> Writer<'a, 'i> {
             sample_ticks: TICKS_PER_SECOND / 48_000,
             missing: BTreeSet::new(),
             borrow: false,
+            new_items: HashMap::new(),
+            used: HashSet::new(),
         }
     }
 
@@ -795,7 +1028,6 @@ impl<'a, 'i> Writer<'a, 'i> {
         let edits_before = self.edit_count();
         self.sample_ticks = TICKS_PER_SECOND / i64::from(seq.settings.sample_rate.max(1));
         let frame = (seq.settings.width as f64, seq.settings.height as f64);
-        let mut used: HashSet<&'a str> = HashSet::new();
         // FilmCraft clip → written Premiere track item id (for links and transitions)
         let mut written_ids: HashMap<filmcraft_project::ClipId, String> = HashMap::new();
         let mut exported = Vec::new();
@@ -897,7 +1129,7 @@ impl<'a, 'i> Writer<'a, 'i> {
                 let mut placed: Vec<((i64, usize), String)> = Vec::new();
                 let mut back = Vec::new();
                 for (n, c) in items.into_iter().enumerate() {
-                    let Some(id) = self.clip(project, c, kind, frame, &mut used)? else { continue };
+                    let Some(id) = self.clip(project, c, kind, frame)? else { continue };
                     written_ids.insert(c.id, id.clone());
                     let order = original_order.get(id.as_str()).copied().unwrap_or(original_order.len() + n);
                     placed.push(((c.start.0, order), id));
@@ -960,8 +1192,143 @@ impl<'a, 'i> Writer<'a, 'i> {
         Ok(exported)
     }
 
-    /// Copy the last Premiere track (with the mixer objects it owns, not its clips) until there
-    /// are `want` tracks.
+    // -----------------------------------------------------------------------------------------
+    // Bins
+    // -----------------------------------------------------------------------------------------
+
+    /// The Project panel as FilmCraft has it: bins made in FilmCraft are added, items go into
+    /// the bin they are in, Premiere bins FilmCraft no longer has leave their parent. Project
+    /// items FilmCraft does not show (or deleted) stay where they are.
+    fn bins(&mut self, project: &Project) {
+        let Some(rp) = self.root.children().find(|n| n.has_tag_name("RootProjectItem")) else { return };
+        // each FilmCraft item's ClipProjectItem
+        let mut pi_of: HashMap<ItemId, String> = self.new_items.clone();
+        for (item, a) in &self.assets {
+            if let Some(a) = a.as_ref().filter(|a| !a.item_uid.is_empty()) {
+                pi_of.insert(*item, a.item_uid.clone());
+            }
+        }
+        let mut by_target: HashMap<&'a str, &'a str> = HashMap::new();
+        for pi in self.root.children().filter(|n| n.has_tag_name("ClipProjectItem")) {
+            let (Some(uid), Some(master)) = (pi.attribute("ObjectUID"), self.ix.follow(pi, &["MasterClip"])) else { continue };
+            for c in self.ix.list(master, &["Clips"], "Clip") {
+                let target = prproj_graph::clip_media(&self.ix, c).or_else(|| prproj_graph::clip_sequence(&self.ix, c)).and_then(|t| t.attribute("ObjectUID"));
+                if let Some(t) = target {
+                    by_target.entry(t).or_insert(uid);
+                }
+            }
+        }
+        for it in project.items.values() {
+            if pi_of.contains_key(&it.id) {
+                continue;
+            }
+            let uids = it.metadata.get(META_SEQUENCE).or_else(|| it.metadata.get(META_MEDIA));
+            if let Some(pi) = uids.and_then(|u| u.split(',').find_map(|u| by_target.get(u))) {
+                pi_of.insert(it.id, pi.to_string());
+            }
+        }
+        let mut plans: Vec<BinPlan<'a, 'i>> = Vec::new();
+        let mut placed: HashSet<String> = HashSet::new();
+        self.plan_bin(&project.root, Some(rp), &pi_of, &mut plans, &mut placed, 0);
+        // items added to the project but in no FilmCraft bin go to the root
+        let loose: Vec<String> =
+            pi_of.values().chain(self.added_items.iter()).filter(|u| !placed.contains(*u)).cloned().collect::<BTreeSet<_>>().into_iter().collect();
+        if let Some(root_plan) = plans.iter_mut().find(|p| p.node.is_some_and(|n| n.id() == rp.id())) {
+            for u in loose {
+                placed.insert(u.clone());
+                root_plan.items.push(u);
+            }
+        }
+        for plan in plans {
+            match plan.node {
+                Some(node) => {
+                    let list = self.ix.at(node, &["ProjectItemContainer", "Items"]);
+                    let original: Vec<&str> =
+                        list.into_iter().flat_map(|l| l.children().filter(|c| c.has_tag_name("Item"))).filter_map(|r| r.attribute("ObjectURef")).collect();
+                    // what FilmCraft does not place stays (Premiere bins it no longer has go)
+                    let kept =
+                        original.iter().filter(|u| !placed.contains(**u)).filter(|u| !self.ix.uids.get(**u).is_some_and(|n| n.has_tag_name("BinProjectItem")));
+                    let mut want: Vec<String> = plan.items.clone();
+                    want.extend(kept.map(|u| u.to_string()));
+                    // unchanged when the same items keep Premiere's order
+                    let same_set = want.len() == original.len() && want.iter().all(|u| original.contains(&u.as_str()));
+                    let order_kept = original.iter().filter(|u| plan.items.iter().any(|p| p == **u)).copied().eq(plan.items.iter().map(String::as_str));
+                    if same_set && order_kept {
+                        continue;
+                    }
+                    let xml: String = want.iter().enumerate().map(|(i, u)| format!("<Item Index=\"{i}\" ObjectURef=\"{u}\" />")).collect();
+                    let inst = self.here(node);
+                    match (list, child(node, "ProjectItemContainer")) {
+                        (Some(l), _) => self.set_list(inst, l, &xml),
+                        (None, Some(c)) => self.insert(inst, c, &format!("<Items Version=\"1\">{xml}</Items>")),
+                        (None, None) => {
+                            self.insert(inst, node, &format!("<ProjectItemContainer Version=\"1\"><Items Version=\"1\">{xml}</Items></ProjectItemContainer>"))
+                        }
+                    }
+                }
+                None => {
+                    let xml: String = plan.items.iter().enumerate().map(|(i, u)| format!("<Item Index=\"{i}\" ObjectURef=\"{u}\" />")).collect();
+                    let items = if xml.is_empty() { String::new() } else { format!("<Items Version=\"1\">{xml}</Items>") };
+                    self.created.push(format!(
+                        "<BinProjectItem ObjectUID=\"{}\" ClassID=\"{BIN_ITEM_CLASS}\" Version=\"1\"><ProjectItem Version=\"1\"><Node Version=\"1\"><Properties Version=\"1\"></Properties></Node><Name>{}</Name></ProjectItem><ProjectItemContainer Version=\"1\">{items}</ProjectItemContainer></BinProjectItem>\n\t",
+                        plan.uid,
+                        escape(&plan.name)
+                    ));
+                }
+            }
+        }
+    }
+
+    /// What FilmCraft's `bin` holds, as Premiere project item UIDs, with its sub-bins planned
+    /// first (`node`: the Premiere bin it is, None: a new one). Returns the bin's UID.
+    fn plan_bin(
+        &mut self,
+        bin: &filmcraft_project::Bin,
+        node: Option<Node<'a, 'i>>,
+        pi_of: &HashMap<ItemId, String>,
+        plans: &mut Vec<BinPlan<'a, 'i>>,
+        placed: &mut HashSet<String>,
+        depth: usize,
+    ) -> String {
+        let uid = node.and_then(|n| n.attribute("ObjectUID")).map(str::to_string).unwrap_or_else(|| self.uuid());
+        let premiere_bins: Vec<Node<'a, 'i>> = node
+            .and_then(|n| self.ix.at(n, &["ProjectItemContainer", "Items"]))
+            .into_iter()
+            .flat_map(|l| l.children().filter(|c| c.has_tag_name("Item")))
+            .filter_map(|r| r.attribute("ObjectURef").and_then(|u| self.ix.uids.get(u)).copied())
+            .filter(|n| n.has_tag_name("BinProjectItem"))
+            .collect();
+        let mut matched: HashSet<usize> = HashSet::new();
+        let mut items = Vec::new();
+        for e in &bin.children {
+            match e {
+                filmcraft_project::BinEntry::Item(i) => {
+                    if let Some(u) = pi_of.get(i)
+                        && placed.insert(u.clone())
+                    {
+                        items.push(u.clone());
+                    }
+                }
+                filmcraft_project::BinEntry::Bin(b) if depth < 64 => {
+                    let existing = premiere_bins
+                        .iter()
+                        .enumerate()
+                        .find(|(k, n)| !matched.contains(k) && path_text(**n, &["ProjectItem", "Name"]) == Some(b.name.as_str()))
+                        .map(|(k, n)| (k, *n));
+                    if let Some((k, _)) = existing {
+                        matched.insert(k);
+                    }
+                    let sub = self.plan_bin(b, existing.map(|(_, n)| n), pi_of, plans, placed, depth + 1);
+                    placed.insert(sub.clone());
+                    items.push(sub);
+                }
+                filmcraft_project::BinEntry::Bin(_) => {}
+            }
+        }
+        plans.push(BinPlan { node, uid: uid.clone(), name: bin.name.clone(), items });
+        uid
+    }
+
     /// Sequence ▸ Sequence Settings: the name, frame size and timebase. Premiere fixes a
     /// sequence's audio sample rate and master channels when it is made; changes to those are
     /// reported, not written.
@@ -1047,6 +1414,8 @@ impl<'a, 'i> Writer<'a, 'i> {
         }
     }
 
+    /// Copy the last Premiere track (with the mixer objects it owns, not its clips) until there
+    /// are `want` tracks.
     fn add_tracks(&mut self, group: Node<'a, 'i>, ptracks: &mut Vec<(usize, Node<'a, 'i>)>, want: usize) -> Result<()> {
         let Some((_, template)) = ptracks.last().copied() else {
             self.report.warn("the Premiere sequence has no track to copy for FilmCraft's extra tracks");
@@ -1100,7 +1469,7 @@ impl<'a, 'i> Writer<'a, 'i> {
     }
 
     /// Write one clip; returns its instance and Premiere id, or `None` when it cannot be written.
-    fn clip(&mut self, project: &Project, c: &TrackItem, kind: TrackKind, frame: (f64, f64), used: &mut HashSet<&'a str>) -> Result<Option<String>> {
+    fn clip(&mut self, project: &Project, c: &TrackItem, kind: TrackKind, frame: (f64, f64)) -> Result<Option<String>> {
         let want_tag = if kind == TrackKind::Video { "VideoClipTrackItem" } else { "AudioClipTrackItem" };
         let source_uid = self.source_uid(project, c.item);
         // the Premiere object to start from, and whether it is a copy
@@ -1113,7 +1482,9 @@ impl<'a, 'i> Writer<'a, 'i> {
         let (obj, fresh) = match origin {
             Some(o) => {
                 let id = o.attribute("ObjectID").unwrap_or("");
-                (o, !used.insert(id))
+                // a clip pasted into another sequence keeps its Premiere origin: the second clip
+                // of one track item (in any sequence) is a copy
+                (o, !self.used.insert(id))
             }
             None => match self.template(want_tag, source_uid.as_deref()) {
                 Some(t) => (t, true),
@@ -1245,7 +1616,15 @@ impl<'a, 'i> Writer<'a, 'i> {
             }
         }
         // effects
-        let Some(chain) = self.ix.follow(obj, &["ClipTrackItem", "ComponentOwner", "Components"]) else { return };
+        let Some(chain) = self.ix.follow(obj, &["ClipTrackItem", "ComponentOwner", "Components"]) else {
+            // Premiere always writes one; without it there is nowhere to put effects
+            let added: Vec<&str> =
+                c.effects.iter().filter_map(|e| filmcraft_project::find_effect(&e.effect)).filter(|d| !d.intrinsic).map(|d| d.name).collect();
+            if !added.is_empty() {
+                self.report.warn(format!("\"{}\": {} not written (the Premiere clip has no effect list)", c.name, added.join(", ")));
+            }
+            return;
+        };
         let chain_inst = self.inst_of(chain, copies);
         let ctx = Ctx { source_in: c.source_in.0, speed: c.speed, frame, src: source_frame(project, c.item).unwrap_or(frame) };
         let comps = prproj_fx::chain(&self.ix, chain);
@@ -1396,6 +1775,25 @@ impl<'a, 'i> Writer<'a, 'i> {
             }
             next_component_id += 1;
             let (maps, _) = prproj_fx::mappings(&model, Target::Effect(def));
+            // settings FilmCraft changed that Premiere's layout has no place it knows for (a
+            // layout learned at default settings keeps Premiere's default there)
+            let mapped: HashSet<&str> = maps.iter().map(|m| m.param).collect();
+            let lost: Vec<&str> = def
+                .params
+                .iter()
+                .filter(|p| !mapped.contains(p.id))
+                .filter(|p| e.params.get(p.id).is_some_and(|v| !v.keyframes.is_empty() || v.value != p.default))
+                .map(|p| p.label)
+                .collect();
+            if !lost.is_empty() {
+                self.report.warn(format!(
+                    "\"{}\" on \"{}\": {} not written (Premiere keeps its default{})",
+                    def.name,
+                    c.name,
+                    lost.join(", "),
+                    if lost.len() > 1 { "s" } else { "" }
+                ));
+            }
             for m in maps {
                 let fc_param = e
                     .params
@@ -1665,38 +2063,9 @@ impl<'a, 'i> Writer<'a, 'i> {
         let ItemKind::Media(m) = &it.kind else { return None };
         let filmcraft_project::MediaRef::File { path } = &m.media else { return None };
         let info = &m.info;
-        let ext = ext_of(project, item);
-        let channels = info.audio.as_ref().map(|a| a.channels);
         let still = info.kind == filmcraft_media::MediaKind::Still;
-        if !still && info.duration.0 <= 0 {
-            return None;
-        }
-        // a project item whose media has the same extension and streams (and channel count)
-        let mut best: Option<(u8, Node<'a, 'i>)> = None;
-        for pi in self.root.children().filter(|n| n.has_tag_name("ClipProjectItem")) {
-            let Some(master) = self.ix.follow(pi, &["MasterClip"]) else { continue };
-            let Some(media) = self.ix.list(master, &["Clips"], "Clip").into_iter().find_map(|c| prproj_graph::clip_media(&self.ix, c)) else { continue };
-            let fp = child_text(media, "ActualMediaFilePath").or_else(|| child_text(media, "FilePath")).unwrap_or("");
-            if !fp.to_ascii_lowercase().ends_with(&format!(".{ext}")) {
-                continue;
-            }
-            let has_v = child(media, "VideoStream").is_some();
-            let has_a = child(media, "AudioStream").is_some();
-            if has_v != info.video.is_some() || (has_a != info.audio.is_some() && !still) {
-                continue;
-            }
-            let ch = self
-                .ix
-                .follow(media, &["AudioStream"])
-                .and_then(|a| child_text(a, "AudioChannelLayout"))
-                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                .and_then(|v| v.as_array().map(|a| a.len() as u32));
-            let score = u8::from(ch == channels) + 1;
-            if best.is_none_or(|(b, _)| score > b) {
-                best = Some((score, pi));
-            }
-        }
-        let (_, template) = best?;
+        let ext = ext_of(project, item);
+        let template = asset_model(&self.ix, self.root, project, item)?;
         let copies = self.clone_graph(template);
         let name = crate::common::file_name(path).to_string();
         let win_path = self.premiere_path(path);
@@ -1712,7 +2081,7 @@ impl<'a, 'i> Writer<'a, 'i> {
             .filter(|r| r.num > 0 && r.den > 0)
             .map(|r| (prproj_graph::TICKS_PER_SECOND as i128 * r.den as i128 / r.num as i128) as i64);
         let audio_rate = info.audio.as_ref().map(|a| a.sample_rate).filter(|r| *r > 0).map(|r| prproj_graph::TICKS_PER_SECOND / r as i64);
-        let mut asset = Asset { master_uid: String::new(), name: name.clone(), video: None, audio: None };
+        let mut asset = Asset { master_uid: String::new(), item_uid: String::new(), name: name.clone(), video: None, audio: None };
         let objects: Vec<(Node<'a, 'i>, usize)> =
             copies.iter().filter_map(|(k, i)| self.ix.ids.get(k).or_else(|| self.ix.uids.get(k)).map(|n| (*n, *i))).collect();
         let new_key = |w: &Self, n: Node<'a, 'i>| -> Option<String> {
@@ -1724,6 +2093,7 @@ impl<'a, 'i> Writer<'a, 'i> {
                     if let Some(pn) = self.ix.at(n, &["ProjectItem", "Name"]) {
                         self.set_text(i, pn, &name);
                     }
+                    asset.item_uid = self.id_of(i);
                     self.added_items.push(self.id_of(i));
                 }
                 "MasterClip" => {
@@ -2164,15 +2534,6 @@ impl<'a, 'i> Writer<'a, 'i> {
     fn finish(&mut self) -> Result<Output> {
         for (inst, cti) in std::mem::take(&mut self.muted) {
             self.insert(inst, cti, "<IsMuted>true</IsMuted>");
-        }
-        if !self.added_items.is_empty()
-            && let Some(rp) = self.root.children().find(|n| n.has_tag_name("RootProjectItem"))
-            && let Some(items) = self.ix.at(rp, &["ProjectItemContainer", "Items"])
-        {
-            let n = items.children().filter(|c| c.has_tag_name("Item")).count();
-            let xml: String = self.added_items.iter().enumerate().map(|(i, uid)| format!("<Item Index=\"{}\" ObjectURef=\"{uid}\" />", n + i)).collect();
-            let ri = self.here(rp);
-            self.insert(ri, items, &xml);
         }
         let mut splices: Vec<(Range<usize>, String)> = Vec::new();
         let mut appended = String::new();

@@ -74,7 +74,7 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
         _ => filmcraft_interchange::import_with(bytes, format, &opts).map_err(|e| EngineError::Other(format!("{path}: {e}")))?,
     };
     if format == Format::Prproj {
-        stash_premiere_original(s, bytes);
+        stash_premiere_original(s, path, bytes);
     }
     let before: std::collections::HashSet<ItemId> = s.project.items.keys().copied().collect();
     let name = opts.name.clone().unwrap_or_else(|| format.name().to_string());
@@ -188,7 +188,13 @@ fn premiere_originals_dir(s: &Session) -> Option<std::path::PathBuf> {
         .map(|d| d.join("Premiere Originals"))
 }
 
-fn stash_premiere_original(s: &Session, bytes: &[u8]) {
+/// Whether a Premiere project is a layout kit made for FilmCraft (its file name says "Layout
+/// Kit"): one clip per effect at Premiere's default settings.
+fn is_layout_kit(path: &str) -> bool {
+    std::path::Path::new(path).file_stem().is_some_and(|n| n.to_string_lossy().to_lowercase().contains("layout kit"))
+}
+
+fn stash_premiere_original(s: &Session, source: &str, bytes: &[u8]) {
     let Some(dir) = premiere_originals_dir(s) else { return };
     let path = dir.join(format!("{}.prproj", filmcraft_interchange::prproj_fingerprint(bytes)));
     if path.exists() || s.services.export_in_memory() {
@@ -196,6 +202,75 @@ fn stash_premiere_original(s: &Session, bytes: &[u8]) {
     }
     let _ = std::fs::create_dir_all(&dir);
     let _ = s.services.write_file(&path.to_string_lossy(), bytes);
+    // a version of a project not seen before: keep its effect and transition layouts
+    learn_layouts(s, bytes, is_layout_kit(source));
+}
+
+/// The effect and transition layouts FilmCraft has learned from Premiere projects (one small
+/// `.prproj` per effect or transition type), for effects added to a project that never used them.
+fn premiere_layouts_dir(s: &Session) -> Option<std::path::PathBuf> {
+    premiere_originals_dir(s).and_then(|d| d.parent().map(|p| p.join("Premiere Layouts")))
+}
+
+/// Keep the layouts of a Premiere project (`at_defaults`: its effects are at Premiere's default
+/// settings, as in a layout kit). A layout replaces a kept one when it is better: learned at
+/// defaults, or not animated where the kept one is. Returns how many were added or improved.
+fn learn_layouts(s: &Session, bytes: &[u8], at_defaults: bool) -> usize {
+    let Some(dir) = premiere_layouts_dir(s) else { return 0 };
+    if s.services.export_in_memory() {
+        return 0;
+    }
+    let mut n = 0;
+    for l in filmcraft_interchange::prproj_layouts(bytes, at_defaults) {
+        let path = dir.join(format!("{}.prproj", l.key));
+        let better = match std::fs::read(&path) {
+            Err(_) => true,
+            Ok(old) => {
+                let old_defaults = old.windows(26).any(|w| w == b"FilmCraftLayoutAtDefaults=");
+                let old_animated = filmcraft_interchange::prproj_layouts(&old, old_defaults).first().is_some_and(|o| o.animated);
+                (l.at_defaults && !old_defaults) || (l.at_defaults == old_defaults && old_animated && !l.animated)
+            }
+        };
+        if better {
+            let _ = std::fs::create_dir_all(&dir);
+            if s.services.write_file(&path.to_string_lossy(), &l.document).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// `file.learnPremiereLayouts {path, atDefaults?}`: learn the effect and transition layouts of a
+/// Premiere project, or of every `.prproj` under a folder. `atDefaults` (or a file name with
+/// "Layout Kit"): the effects are at Premiere's default settings, so effects with settings
+/// FilmCraft does not map are learned too.
+pub fn learn_layouts_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = p.get("path").and_then(Value::as_str).ok_or_else(|| EngineError::Other("file.learnPremiereLayouts: need `path`".into()))?.to_string();
+    let at_defaults = p.get("atDefaults").and_then(Value::as_bool).unwrap_or(false);
+    let mut files = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(&path)];
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&p) {
+                stack.extend(entries.filter_map(|e| e.ok()).map(|e| e.path()));
+            }
+        } else if is_prproj(&p.to_string_lossy()) {
+            files.push(p);
+        }
+        if files.len() > 5_000 {
+            break;
+        }
+    }
+    let mut learned = 0;
+    for f in &files {
+        if let Ok(bytes) = std::fs::read(f) {
+            learned += learn_layouts(s, &bytes, at_defaults || is_layout_kit(&f.to_string_lossy()));
+        }
+    }
+    let total = premiere_layouts_dir(s).and_then(|d| std::fs::read_dir(d).ok()).map(|e| e.filter_map(|e| e.ok()).count()).unwrap_or(0);
+    s.toast(format!("Learned {learned} effect/transition layout(s) from {} Premiere project(s); {total} known", files.len()));
+    Ok(json!({"projects": files.len(), "learned": learned, "known": total}))
 }
 
 /// How Save treats a project opened from Premiere Pro.
@@ -327,11 +402,13 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
             warnings.push(format!("the original was kept as {backup}"));
         }
     }
+    // every sequence unless some were asked for: sequences made here are added to the project
+    let written: &[ItemId] = if p.get("sequences").is_some() { &wanted } else { &[] };
     // an effect or transition added here that this project has never used is laid out as in
     // another Premiere project FilmCraft has opened
     let models = premiere_layouts(s);
     let (bytes, report) =
-        filmcraft_interchange::export_prproj_with(&s.project, &base, &wanted, std::path::Path::new(&path).parent().and_then(|d| d.to_str()), &models)
+        filmcraft_interchange::export_prproj_with(&s.project, &base, written, std::path::Path::new(&path).parent().and_then(|d| d.to_str()), &models)
             .map_err(|e| bad(e.to_string()))?;
     s.services.write_file(&path, &bytes).map_err(|e| bad(format!("{path}: {e}")))?;
     // Saving to Premiere Pro (Settings ▸ General): this is where Save writes from now on, and
@@ -426,9 +503,19 @@ fn premiere_originals(s: &Session) -> Vec<std::path::PathBuf> {
     files.into_iter().take(16).map(|(_, p)| p).collect()
 }
 
-/// Premiere projects to borrow effect and transition layouts from.
+/// Premiere projects to borrow effect and transition layouts from: the learned layouts first
+/// (small), then the kept copies of the projects opened most recently.
 fn premiere_layouts(s: &Session) -> Vec<Vec<u8>> {
-    premiere_originals(s).iter().filter_map(|p| std::fs::read(p).ok()).collect()
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    if let Some(dir) = premiere_layouts_dir(s)
+        && let Ok(entries) = std::fs::read_dir(&dir)
+    {
+        let mut files: Vec<std::path::PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_prproj(&p.to_string_lossy())).collect();
+        files.sort();
+        out.extend(files.iter().filter_map(|p| std::fs::read(p).ok()));
+    }
+    out.extend(premiere_originals(s).iter().filter_map(|p| std::fs::read(p).ok()));
+    out
 }
 
 /// (local folder, Premiere drive) pairs, learned from the Premiere projects FilmCraft has opened:

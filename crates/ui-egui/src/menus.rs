@@ -424,6 +424,7 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
         || (matches!(id, "captions.import" | "captions.export") && params.get("path").is_none())
         || (id == "graphics.newFromFile" && params.get("path").is_none())
         || (id == "file.exportPrproj" && params.get("path").is_none())
+        || (id == "file.learnPremiereLayouts" && params.get("path").is_none())
     {
         return app.file_dialog(id, &params);
     }

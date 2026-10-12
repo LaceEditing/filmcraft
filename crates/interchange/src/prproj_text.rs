@@ -168,6 +168,23 @@ pub(crate) fn base64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Bytes → base64 (standard alphabet, `=` padding).
+pub(crate) fn base64_encode(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for chunk in b.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(A[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// A PostScript font name as (family, style): `FatFrank-Heavy` → (`FatFrank`, `Heavy`),
 /// `Lato-BoldItalic` → (`Lato`, `Bold Italic`), `Impact` → (`Impact`, `Regular`).
 pub(crate) fn font_family_style(ps: &str) -> (String, String) {
@@ -281,6 +298,14 @@ pub(crate) mod tests {
             }
             let _ = decode(&b);
         }
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        for b in [&b""[..], b"O77\0\x01\0\0\0", b"\x01\0", b"abcd"] {
+            assert_eq!(base64(&base64_encode(b)).unwrap(), b);
+        }
+        assert_eq!(base64_encode(&[0x4f, 0x37, 0x37, 0, 1, 0, 0, 0]), "Tzc3AAEAAAA=", "as Premiere writes a colour matte's");
     }
 
     #[test]

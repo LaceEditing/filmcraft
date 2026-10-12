@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<PremiereData Version="3">
+  <Project ObjectRef="1"/>
+  <RootProjectItem ObjectUID="root">
+    <ProjectItem><Name>Root Bin</Name></ProjectItem>
+    <ProjectItemContainer><Items><Item Index="0" ObjectURef="bin1"/><Item Index="1" ObjectURef="seqpi"/></Items></ProjectItemContainer>
+  </RootProjectItem>
+  <BinProjectItem ObjectUID="bin1">
+    <ProjectItem><Name>Footage</Name></ProjectItem>
+    <ProjectItemContainer><Items><Item Index="0" ObjectURef="mpi"/></Items></ProjectItemContainer>
+  </BinProjectItem>
+  <ClipProjectItem ObjectUID="mpi"><ProjectItem><Name>interview.mov</Name></ProjectItem><MasterClip ObjectURef="mmc"/></ClipProjectItem>
+  <MasterClip ObjectUID="mmc"><Clips><Clip Index="0" ObjectRef="10"/><Clip Index="1" ObjectRef="16"/></Clips></MasterClip>
+  <AudioClip ObjectID="16"><Clip><Source ObjectRef="76"/></Clip></AudioClip>
+  <VideoClip ObjectID="10"><Clip><Source ObjectRef="11"/><MarkerOwner><Markers ObjectRef="12"/></MarkerOwner></Clip></VideoClip>
+  <VideoMediaSource ObjectID="11"><MediaSource><Media ObjectURef="media1"/></MediaSource></VideoMediaSource>
+  <Markers ObjectID="12"><Markers><Marker Index="0"><First>m1</First><Second ObjectRef="13"/></Marker></Markers></Markers>
+  <Marker ObjectID="13"><DVAMarker>{"DVAMarker":{"mMarkerID":"m1","mStartTime":{"ticks":254016000000},"mName":"Laugh","mComment":"keep this","mType":"Comment"}}</DVAMarker></Marker>
+  <Media ObjectUID="media1">
+    <AudioStream ObjectRef="15"/><VideoStream ObjectRef="14"/>
+    <RelativePath>.\Footage\interview.mov</RelativePath>
+    <FilePath>L:\Edit\Footage\interview.mov</FilePath>
+    <Title>interview.mov</Title>
+  </Media>
+  <VideoStream ObjectID="14"><FrameRate>8467200000</FrameRate><Duration>15240960000000</Duration><FrameRect>0,0,2560,1440</FrameRect></VideoStream>
+  <AudioStream ObjectID="15"><FrameRate>5292000</FrameRate><AudioChannelLayout>[{"channellabel":100},{"channellabel":101}]</AudioChannelLayout><Duration>15240960000000</Duration></AudioStream>
+
+  <ClipProjectItem ObjectUID="seqpi"><ProjectItem><Name>Main Edit</Name></ProjectItem><MasterClip ObjectURef="smc"/></ClipProjectItem>
+  <MasterClip ObjectUID="smc"><Clips><Clip Index="0" ObjectRef="20"/></Clips></MasterClip>
+  <VideoClip ObjectID="20"><Clip><Source ObjectRef="21"/><MarkerOwner><Markers ObjectRef="22"/></MarkerOwner></Clip></VideoClip>
+  <VideoSequenceSource ObjectID="21"><SequenceSource><Sequence ObjectURef="seq1"/></SequenceSource></VideoSequenceSource>
+  <Markers ObjectID="22"><Markers><Marker Index="0"><First>m2</First><Second ObjectRef="23"/></Marker></Markers></Markers>
+  <Marker ObjectID="23"><DVAMarker>{"DVAMarker":{"mMarkerID":"m2","mStartTime":{"ticks":508032000000},"mName":"Act 2","mType":"Chapter"}}</DVAMarker></Marker>
+
+  <Sequence ObjectUID="seq1">
+    <Name>Main Edit</Name>
+    <TrackGroups>
+      <TrackGroup><Second ObjectRef="30"/></TrackGroup>
+      <TrackGroup><Second ObjectRef="31"/></TrackGroup>
+    </TrackGroups>
+    <PersistentGroupContainer Version="1"><LinkContainer Version="1"><Links Version="1"><Link Index="0" ObjectRef="80" /></Links></LinkContainer></PersistentGroupContainer>
+  </Sequence>
+  <VideoTrackGroup ObjectID="30"><TrackGroup><Tracks><Track Index="0" ObjectURef="vt1"/></Tracks><FrameRate>8467200000</FrameRate></TrackGroup><FrameRect>0,0,1920,1080</FrameRect></VideoTrackGroup>
+  <AudioTrackGroup ObjectID="31"><TrackGroup><Tracks><Track Index="0" ObjectURef="at1"/></Tracks><FrameRate>5292000</FrameRate></TrackGroup></AudioTrackGroup>
+
+  <VideoClipTrack ObjectUID="vt1"><ClipTrack>
+    <Track><Name>Cam</Name><Index>0</Index></Track>
+    <ClipItems><TrackItems><TrackItem Index="0" ObjectRef="40"/><TrackItem Index="1" ObjectRef="50"/></TrackItems></ClipItems>
+    <TransitionItems><TrackItems><TrackItem Index="0" ObjectRef="60"/></TrackItems></TransitionItems>
+  </ClipTrack></VideoClipTrack>
+
+  <VideoClipTrackItem ObjectID="40"><ClipTrackItem>
+    <ComponentOwner><Components ObjectRef="43"/></ComponentOwner>
+    <TrackItem><Start>0</Start><End>1270080000000</End></TrackItem>
+    <SubClip ObjectRef="41"/>
+  </ClipTrackItem></VideoClipTrackItem>
+  <SubClip ObjectID="41"><Clip ObjectRef="42"/><Name>interview.mov</Name></SubClip>
+  <VideoClip ObjectID="42"><Clip><Source ObjectRef="11"/><InPoint>2540160000000</InPoint><OutPoint>3810240000000</OutPoint></Clip></VideoClip>
+  <VideoComponentChain ObjectID="43"><ComponentChain><Components><Component Index="0" ObjectRef="44"/><Component Index="1" ObjectRef="48"/></Components></ComponentChain></VideoComponentChain>
+  <VideoFilterComponent ObjectID="44">
+    <Component><Params><Param Index="0" ObjectRef="46"/><Param Index="1" ObjectRef="45"/><Param Index="2" ObjectRef="47"/></Params><DisplayName>Motion</DisplayName></Component>
+    <MatchName>AE.ADBE Motion</MatchName>
+  </VideoFilterComponent>
+  <VideoComponentParam ObjectID="45"><Name>Scale</Name><StartKeyframe>-91445760000000000,100,0,0,0,0,0,0</StartKeyframe><Keyframes>2540160000000,100,0,0,0,0.1,1.5,0.1;3048192000000,120,0,0,1.5,0.1,0,0.1;</Keyframes></VideoComponentParam>
+  <PointComponentParam ObjectID="46"><Name>Position</Name><StartKeyframe>-91445760000000000,0.25:0.5,0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe></PointComponentParam>
+  <VideoComponentParam ObjectID="47"><Name> </Name><StartKeyframe>-91445760000000000,false,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoFilterComponent ObjectID="48"><Component><Params/><DisplayName>RSMB Pro</DisplayName></Component><MatchName>RE:Vision RSMB Pro</MatchName></VideoFilterComponent>
+
+  <VideoClipTrackItem ObjectID="50"><ClipTrackItem>
+    <ComponentOwner><Components ObjectRef="53"/></ComponentOwner>
+    <TrackItem><Start>1270080000000</Start><End>1778112000000</End></TrackItem>
+    <SubClip ObjectRef="51"/>
+  </ClipTrackItem></VideoClipTrackItem>
+  <SubClip ObjectID="51"><Clip ObjectRef="52"/><Name>backwards</Name></SubClip>
+  <VideoClip ObjectID="52"><Clip><Source ObjectRef="11"/><InPoint>5080320000000</InPoint><OutPoint>6096384000000</OutPoint><PlaybackSpeed>-2</PlaybackSpeed></Clip></VideoClip>
+  <VideoComponentChain ObjectID="53"><ComponentChain><Components><Component Index="0" ObjectRef="54"/><Component Index="1" ObjectRef="56"/><Component Index="2" ObjectRef="100"/></Components></ComponentChain></VideoComponentChain>
+  <VideoFilterComponent ObjectID="100"><Component><Params><Param Index="0" ObjectRef="101"/><Param Index="1" ObjectRef="102"/><Param Index="2" ObjectRef="103"/></Params><ID>3</ID><DisplayName>Tint</DisplayName></Component><MatchName>AE.ADBE Tint</MatchName></VideoFilterComponent>
+  <VideoComponentParam ObjectID="101"><Name>Map Black To</Name><StartKeyframe>-91445760000000000,18374686479671623680,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="102"><Name>Map White To</Name><StartKeyframe>-91445760000000000,18374966857753992192,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="103"><Name>Amount to Tint</Name><StartKeyframe>-91445760000000000,100.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoFilterComponent ObjectID="56"><Component><Params><Param Index="0" ObjectRef="57"/><Param Index="1" ObjectRef="58"/><Param Index="2" ObjectRef="59"/></Params><ID>2</ID><DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName></VideoFilterComponent>
+  <VideoComponentParam ObjectID="57"><Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>5080320000000,0,5,0,0,0.33333333333333331,0,0.33333333333333331;5588352000000,40,5,2,0,0.25,0,0.5;</Keyframes></VideoComponentParam>
+  <VideoComponentParam ObjectID="58"><Name>Blur Dimensions</Name><StartKeyframe>-91445760000000000,1,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoComponentParam ObjectID="59"><Name>Repeat Edge Pixels</Name><StartKeyframe>-91445760000000000,true,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+  <VideoFilterComponent ObjectID="54"><Component><Params><Param Index="0" ObjectRef="55"/></Params><DisplayName>Opacity</DisplayName></Component><MatchName>AE.ADBE Opacity</MatchName></VideoFilterComponent>
+  <VideoComponentParam ObjectID="55"><Name>Opacity</Name><StartKeyframe>-91445760000000000,50,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
+
+  <VideoTransitionTrackItem ObjectID="60"><TransitionTrackItem>
+    <TrackItem><Start>1143072000000</Start><End>1397088000000</End></TrackItem>
+    <DisplayName>Cross Dissolve</DisplayName><HasOutgoingClip>true</HasOutgoingClip><HasIncomingClip>true</HasIncomingClip>
+  </TransitionTrackItem></VideoTransitionTrackItem>
+
+  <AudioClipTrack ObjectUID="at1"><ClipTrack>
+    <Track><Index>0</Index></Track>
+    <ClipItems><TrackItems><TrackItem Index="0" ObjectRef="70"/></TrackItems></ClipItems>
+  </ClipTrack></AudioClipTrack>
+  <AudioClipTrackItem ObjectID="70"><ClipTrackItem>
+    <ComponentOwner><Components ObjectRef="73"/></ComponentOwner>
+    <TrackItem><End>1270080000000</End><Start>0</Start></TrackItem>
+    <SubClip ObjectRef="71"/>
+  </ClipTrackItem></AudioClipTrackItem>
+  <SubClip ObjectID="71"><Clip ObjectRef="72"/><Name>interview.mov</Name></SubClip>
+  <AudioClip ObjectID="72"><Clip><Source ObjectRef="76"/><InPoint>2540160000000</InPoint><OutPoint>3810240000000</OutPoint></Clip></AudioClip>
+  <AudioMediaSource ObjectID="76"><MediaSource><Media ObjectURef="media1"/></MediaSource></AudioMediaSource>
+  <AudioComponentChain ObjectID="73"><ComponentChain><Components><Component Index="0" ObjectRef="74"/></Components></ComponentChain></AudioComponentChain>
+  <AudioFilterComponent ObjectID="74"><AudioComponent><Component><Params><Param Index="0" ObjectRef="75"/></Params></Component></AudioComponent><FilterMatchName>Internal Volume Stereo</FilterMatchName></AudioFilterComponent>
+  <AudioComponentParam ObjectID="75"><Name>Level</Name><StartKeyframe>-91445760000000000,0.08912509381337455,0,0,0,0,0,0</StartKeyframe></AudioComponentParam>
+
+  <Link ObjectID="80"><TrackItemGroup><TrackItems><TrackItem Index="0" ObjectRef="40"/><TrackItem Index="1" ObjectRef="70"/></TrackItems></TrackItemGroup></Link>
+</PremiereData>

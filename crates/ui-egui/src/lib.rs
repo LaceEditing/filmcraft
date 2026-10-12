@@ -1059,6 +1059,11 @@ impl FilmcraftApp {
                 let Some(path) = self.hooks.pick_open_project.as_mut().and_then(|f| f()) else { return Ok(Value::Null) };
                 self.session.execute("file.open", json!({"path": path})).map_err(|e| e.to_string())
             }
+            // a folder of Premiere projects (or the one with the layout kit)
+            "file.learnPremiereLayouts" => {
+                let Some(folder) = self.hooks.pick_folder.as_mut().and_then(|f| f()) else { return Ok(Value::Null) };
+                self.session.execute("file.learnPremiereLayouts", json!({"path": folder})).map_err(|e| e.to_string())
+            }
             "graphics.newFromFile" => {
                 let exts: Vec<&str> = filmcraft_media::STILL_EXTENSIONS.iter().chain(filmcraft_media::VIDEO_EXTENSIONS).copied().collect();
                 let paths = self.hooks.pick_files.as_mut().map(|f| f(&exts)).unwrap_or_default();
