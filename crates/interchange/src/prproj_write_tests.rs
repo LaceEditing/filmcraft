@@ -459,3 +459,158 @@ fn masks_round_trip_and_their_settings_are_written() {
     let (_, report) = export(&q, plain.as_bytes(), &[], None).unwrap();
     assert!(report.mentions("mask shape changed") && report.mentions("masks added to or removed from"), "{report}");
 }
+
+/// The test project as Premiere saves clips it never had a Motion, Opacity or Volume change on:
+/// the second video clip and the audio clip have empty chains with `Default…` flags. Without
+/// `tint`, the project has no Tint anywhere.
+fn default_chains_doc(tint: bool) -> String {
+    let mut d = doc()
+        .replace(
+            r#"<VideoComponentChain ObjectID="53"><ComponentChain><Components><Component Index="0" ObjectRef="54"/><Component Index="1" ObjectRef="56"/><Component Index="2" ObjectRef="100"/></Components></ComponentChain></VideoComponentChain>"#,
+            r#"<VideoComponentChain ObjectID="53"><DefaultMotion>true</DefaultMotion><DefaultOpacity>true</DefaultOpacity><DefaultMotionComponentID>1</DefaultMotionComponentID><DefaultOpacityComponentID>2</DefaultOpacityComponentID><ComponentChain Version="3"><Node Version="1"></Node></ComponentChain></VideoComponentChain>"#,
+        )
+        .replace(
+            r#"<AudioComponentChain ObjectID="73"><ComponentChain><Components><Component Index="0" ObjectRef="74"/></Components></ComponentChain></AudioComponentChain>"#,
+            r#"<AudioComponentChain ObjectID="73"><DefaultVol>true</DefaultVol><DefaultVolumeComponentID>1</DefaultVolumeComponentID><DefaultChannelVolumeComponentID>2</DefaultChannelVolumeComponentID><ComponentChain Version="3"></ComponentChain><AudioChannelLayout>[{"channellabel":100},{"channellabel":101}]</AudioChannelLayout><ChannelType>1</ChannelType></AudioComponentChain>"#,
+        );
+    assert!(d.contains("<DefaultMotion>") && d.contains("<DefaultVol>"), "the fixture changed");
+    if !tint {
+        let lines: Vec<&str> =
+            d.lines().filter(|l| !["\"100\"", "\"101\"", "\"102\"", "\"103\""].iter().any(|id| l.contains(&format!("ObjectID={id}")))).collect();
+        d = lines.join("\n") + "\n";
+    }
+    d
+}
+
+/// Premiere saves no Motion, Opacity or clip Volume until one leaves its default; a value changed
+/// first in FilmCraft gets the component Premiere would add, and Clip ▸ Enable is written.
+#[test]
+fn motion_opacity_volume_and_enable_changed_first_in_filmcraft_are_written() {
+    let plain = default_chains_doc(true);
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    // nothing changed: nothing is added
+    let (same, _) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(same).unwrap(), plain);
+    let sid = seq_id(&p);
+    {
+        let seq = p.sequence_mut(sid).unwrap();
+        let b = &mut seq.video_tracks[0].items[1];
+        assert_eq!(b.effect("opacity").unwrap().params["opacity"].value, ParamValue::Float(100.0), "a default chain reads as the defaults");
+        b.effect_mut("motion").unwrap().params.insert("scale".into(), Param::new(ParamValue::Float(150.0)));
+        b.effect_mut("opacity").unwrap().params.insert("opacity".into(), Param::new(ParamValue::Float(40.0)));
+        seq.video_tracks[0].items[0].enabled = false;
+        let a = &mut seq.audio_tracks[0].items[0];
+        a.effect_mut("volume").unwrap().params.insert("level".into(), Param::new(ParamValue::Float(-6.0)));
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    // as Premiere writes it: the flags of the components that now exist are gone, the channel
+    // volume (still default) keeps its own
+    assert!(!text.contains("<DefaultMotion>") && !text.contains("<DefaultOpacity>") && !text.contains("<DefaultVol>"), "{report}");
+    assert!(text.contains("<DefaultChannelVolumeComponentID>2</DefaultChannelVolumeComponentID>"));
+    assert_eq!(text.matches("<IsMuted>true</IsMuted>").count(), 1);
+    let back = read(&out);
+    let seq = back.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    let b = &seq.video_tracks[0].items[1];
+    assert_eq!(b.effect("motion").unwrap().params["scale"].value, ParamValue::Float(150.0), "{report}");
+    assert_eq!(b.effect("opacity").unwrap().params["opacity"].value, ParamValue::Float(40.0));
+    assert!(!seq.video_tracks[0].items[0].enabled && b.enabled);
+    let level = seq.audio_tracks[0].items[0].effect("volume").unwrap().params["level"].value.as_f64().unwrap();
+    assert!((level + 6.0).abs() < 0.01, "{level}");
+
+    // saved again with nothing changed: the same document
+    let (imp2, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&imp2.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
+    // enabled again: the flag goes
+    let mut p2 = imp2.project;
+    let sid2 = seq_id(&p2);
+    p2.sequence_mut(sid2).unwrap().video_tracks[0].items[0].enabled = true;
+    let (on, _) = export(&p2, text.as_bytes(), &[], None).unwrap();
+    assert!(!String::from_utf8(prproj_graph::decompress(&on).unwrap().0).unwrap().contains("IsMuted"));
+}
+
+/// An effect the project has no instance of is laid out as in another Premiere project (and
+/// reported when none has it); a clip with an empty chain gets a component list for it.
+#[test]
+fn effects_without_a_layout_here_borrow_one_from_other_projects() {
+    let plain = default_chains_doc(false);
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let b = &mut p.sequence_mut(sid).unwrap().video_tracks[0].items[1];
+        let mut tint = filmcraft_project::find_effect("tint").unwrap().instance();
+        tint.params.insert("amount".into(), Param::new(ParamValue::Float(30.0)));
+        b.effects.insert(0, tint);
+    }
+    // nowhere to borrow from: reported, the rest written
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert!(report.mentions("\"Tint\" added in FilmCraft was not written"), "{report}");
+    assert!(read(&out).sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[0].items[1].effect("tint").is_none());
+    // another project has one
+    let models = vec![doc().into_bytes()];
+    let (out, report) = export_with(&p, plain.as_bytes(), &[], None, &models).unwrap();
+    assert!(report.mentions("borrowed from your other Premiere projects") && !report.mentions("was not written"), "{report}");
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert_eq!(text.matches("<MatchName>AE.ADBE Tint</MatchName>").count(), 1, "the borrowed model itself is not left behind");
+    let back = read(&out);
+    let b = &back.sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[0].items[1];
+    assert_eq!(b.effect("tint").expect("tint written").params["amount"].value, ParamValue::Float(30.0));
+}
+
+/// Sequence Settings: the name, frame size and timebase are written; the sample rate and master
+/// channels, which Premiere fixes when a sequence is made, are reported.
+#[test]
+fn sequence_settings_are_written() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    p.item_mut(sid).unwrap().name = "Final Cut".into();
+    {
+        let st = &mut p.sequence_mut(sid).unwrap().settings;
+        st.width = 1080;
+        st.height = 1920;
+        st.frame_rate = filmcraft_time::FrameRate::new(25, 1);
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert!(!report.mentions("sample rate"), "{report}");
+    let back = read(&out);
+    let it = back.sequences().next().unwrap();
+    let st = &it.as_sequence().unwrap().settings;
+    assert_eq!(
+        (it.name.as_str(), st.width, st.height, st.frame_rate.frame_duration()),
+        ("Final Cut", 1080, 1920, filmcraft_time::FrameRate::new(25, 1).frame_duration())
+    );
+    p.sequence_mut(sid).unwrap().settings.sample_rate = 44_100;
+    let (_, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert!(report.mentions("sample rate (44100 Hz) was not written"), "{report}");
+}
+
+/// Tracks added in FilmCraft are written even while empty; sequences and bins made in FilmCraft
+/// are not written yet and say so.
+#[test]
+fn added_tracks_are_kept_and_new_sequences_and_bins_are_reported() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let (vt, at) = (TrackId(p.alloc_id()), TrackId(p.alloc_id()));
+    {
+        let seq = p.sequence_mut(sid).unwrap();
+        seq.video_tracks.push(Track::new(vt, TrackKind::Video, "V2".into()));
+        seq.audio_tracks.push(Track::new(at, TrackKind::Audio, "A2".into()));
+    }
+    let settings = p.sequence(sid).unwrap().settings.clone();
+    p.new_sequence("Made Here", settings, 1, 1, None);
+    let bin = filmcraft_project::BinId(p.alloc_id());
+    p.root.children.push(filmcraft_project::BinEntry::Bin(filmcraft_project::Bin { id: bin, name: "Selects".into(), children: Vec::new() }));
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert!(report.mentions("sequence \"Made Here\" was made in FilmCraft") && report.mentions("bin \"Selects\" was made in FilmCraft"), "{report}");
+    assert!(!report.mentions("bin \"Footage\""), "{report}");
+    let back = read(&out);
+    let seq = back.sequences().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
+    assert_eq!((seq.video_tracks.len(), seq.audio_tracks.len()), (2, 2), "{report}");
+}

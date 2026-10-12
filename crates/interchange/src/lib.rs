@@ -38,6 +38,7 @@ pub mod otio;
 mod prproj;
 mod prproj_fx;
 mod prproj_graph;
+mod prproj_intrinsic;
 mod prproj_mask;
 pub mod prproj_new;
 mod prproj_text;
@@ -437,6 +438,12 @@ pub fn prproj_fingerprint(bytes: &[u8]) -> String {
 /// project goes to (for media paths relative to it).
 pub fn export_prproj(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir: Option<&str>) -> Result<(Vec<u8>, Report)> {
     prproj_write::export(project, original, sequences, dest_dir)
+}
+
+/// [`export_prproj`], borrowing the layout of an effect or transition added in FilmCraft that the
+/// project has no other instance of from `models` (other Premiere projects, as `.prproj` bytes).
+pub fn export_prproj_with(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir: Option<&str>, models: &[Vec<u8>]) -> Result<(Vec<u8>, Report)> {
+    prproj_write::export_with(project, original, sequences, dest_dir, models)
 }
 
 /// A new Premiere Pro project (gzip-compressed `.prproj`) with every sequence, media file and bin

@@ -257,3 +257,32 @@ fn save_writes_a_premiere_project_for_projects_opened_from_one() {
     s.execute("file.save", json!({"path": fc.to_string_lossy()})).unwrap();
     assert!(filmcraft_format::decode(&std::fs::read(&fc).unwrap()).is_ok());
 }
+
+/// Save into a Premiere Pro project says what it could not write (the Events panel, an event
+/// the app shows as a notice, and `unsaved` in the result); a complete save says nothing.
+#[test]
+fn save_says_what_the_premiere_project_could_not_hold() {
+    let dir = tmp_dir("prproj-save-notes");
+    let src = dir.join("show.prproj");
+    std::fs::write(&src, prproj()).unwrap();
+    let mut s = session(&dir);
+    s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
+    set_first_video_clip(&mut s, 4);
+    s.drain_events();
+    let r = s.execute("file.save", json!({})).unwrap();
+    assert_eq!(r["unsaved"], json!([]), "{r}");
+    assert!(!s.drain_events().iter().any(|e| matches!(e, crate::Event::SaveNotes { .. })));
+    // a sequence made here cannot go into the Premiere project yet
+    s.execute("file.newSequence", json!({"name": "Made Here"})).unwrap();
+    let r = s.execute("file.save", json!({})).unwrap();
+    let unsaved = r["unsaved"].as_array().cloned().unwrap_or_default();
+    assert!(unsaved.iter().any(|n| n.as_str().is_some_and(|n| n.contains("\"Made Here\""))), "{r}");
+    let notes = s.drain_events().into_iter().find_map(|e| match e {
+        crate::Event::SaveNotes { path, notes } => Some((path, notes)),
+        _ => None,
+    });
+    let (path, notes) = notes.expect("a SaveNotes event");
+    assert_eq!(path, src.to_string_lossy());
+    assert_eq!(notes.len(), unsaved.len());
+    assert!(s.log.entries.iter().any(|e| e.level == crate::panels::Level::Warning && e.message.contains("Made Here")));
+}

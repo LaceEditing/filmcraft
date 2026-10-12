@@ -34,6 +34,7 @@ use roxmltree::Node;
 
 use crate::prproj::{META_MEDIA, META_SEQUENCE};
 use crate::prproj_graph::{self, TICKS_PER_SECOND};
+use crate::prproj_intrinsic::{self as intrinsic, MONO, NO_TIME, STEREO};
 use crate::xml::{escape, num};
 use crate::{Error, Report, Result};
 
@@ -42,14 +43,8 @@ const AUDIO_MEDIA_TYPE: &str = "80b8e3d5-6dca-4195-aefb-cb5f407ab009";
 const DATA_MEDIA_TYPE: &str = "d8143ffe-eec4-4d2a-a909-d5f7bf094dc5";
 /// The importer Premiere records for ordinary media files (movies, audio, stills).
 const IMPORTER: &str = "1fa18bfa-255c-44b1-ad73-56bcd99fceaf";
-/// `StartKeyframe` time of a static value.
-const NO_TIME: &str = "-91445760000000000";
-const STEREO: &str = r#"[{"channellabel":100},{"channellabel":101}]"#;
-const MONO: &str = r#"[{"channellabel":0}]"#;
 /// Premiere's length of a still's media (12 hours).
 const STILL_DURATION: i64 = 12 * 3600 * TICKS_PER_SECOND;
-/// Clip volume at 0 dB as Premiere stores it (linear, +15 dB of headroom above 1.0).
-const UNITY_LEVEL: &str = "0.177827939391";
 /// A track fader's upper bound (+15 dB, linear).
 const FADER_MAX: &str = "5.6234130859375";
 /// Premiere's "Custom" sequence editing mode (any frame size and rate) and its preview preset.
@@ -63,6 +58,7 @@ const CHANNEL_VOLUME_SLOTS: usize = 32;
 
 /// Class ids (and object versions) of the objects the seed writes.
 mod class {
+    pub use crate::prproj_intrinsic::class::*;
     pub const PROJECT: (&str, u32) = ("62ad66dd-0dcd-42da-a660-6d8fbde94876", 45);
     pub const ROOT_ITEM: (&str, u32) = ("1c307a89-9318-47d7-a583-bf2553736543", 1);
     pub const BIN_ITEM: (&str, u32) = ("dbfd6653-24da-480e-a35e-ba45e9504e4b", 1);
@@ -109,15 +105,6 @@ mod class {
     pub const METER: (&str, u32) = ("72ea4700-f615-11d5-abc4-c186585e63e0", 2);
     pub const STEREO_PANNER: (&str, u32) = ("7bf86a01-efbe-11d5-abc4-c1ce2b1e9090", 1);
     pub const DEFAULT_PANNER: (&str, u32) = ("33a94282-ee2c-11d5-abc4-c1cd7f9e3c10", 2);
-    pub const AUDIO_PARAM: (&str, u32) = ("a714635e-a628-4b27-9d59-77eba47dbc1a", 10);
-    pub const AUDIO_BOOL_PARAM: (&str, u32) = ("32657501-3aa4-445f-a49b-d09ecb9fa1ae", 10);
-    pub const AUDIO_FILTER: (&str, u32) = ("d77a90a0-6c9e-44bf-9b20-de8c21168fe1", 4);
-    pub const VIDEO_FILTER: (&str, u32) = ("d10da199-beea-4dd1-b941-ed3a78766d50", 9);
-    pub const POINT_PARAM: (&str, u32) = ("ca81d347-309b-44d2-acc7-1c572efb973c", 4);
-    pub const FLOAT_PARAM: (&str, u32) = ("fe47129e-6c94-4fc0-95d5-c056a517aaf3", 10);
-    pub const BOOL_PARAM: (&str, u32) = ("cc12343e-f113-4d3b-ae05-b287db77d461", 10);
-    pub const SLIDER_PARAM: (&str, u32) = ("a4ff2d6e-7ac2-44f8-9d52-17d9ca50e542", 10);
-    pub const POPUP_PARAM: (&str, u32) = ("6e02e8bb-2569-46b2-8ab1-4ab11c43e9c8", 10);
     pub const VIDEO_TRACK_ITEM: (&str, u32) = ("368b0406-29e3-4923-9fcd-094fbf9a1089", 8);
     pub const AUDIO_TRACK_ITEM: (&str, u32) = ("064ec682-9ba6-11d5-af2d-9ca32c7d6164", 11);
     pub const SUB_CLIP: (&str, u32) = ("e0c58dc9-dbdd-4166-aef7-5db7e3f22e84", 6);
@@ -324,7 +311,7 @@ fn playable(p: &Project, item: ItemId) -> std::result::Result<ItemId, &'static s
 
 /// An effect or transition the project uses, which needs Premiere's layout to be written.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum Need {
+pub(crate) enum Need {
     /// A FilmCraft effect (by id).
     Effect(&'static str),
     /// A transition (lower-case display name, audio).
@@ -332,7 +319,7 @@ enum Need {
 }
 
 impl Need {
-    fn transition(e: &filmcraft_project::EffectInstance, audio: bool) -> Need {
+    pub(crate) fn transition(e: &filmcraft_project::EffectInstance, audio: bool) -> Need {
         Need::Transition(crate::common::transition_name(e).to_lowercase(), audio)
     }
 }
@@ -371,14 +358,14 @@ struct GraftObj {
 
 /// A component (effect) or transition track item with the objects only it owns, first object
 /// first.
-struct Graft {
-    what: Need,
+pub(crate) struct Graft {
+    pub(crate) what: Need,
     objects: Vec<GraftObj>,
 }
 
 /// Find a layout for each need in `models` (earlier projects first; a model without animated
 /// parameters is preferred).
-fn find_models(models: &[Vec<u8>], needs: &BTreeSet<Need>) -> Vec<Graft> {
+pub(crate) fn find_models(models: &[Vec<u8>], needs: &BTreeSet<Need>) -> Vec<Graft> {
     // (need → (score, graft)); score 0 is a model with no animated parameter
     let mut best: BTreeMap<Need, (u8, Graft)> = BTreeMap::new();
     for bytes in models {
@@ -571,6 +558,12 @@ fn list<T: std::fmt::Display>(tag: &str, item: &str, refs: &[T], uref: bool) -> 
 /// Ticks per audio sample.
 fn sample_ticks(rate: u32) -> i64 {
     TICKS_PER_SECOND / i64::from(rate.max(1))
+}
+
+impl intrinsic::Objects for Seed<'_> {
+    fn obj(&mut self, tag: &str, class: (&str, u32), body: &str) -> u64 {
+        Seed::obj(self, tag, class, body)
+    }
 }
 
 impl<'p> Seed<'p> {
@@ -1308,69 +1301,8 @@ impl<'p> Seed<'p> {
     }
 
     fn video_template(&mut self, src: &Sources, source: u64) {
-        let float = |s: &mut Self, name: &str, id: u32, v: &str, bounds: &str, extra: &str| {
-            s.obj(
-                "VideoComponentParam",
-                class::FLOAT_PARAM,
-                &format!("{}{extra}<ParameterID>{id}</ParameterID><StartKeyframe>{NO_TIME},{v},0,0,0,0,0,0</StartKeyframe>{bounds}", el("Name", name)),
-            )
-        };
-        let point = |s: &mut Self, name: &str, id: u32| {
-            s.obj(
-                "PointComponentParam",
-                class::POINT_PARAM,
-                &format!("{}<ParameterID>{id}</ParameterID><StartKeyframe>{NO_TIME},0.5:0.5,0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe>", el("Name", name)),
-            )
-        };
-        let scale_bounds = "<LowerBound>0</LowerBound><UpperBound>10000</UpperBound>";
-        let pct = "<LowerBound>0</LowerBound><UpperBound>100</UpperBound>";
-        let motion_params = vec![
-            point(self, "Position", 1),
-            float(self, "Scale", 2, "100.", scale_bounds, "<UpperUIBound>200</UpperUIBound>"),
-            float(self, "Scale Width", 3, "100.", scale_bounds, "<UpperUIBound>200</UpperUIBound>"),
-            // Uniform Scale: Premiere saves it without a name
-            self.obj("VideoComponentParam", class::BOOL_PARAM, &format!("<Name> </Name><ParameterID>4</ParameterID><StartKeyframe>{NO_TIME},true,0,0,0,0,0,0</StartKeyframe>")),
-            float(self, "Rotation", 5, "0.", "<LowerBound>-32768</LowerBound><UpperBound>32767</UpperBound>", "<ParameterControlType>3</ParameterControlType>"),
-            point(self, "Anchor Point", 6),
-            self.obj(
-                "VideoComponentParam",
-                class::SLIDER_PARAM,
-                &format!("<Name>Anti-flicker Filter</Name><ParameterID>7</ParameterID><StartKeyframe>{NO_TIME},0.,0,0,0,0,0,0</StartKeyframe><LowerBound>0</LowerBound><UpperBound>1</UpperBound>"),
-            ),
-            float(self, "Crop Left", 8, "0.", pct, ""),
-            float(self, "Crop Top", 9, "0.", pct, ""),
-            float(self, "Crop Right", 10, "0.", pct, ""),
-            float(self, "Crop Bottom", 11, "0.", pct, ""),
-        ];
-        let motion = self.obj(
-            "VideoFilterComponent",
-            class::VIDEO_FILTER,
-            &format!(
-                "<Component Version=\"7\">{}<ID>1</ID><DisplayName>Motion</DisplayName><Intrinsic>true</Intrinsic></Component><PremiereFilterPrivateData Encoding=\"base64\" BinaryHash=\"3805854c-243a-c4be-bd40-a8a40000000e\">AQA=</PremiereFilterPrivateData><MatchName>AE.ADBE Motion</MatchName><VideoFilterType>2</VideoFilterType>",
-                list("Params", "Param", &motion_params, false)
-            ),
-        );
-        let opacity_params = vec![
-            float(self, "Opacity", 1, "100.", pct, ""),
-            self.obj(
-                "VideoComponentParam",
-                class::POPUP_PARAM,
-                &format!("<Name>Blend Mode</Name><ParameterControlType>10</ParameterControlType><ParameterID>2</ParameterID><DiscontinuousInterpolate>true</DiscontinuousInterpolate><StartKeyframe>{NO_TIME},18,0,0,0,0,0,0</StartKeyframe><LowerBound>0</LowerBound><UpperBound>27</UpperBound>"),
-            ),
-            self.obj(
-                "VideoComponentParam",
-                class::POPUP_PARAM,
-                &format!("<Name>Blend Mode</Name><ParameterID>3</ParameterID><DiscontinuousInterpolate>true</DiscontinuousInterpolate><StartKeyframe>{NO_TIME},0,0,0,0,0,0,0</StartKeyframe><LowerBound>0</LowerBound><UpperBound>31</UpperBound>"),
-            ),
-        ];
-        let opacity = self.obj(
-            "VideoFilterComponent",
-            class::VIDEO_FILTER,
-            &format!(
-                "<Component Version=\"7\">{}<ID>2</ID><DisplayName>Opacity</DisplayName><Intrinsic>true</Intrinsic></Component><MatchName>AE.ADBE Opacity</MatchName><VideoFilterType>2</VideoFilterType>",
-                list("Params", "Param", &opacity_params, false)
-            ),
-        );
+        let motion = intrinsic::motion(self, 1);
+        let opacity = intrinsic::opacity(self, 2);
         let chain = self.obj(
             "VideoComponentChain",
             class::VIDEO_CHAIN,
@@ -1390,49 +1322,15 @@ impl<'p> Seed<'p> {
 
     fn audio_template(&mut self, src: &Sources, source: u64) {
         let sample = if src.sample > 0 { src.sample } else { sample_ticks(48_000) };
-        let level = |s: &mut Self, name: Option<&str>| {
-            let name = name.map(|n| el("Name", n)).unwrap_or_default();
-            s.obj(
-                "AudioComponentParam",
-                class::AUDIO_PARAM,
-                &format!("<StartKeyframe>{NO_TIME},{UNITY_LEVEL},0,0,0,0,0,0</StartKeyframe><CurrentValue>{UNITY_LEVEL}</CurrentValue><IsTimeVarying>false</IsTimeVarying><UnitsString>dB</UnitsString>{name}"),
-            )
-        };
-        let toggle = |s: &mut Self, name: &str| {
-            s.obj(
-                "AudioComponentParam",
-                class::AUDIO_BOOL_PARAM,
-                &format!("<IsTimeVarying>false</IsTimeVarying><RangeLocked>false</RangeLocked>{}", el("Name", name)),
-            )
-        };
-        let (layout, kind, config, suffix) = if src.mono {
-            (MONO, 0, r#"{"in":[{"layout":[0],"name":"Mono In","type":0}],"out":[{"layout":[0],"name":"Mono Out","type":0}]}"#, "Mono")
-        } else {
-            (STEREO, 1, r#"{"in":[{"layout":[100,101],"name":"Stereo In","type":0}],"out":[{"layout":[100,101],"name":"Stereo Out","type":0}]}"#, "Stereo")
-        };
-        let filter = |s: &mut Self, params: &[u64], id: u32, name: &str| {
-            s.obj(
-                "AudioFilterComponent",
-                class::AUDIO_FILTER,
-                &format!(
-                    "<AudioComponent Version=\"3\"><Component Version=\"7\">{}<Intrinsic>true</Intrinsic><ID>{id}</ID></Component>{}<ChannelType>{kind}</ChannelType><FrameRate>{sample}</FrameRate><AudioComponentType>0</AudioComponentType></AudioComponent><FilterPreset>0</FilterPreset>{}<FilterIndex>-1</FilterIndex>{}",
-                    list("Params", "Param", params, false),
-                    el("AudioChannelLayout", layout),
-                    el("FilterMatchName", &format!("{name} {suffix}")),
-                    el("ChannelConfigData", config)
-                ),
-            )
-        };
-        let mute = toggle(self, "Mute");
-        let lvl = level(self, Some("Level"));
-        let volume = filter(self, &[mute, lvl], 1, "Internal Volume");
+        let volume = intrinsic::volume(self, 1, src.mono, sample);
         let mut components = vec![volume];
         if !src.mono {
-            let mut params = vec![toggle(self, "Bypass"), level(self, Some("Left")), level(self, Some("Right"))];
+            let mut params =
+                vec![intrinsic::audio_toggle(self, "Bypass"), intrinsic::audio_level(self, Some("Left")), intrinsic::audio_level(self, Some("Right"))];
             for _ in 2..CHANNEL_VOLUME_SLOTS {
-                params.push(level(self, None));
+                params.push(intrinsic::audio_level(self, None));
             }
-            components.push(filter(self, &params, 2, "Internal Channel Volume"));
+            components.push(intrinsic::audio_filter(self, &params, 2, "Internal Channel Volume", false, sample));
         }
         let chain_tail =
             if src.mono { String::new() } else { format!("<FrameRate>{sample}</FrameRate>{}<ChannelType>1</ChannelType>", el("AudioChannelLayout", STEREO)) };
@@ -1458,34 +1356,11 @@ impl<'p> Seed<'p> {
     /// Add a borrowed layout with ids of this document (it is copied by the writer for the clips
     /// that use it, and dropped with the templates).
     fn graft(&mut self, g: &Graft) {
-        let ids: HashMap<&str, u64> = g.objects.iter().map(|o| (o.key.as_str(), self.id())).collect();
-        let mut objs = Vec::with_capacity(g.objects.len());
-        for o in &g.objects {
-            let Some(new) = ids.get(o.key.as_str()) else { return };
-            let mut edits: Vec<(Range<usize>, String)> = vec![(o.id_at.clone(), new.to_string())];
-            for (r, old) in &o.refs {
-                match ids.get(old.as_str()) {
-                    Some(n) => edits.push((r.clone(), n.to_string())),
-                    None => return,
-                }
-            }
-            edits.extend(o.payloads.iter().cloned());
-            edits.sort_by_key(|(r, _)| r.start);
-            let mut out = String::with_capacity(o.text.len() + 64);
-            let mut pos = 0;
-            for (r, t) in edits {
-                if r.start < pos {
-                    return;
-                }
-                out.push_str(o.text.get(pos..r.start).unwrap_or(""));
-                out.push_str(&t);
-                pos = r.end;
-            }
-            out.push_str(o.text.get(pos..).unwrap_or(""));
-            objs.push(format!("\t{out}\n"));
+        let mut next = self.next_id;
+        if let Some(objs) = graft_objects(g, &mut next) {
+            self.next_id = next;
+            self.objs.extend(objs);
         }
-        // all or nothing: a part of a layout would leave references unresolved
-        self.objs.extend(objs);
     }
 
     // ----------------------------------------------------------------------------- bins
@@ -1553,6 +1428,45 @@ pub(crate) fn premiere_path(path: &str, map: &[(String, String)]) -> String {
 }
 
 /// The document without the objects nothing reachable from the project refers to (the templates).
+/// A borrowed layout as objects with ids from `next` (advanced past them), each with its own
+/// references renumbered; all or nothing (`None`: a part of it would leave references unresolved).
+pub(crate) fn graft_objects(g: &Graft, next: &mut u64) -> Option<Vec<String>> {
+    let mut id = *next;
+    let ids: HashMap<&str, u64> = g
+        .objects
+        .iter()
+        .map(|o| {
+            let n = id;
+            id += 1;
+            (o.key.as_str(), n)
+        })
+        .collect();
+    let mut objs = Vec::with_capacity(g.objects.len());
+    for o in &g.objects {
+        let new = ids.get(o.key.as_str())?;
+        let mut edits: Vec<(Range<usize>, String)> = vec![(o.id_at.clone(), new.to_string())];
+        for (r, old) in &o.refs {
+            edits.push((r.clone(), ids.get(old.as_str())?.to_string()));
+        }
+        edits.extend(o.payloads.iter().cloned());
+        edits.sort_by_key(|(r, _)| r.start);
+        let mut out = String::with_capacity(o.text.len() + 64);
+        let mut pos = 0;
+        for (r, t) in edits {
+            if r.start < pos {
+                return None;
+            }
+            out.push_str(o.text.get(pos..r.start).unwrap_or(""));
+            out.push_str(&t);
+            pos = r.end;
+        }
+        out.push_str(o.text.get(pos..).unwrap_or(""));
+        objs.push(format!("\t{out}\n"));
+    }
+    *next = id;
+    Some(objs)
+}
+
 fn prune(text: &str) -> Result<String> {
     let doc = crate::xml::parse(text).map_err(|e| Error::Other(format!("Premiere Pro project: the written project does not parse: {e}")))?;
     let root = doc.root_element();

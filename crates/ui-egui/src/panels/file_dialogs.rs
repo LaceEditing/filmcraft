@@ -2,7 +2,7 @@
 //! `panels::settings`).
 //!
 //! Automation ids: `recovery.item.<n>`, `recovery.recover`, `recovery.discard`, `recovery.later`;
-//! `revert.yes`, `revert.no`.
+//! `revert.yes`, `revert.no`; `saveNotes.note.<n>`, `saveNotes.ok`.
 
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, Ui, vec2};
 use serde_json::json;
@@ -14,6 +14,17 @@ use crate::{Dialog, FilmcraftApp};
 #[derive(Default)]
 pub struct FileDialogState {
     pub recovery_choice: usize,
+    /// What the last Save could not write into the Premiere Pro project (path, notes).
+    pub save_notes: Option<(String, Vec<String>)>,
+    /// The notes last shown, by path: the same ones are not shown again on every Save.
+    pub save_notes_seen: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl FileDialogState {
+    /// Whether these notes are news (not the ones last shown for this file).
+    pub fn notes_are_new(&self, path: &str, notes: &[String]) -> bool {
+        self.save_notes_seen.get(path).is_none_or(|seen| seen.as_slice() != notes)
+    }
 }
 
 fn modal_frame(t: &Tokens) -> Frame {
@@ -123,9 +134,16 @@ pub fn show_close(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             ui.add_space(18.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if button(app, ui, "closeConfirm.save", "Save", true) {
+                    // a save that left something out says so before the window goes
+                    let news = |app: &FilmcraftApp| {
+                        app.session
+                            .events
+                            .iter()
+                            .any(|e| matches!(e, filmcraft_engine::Event::SaveNotes { path, notes } if app.file_dialogs.notes_are_new(path, notes)))
+                    };
                     match crate::menus::invoke(app, ctx, "file.save", json!({})) {
                         // a save that needed a dialog and was cancelled leaves the project dirty
-                        Ok(_) if !app.session.is_dirty() => close_now = true,
+                        Ok(_) if !app.session.is_dirty() && !news(app) => close_now = true,
                         Ok(_) => {}
                         Err(e) => app.ui.status = e,
                     }
@@ -177,6 +195,50 @@ pub fn show_revert(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     open && !r.should_close()
 }
 
+/// "Saved, but not everything is in the Premiere Pro project": what Save could not write (the same
+/// list is in the Events panel). Shown when the list changes, not on every Save.
+pub fn show_save_notes(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
+    let t = app.tokens;
+    let Some((path, notes)) = app.file_dialogs.save_notes.clone() else { return false };
+    let file = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+    let mut open = true;
+    let r = egui::Modal::new(egui::Id::new("save-notes-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
+        ui.set_width(560.0);
+        Frame::new().inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 20 }).show(ui, |ui| {
+            ui.label(RichText::new("Not everything was saved").size(18.0).strong().color(t.text));
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "'{file}' was saved, but these changes cannot be written into a Premiere Pro project yet, so they will be missing when it is opened again. To keep them too, also save a FilmCraft copy (File \u{25b8} Save a Copy\u{2026}, as .fcproj)."
+                ))
+                .size(13.0)
+                .color(t.text),
+            );
+            ui.add_space(10.0);
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for (i, n) in notes.iter().enumerate() {
+                    let r = ui.label(RichText::new(format!("\u{2022} {n}")).size(12.5).color(t.text_dim));
+                    app.auto.add(&format!("saveNotes.note.{i}"), r.rect, n);
+                }
+            });
+            ui.add_space(18.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if button(app, ui, "saveNotes.ok", "OK", true) {
+                    open = false;
+                }
+            });
+        });
+    });
+    let open = open && !r.should_close();
+    if !open {
+        app.file_dialogs.save_notes_seen.insert(path, notes);
+        app.file_dialogs.save_notes = None;
+    }
+    open
+}
+
 /// Draw the dialog if it is one of ours; returns Some(still open).
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context, d: Dialog) -> Option<bool> {
     match d {
@@ -184,6 +246,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context, d: Dialog) -> Option<bo
         Dialog::Recovery => Some(show_recovery(app, ctx)),
         Dialog::RevertConfirm => Some(show_revert(app, ctx)),
         Dialog::CloseConfirm => Some(show_close(app, ctx)),
+        Dialog::SaveNotes => Some(show_save_notes(app, ctx)),
         _ => None,
     }
 }

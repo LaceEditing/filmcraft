@@ -4,8 +4,10 @@
 //!
 //! For each project: import; export unchanged and require the identical document; then make
 //! deterministic edits to every sequence (delete every 5th clip, split every 7th, nudge every 3rd
-//! into free space, set every 4th video clip's Scale) and export again (the exporter verifies its
-//! own result). Edited projects are written to OUT_DIR for independent checks. One line per file.
+//! into free space, set every 4th video clip's Scale and Opacity and audio clip's Volume, disable
+//! every 6th) and export again (the exporter verifies its own clips), then import the result and
+//! require the values back. Edited projects are written to OUT_DIR for independent checks. One
+//! line per file.
 
 use std::time::Instant;
 
@@ -86,14 +88,24 @@ fn check(path: &str, out_dir: &str, n: usize) -> Result<String, String> {
                         continue;
                     }
                     let mut c = c;
-                    if kind == TrackKind::Video && i % 4 == 1 {
-                        let motion = c.effects.iter_mut().find(|e| e.effect == "motion");
-                        if let Some(m) = motion
-                            && m.params.get("scale").is_none_or(|p| p.keyframes.is_empty())
+                    let mut set = |c: &mut filmcraft_project::TrackItem, effect: &str, param: &str, v: f64| {
+                        if let Some(e) = c.effects.iter_mut().find(|e| e.effect == effect)
+                            && e.params.get(param).is_none_or(|p| p.keyframes.is_empty())
                         {
-                            m.params.insert("scale".into(), Param::new(ParamValue::Float(111.0)));
+                            e.params.insert(param.into(), Param::new(ParamValue::Float(v)));
                             edits += 1;
                         }
+                    };
+                    if kind == TrackKind::Video && i % 4 == 1 {
+                        set(&mut c, "motion", "scale", 111.0);
+                        set(&mut c, "opacity", "opacity", 61.0);
+                    }
+                    if kind == TrackKind::Audio && i % 4 == 1 {
+                        set(&mut c, "volume", "level", -3.0);
+                    }
+                    if i % 6 == 5 {
+                        c.enabled = !c.enabled;
+                        edits += 1;
                     }
                     out.push(c);
                 }
@@ -175,6 +187,25 @@ fn check(path: &str, out_dir: &str, n: usize) -> Result<String, String> {
     let out = format!("{out_dir}/{n:03} {name}.prproj");
     std::fs::write(&out, &edited).map_err(|e| format!("write: {e}"))?;
     let added_ok = rep.mentions("added \"fc-new");
+    // 4. the values come back
+    let (back, _) = import_with(&edited, Format::Prproj, &opts).map_err(|e| format!("re-import: {e}"))?;
+    let tally = |p: &filmcraft_project::Project| {
+        let mut n = [0usize; 4];
+        let value = |c: &filmcraft_project::TrackItem, e: &str, k: &str| {
+            c.effect(e).and_then(|e| e.params.get(k)).filter(|p| p.keyframes.is_empty()).and_then(|p| p.value.as_f64())
+        };
+        for c in p.sequences().filter_map(|i| i.as_sequence()).flat_map(|s| s.all_tracks()).flat_map(|t| t.items.iter()) {
+            n[0] += usize::from(value(c, "motion", "scale").is_some_and(|v| (v - 111.0).abs() < 1e-6));
+            n[1] += usize::from(value(c, "opacity", "opacity").is_some_and(|v| (v - 61.0).abs() < 1e-6));
+            n[2] += usize::from(value(c, "volume", "level").is_some_and(|v| (v + 3.0).abs() < 0.01));
+            n[3] += usize::from(!c.enabled);
+        }
+        n
+    };
+    let (want, got) = (tally(&project), tally(&back.project));
+    if want != got {
+        return Err(format!("values read back differently (scale 111, opacity 61, volume -3 dB, disabled): wrote {want:?}, read {got:?}"));
+    }
     Ok(format!(
         "{clips} clips, {edits} edits, {added} new-media clips ({}), import report {} lines, export report {} lines",
         if added == 0 {

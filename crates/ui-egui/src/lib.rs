@@ -122,6 +122,8 @@ pub enum Dialog {
     SequenceSettings,
     /// "Save changes before closing?" (the window's close button with unsaved changes).
     CloseConfirm,
+    /// What Save could not write into a Premiere Pro project.
+    SaveNotes,
 }
 
 #[derive(Default)]
@@ -1346,7 +1348,19 @@ impl FilmcraftApp {
                 filmcraft_engine::Event::RevealInProject(item) => self.reveal_in_project(item),
                 filmcraft_engine::Event::Toast { message, .. } => self.toast = Some((message, ctx.input(|i| i.time))),
                 filmcraft_engine::Event::ProjectChanged { .. } => {}
+                filmcraft_engine::Event::SaveNotes { path, notes } => {
+                    if self.file_dialogs.notes_are_new(&path, &notes) {
+                        self.file_dialogs.save_notes = Some((path, notes));
+                        if self.dialog.is_none() {
+                            self.dialog = Some(Dialog::SaveNotes);
+                        }
+                    }
+                }
             }
+        }
+        // a Save's notes that arrived while another dialog was up
+        if self.dialog.is_none() && self.file_dialogs.save_notes.is_some() {
+            self.dialog = Some(Dialog::SaveNotes);
         }
         self.sync_timeline_view();
         self.handle_drops(&ctx);

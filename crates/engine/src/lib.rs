@@ -330,6 +330,11 @@ pub enum Event {
     OpenSource(ItemId),
     /// Show this item in the Project panel (Reveal in Project).
     RevealInProject(ItemId),
+    /// Save wrote a Premiere Pro project that could not hold everything: what was left out.
+    SaveNotes {
+        path: String,
+        notes: Vec<String>,
+    },
 }
 
 pub struct Session {
@@ -1103,6 +1108,8 @@ mod project_manager_tests;
 mod project_panel_tests;
 #[cfg(test)]
 mod proxies_tests;
+#[cfg(test)]
+mod prproj_roundtrip_tests;
 #[cfg(test)]
 mod prproj_tests;
 #[cfg(test)]

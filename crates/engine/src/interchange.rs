@@ -19,6 +19,27 @@ pub fn detect(path: &str, bytes: &[u8]) -> Option<Format> {
     filmcraft_interchange::detect(bytes, ext.as_deref())
 }
 
+/// The report's warnings (what was left out or approximated), for the user to see.
+fn report_warnings(r: &filmcraft_interchange::Report) -> Vec<String> {
+    r.entries
+        .iter()
+        .filter(|e| e.level == filmcraft_interchange::Level::Warning)
+        .map(|e| if e.count > 1 { format!("{} (×{})", e.message, e.count) } else { e.message.clone() })
+        .collect()
+}
+
+/// Tell the user what a Premiere Pro project they saved could not hold (the Events panel, and a
+/// notice the app shows).
+fn note_unsaved(s: &mut Session, path: &str, notes: Vec<String>) {
+    if notes.is_empty() {
+        return;
+    }
+    for n in &notes {
+        s.log.push(crate::panels::Level::Warning, "save", format!("{path}: {n}"));
+    }
+    s.events.push(crate::Event::SaveNotes { path: path.to_string(), notes });
+}
+
 fn report_json(r: &filmcraft_interchange::Report) -> Vec<String> {
     r.entries.iter().map(|e| if e.count > 1 { format!("{} (×{})", e.message, e.count) } else { e.message.clone() }).collect()
 }
@@ -306,8 +327,12 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
             warnings.push(format!("the original was kept as {backup}"));
         }
     }
-    let (bytes, report) = filmcraft_interchange::export_prproj(&s.project, &base, &wanted, std::path::Path::new(&path).parent().and_then(|d| d.to_str()))
-        .map_err(|e| bad(e.to_string()))?;
+    // an effect or transition added here that this project has never used is laid out as in
+    // another Premiere project FilmCraft has opened
+    let models = premiere_layouts(s);
+    let (bytes, report) =
+        filmcraft_interchange::export_prproj_with(&s.project, &base, &wanted, std::path::Path::new(&path).parent().and_then(|d| d.to_str()), &models)
+            .map_err(|e| bad(e.to_string()))?;
     s.services.write_file(&path, &bytes).map_err(|e| bad(format!("{path}: {e}")))?;
     // Saving to Premiere Pro (Settings ▸ General): this is where Save writes from now on, and
     // the project counts as saved
@@ -320,14 +345,15 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut lines = report_json(&report);
     lines.extend(warnings);
-    let n = lines.len();
+    let unsaved = report_warnings(&report);
     let verb = if saving { "Saved" } else { "Exported" };
-    s.toast(if n == 0 {
+    s.toast(if unsaved.is_empty() {
         format!("{verb} to Premiere Pro project {path}")
     } else {
-        format!("{verb} to Premiere Pro project {path} ({n} note(s) in the export report)")
+        format!("{verb} to Premiere Pro project {path}; {} change(s) could not be written into it", unsaved.len())
     });
-    Ok(json!({"path": path, "sequences": wanted.iter().map(|i| i.0).collect::<Vec<_>>(), "report": lines}))
+    note_unsaved(s, &path, unsaved.clone());
+    Ok(json!({"path": path, "sequences": wanted.iter().map(|i| i.0).collect::<Vec<_>>(), "report": lines, "unsaved": unsaved}))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -366,13 +392,14 @@ pub fn create_prproj(s: &mut Session, path: &str, adopt: bool) -> Result<Value> 
         s.premiere_save_path = Some(path.to_string());
         s.saved_revision = s.revision;
     }
-    let n = lines.len();
+    let unsaved = report_warnings(&report);
     let verb = if adopt { "Saved" } else { "Exported" };
-    s.toast(if n == 0 {
+    s.toast(if unsaved.is_empty() {
         format!("{verb} as Premiere Pro project {path}")
     } else {
-        format!("{verb} as Premiere Pro project {path} ({n} note(s) in the export report)")
+        format!("{verb} as Premiere Pro project {path}; {} part(s) of the project could not be written into it", unsaved.len())
     });
+    note_unsaved(s, path, unsaved);
     let sequences: Vec<u64> = s.project.items.values().filter(|i| i.as_sequence().is_some()).map(|i| i.id.0).collect();
     Ok(json!({"path": path, "sequences": sequences, "created": true, "report": lines}))
 }

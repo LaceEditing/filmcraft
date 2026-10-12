@@ -23,7 +23,7 @@
 //! every `BinaryHash` must resolve, ids must be unique, and importing it again must give back
 //! exactly the clips FilmCraft has. A result that fails any check is an error, never a file.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use filmcraft_project::{ItemId, ItemKind, Project, Sequence, TrackItem, TrackKind};
@@ -32,7 +32,8 @@ use roxmltree::Node;
 use crate::common::scaled;
 use crate::prproj::{FRAME_HOLD_AT, META_MEDIA, META_SEQUENCE, parse_i64, source_frame, time};
 use crate::prproj_fx::{self, Ctx, Target};
-use crate::prproj_graph::{self, Index};
+use crate::prproj_graph::{self, Index, TICKS_PER_SECOND};
+use crate::prproj_intrinsic as intrinsic;
 use crate::prproj_mask;
 use crate::xml::{child, child_text, escape, path_text};
 use crate::{Error, Format, ImportOptions, Report, Result};
@@ -45,14 +46,65 @@ fn err(m: impl Into<String>) -> Error {
 /// `original`, the `.prproj` they were imported from. Returns the new document (gzip-compressed
 /// when the original was) and a report of what could not be written.
 pub fn export(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir: Option<&str>) -> Result<(Vec<u8>, Report)> {
+    export_with(project, original, sequences, dest_dir, &[])
+}
+
+/// [`export`], borrowing the layout of an effect or transition FilmCraft added that this project
+/// has nowhere from `models` (other Premiere projects, as `.prproj` bytes).
+pub fn export_with(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir: Option<&str>, models: &[Vec<u8>]) -> Result<(Vec<u8>, Report)> {
     let (xml, compressed) = prproj_graph::decompress(original)?;
     let text = std::str::from_utf8(&xml).map_err(|_| err("the original project is not UTF-8"))?;
+    // Premiere writes no Motion, Opacity or clip Volume until a value leaves its default: a clip
+    // FilmCraft changed first gets them (as Premiere adds them) and is written again; so is a
+    // project that gets a borrowed layout
+    let none = HashSet::new();
+    let out = match write(project, text, sequences, dest_dir, true, !models.is_empty(), &none)? {
+        Written::Done(out) => out,
+        Written::Needs(chains, missing) => {
+            let grafts = if missing.is_empty() { Vec::new() } else { crate::prproj_new::find_models(models, &missing) };
+            let (seeded, borrowed) = seed(text, &chains, &grafts)?;
+            match write(project, &seeded, sequences, dest_dir, false, false, &borrowed)? {
+                Written::Done(mut out) => {
+                    if !grafts.is_empty() {
+                        out.report.info(format!("{} effect or transition layout(s) were borrowed from your other Premiere projects", grafts.len()));
+                    }
+                    out
+                }
+                // the second pass writes what it can (`write` says so for anything left)
+                Written::Needs(..) => return Err(err("internal error: a second pass asked for more")),
+            }
+        }
+    };
+    let bytes = if compressed { prproj_graph::compress(out.text.as_bytes()) } else { out.text.into_bytes() };
+    Ok((bytes, out.report))
+}
+
+enum Written {
+    Done(Output),
+    /// Chains (by object id) that need components the document does not have yet, and effects
+    /// and transitions it has no layout for.
+    Needs(BTreeMap<String, ChainNeed>, BTreeSet<crate::prproj_new::Need>),
+}
+
+/// One pass. `first`: stop when clips need components the document lacks, or (`borrow`, there are
+/// models to look in) effects and transitions have no layout; a second pass writes what it can.
+/// `borrowed`: objects added only to be copied, dropped from the result.
+fn write(
+    project: &Project,
+    text: &str,
+    sequences: &[ItemId],
+    dest_dir: Option<&str>,
+    first: bool,
+    borrow: bool,
+    borrowed: &HashSet<String>,
+) -> Result<Written> {
     let doc = crate::xml::parse(text).map_err(|e| Error::parse(Format::Prproj, e))?;
     let root = doc.root_element();
     if root.tag_name().name() != "PremiereData" {
         return Err(Error::parse(Format::Prproj, "root element is not <PremiereData>"));
     }
     let mut w = Writer::new(text, root);
+    w.borrow = borrow;
     w.displaced = displaced(text);
     w.dest_dir = dest_dir.map(str::to_string);
     w.prefixes = path_prefixes(project, &w.ix);
@@ -63,6 +115,27 @@ pub fn export(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir
     };
     if wanted.is_empty() {
         return Err(err("no sequence in this project came from a Premiere project"));
+    }
+    // what a Premiere project gets only from Premiere so far: sequences and bins made here
+    for it in project.sequences().filter(|i| !i.metadata.contains_key(META_SEQUENCE)) {
+        w.report.warn(format!("sequence \"{}\" was made in FilmCraft; new sequences are not written into Premiere projects yet", it.name));
+    }
+    let premiere_bins: HashSet<&str> =
+        root.children().filter(|n| n.has_tag_name("BinProjectItem")).filter_map(|n| path_text(n, &["ProjectItem", "Name"])).collect();
+    let mut new_bins = Vec::new();
+    let mut stack: Vec<&filmcraft_project::Bin> = vec![&project.root];
+    while let Some(b) = stack.pop() {
+        for e in &b.children {
+            if let filmcraft_project::BinEntry::Bin(c) = e {
+                if !premiere_bins.contains(c.name.as_str()) {
+                    new_bins.push(c.name.clone());
+                }
+                stack.push(c);
+            }
+        }
+    }
+    for b in new_bins {
+        w.report.warn(format!("bin \"{b}\" was made in FilmCraft; new bins are not written into Premiere projects yet"));
     }
     let mut written = Vec::new();
     for id in &wanted {
@@ -77,8 +150,15 @@ pub fn export(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir
             continue;
         };
         let exported = w.sequence(project, seq, pseq)?;
+        w.sequence_settings(&item.name, seq, pseq);
         w.owner_markers(pseq.attribute("ObjectUID").unwrap_or(""), true, &seq.markers, &format!("sequence \"{}\"", item.name));
         written.push((*id, uid.clone(), exported));
+    }
+    if first && (!w.needs.is_empty() || (borrow && !w.missing.is_empty())) {
+        return Ok(Written::Needs(std::mem::take(&mut w.needs), std::mem::take(&mut w.missing)));
+    }
+    if !w.needs.is_empty() {
+        w.report.warn(format!("{} clip(s): a Motion, Opacity or Volume change could not be written", w.needs.len()));
     }
     // source markers of media Premiere knows
     for it in project.items.values() {
@@ -86,17 +166,213 @@ pub fn export(project: &Project, original: &[u8], sequences: &[ItemId], dest_dir
         let Some(first) = uids.split(',').next() else { continue };
         w.owner_markers(first, false, &m.markers, &format!("\"{}\"", it.name));
     }
-    let out = w.finish()?;
+    let mut out = w.finish()?;
+    if !borrowed.is_empty() {
+        out.text = drop_objects(&out.text, borrowed)?;
+    }
     let known = problems(text);
     if !known.is_empty() {
         w.report.warn(format!("the original project already has {} unresolved reference(s); they were left as they are", known.len()));
     }
-    let mut out = out;
     out.report.entries.extend(std::mem::take(&mut w.report.entries));
     verify(&out, &written, &known)?;
-    let bytes = if compressed { prproj_graph::compress(out.text.as_bytes()) } else { out.text.into_bytes() };
-    Ok((bytes, out.report))
+    Ok(Written::Done(out))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Intrinsic components Premiere had not written yet
+// ---------------------------------------------------------------------------------------------
+
+/// The intrinsic components one clip chain needs before FilmCraft's values can be written.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ChainNeed {
+    motion: bool,
+    opacity: bool,
+    /// Clip volume, of a mono (true) or stereo clip.
+    volume: Option<bool>,
+    /// A `Components` list (the chain has none, and FilmCraft added an effect).
+    list: bool,
+    /// Ticks per audio sample (for a volume component).
+    sample: i64,
+}
+
+impl ChainNeed {
+    fn any(&self) -> bool {
+        self.motion || self.opacity || self.volume.is_some() || self.list
+    }
+
+    fn merge(&mut self, o: ChainNeed) {
+        self.motion |= o.motion;
+        self.opacity |= o.opacity;
+        self.volume = self.volume.or(o.volume);
+        self.list |= o.list;
+        if o.sample > 0 {
+            self.sample = o.sample;
+        }
+    }
+}
+
+/// New objects with ids from `next` (`ObjectID`s of the document they go into).
+struct Fragment {
+    next: u64,
+    objs: Vec<String>,
+}
+
+impl intrinsic::Objects for Fragment {
+    fn obj(&mut self, tag: &str, c: (&str, u32), body: &str) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.objs.push(format!("<{tag} ObjectID=\"{id}\" ClassID=\"{}\" Version=\"{}\">{body}</{tag}>\n\t", c.0, c.1));
+        id
+    }
+}
+
+/// Whether FilmCraft's Motion / Opacity / clip volume differs from Premiere's default (what a
+/// chain without that component means).
+fn intrinsic_changed(target: Target, instance: Option<&filmcraft_project::EffectInstance>, ctx: &Ctx) -> bool {
+    let Some(e) = instance else { return false };
+    let mut f = Fragment { next: 1, objs: Vec::new() };
+    match target {
+        Target::Motion => intrinsic::motion(&mut f, 1),
+        Target::Opacity => intrinsic::opacity(&mut f, 2),
+        Target::Volume => intrinsic::volume(&mut f, 1, false, TICKS_PER_SECOND / 48_000),
+        _ => return false,
+    };
+    let text = format!("<PremiereData Version=\"3\">{}</PremiereData>", f.objs.concat());
+    // the defaults are ours: one that does not parse cannot happen, and is not a change
+    let Ok(doc) = crate::xml::parse(&text) else { return false };
+    let ix = Index::new(doc.root_element());
+    let Some(comp) = doc.root_element().children().filter(|n| n.tag_name().name().ends_with("FilterComponent")).find_map(|n| prproj_fx::component(&ix, n))
+    else {
+        return false;
+    };
+    let (maps, _) = prproj_fx::mappings(&comp, target);
+    maps.iter().any(|m| {
+        let Some(fc) = e.params.get(m.param).and_then(|p| prproj_fx::from_param(p, m.conv, ctx)) else { return false };
+        prproj_fx::decode(m.node, m.conv).is_none_or(|pr| !prproj_fx::same(&pr, &fc, ctx))
+    })
+}
+
+/// Whether a clip's audio chain is mono (Some(true)) or stereo; None for other layouts.
+fn chain_is_mono(chain: Node<'_, '_>) -> Option<bool> {
+    match child_text(chain, "ChannelType").map(str::trim) {
+        None | Some("0") => Some(true),
+        Some("1") => Some(false),
+        Some(_) => None,
+    }
+}
+
+/// `text` with the components `needs` asks for added to those chains, the way Premiere adds them
+/// (the chain's `Default…` flags go, the component takes the id they reserved), and the borrowed
+/// layouts `grafts` (whose object ids are returned: the writer copies them, they are dropped after).
+fn seed(text: &str, needs: &BTreeMap<String, ChainNeed>, grafts: &[crate::prproj_new::Graft]) -> Result<(String, HashSet<String>)> {
+    let doc = crate::xml::parse(text).map_err(|e| Error::parse(Format::Prproj, e))?;
+    let root = doc.root_element();
+    let by_id: HashMap<&str, Node> = root.children().filter_map(|n| n.attribute("ObjectID").map(|id| (id, n))).collect();
+    let next = by_id.keys().filter_map(|k| k.parse::<u64>().ok()).max().unwrap_or(0) + 1;
+    let mut f = Fragment { next, objs: Vec::new() };
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    for (key, need) in needs {
+        let Some(chain) = by_id.get(key.as_str()).copied() else { continue };
+        let Some(cc) = child(chain, "ComponentChain") else { continue };
+        let list = child(cc, "Components");
+        let refs: Vec<Node> = list.map(|l| l.children().filter(|n| n.has_tag_name("Component")).collect()).unwrap_or_default();
+        // component ids in use (a reserved one is free; anything else gets the next one)
+        let mut used: HashSet<u32> = refs
+            .iter()
+            .filter_map(|r| r.attribute("ObjectRef").and_then(|o| by_id.get(o)))
+            .filter_map(|c| path_text(*c, &["Component", "ID"]).or_else(|| path_text(*c, &["AudioComponent", "Component", "ID"])))
+            .filter_map(|t| t.trim().parse::<u32>().ok())
+            .collect();
+        let mut take = |reserved: Option<u32>, fallback: u32| {
+            let mut id = reserved.unwrap_or(fallback);
+            while used.contains(&id) {
+                id = used.iter().max().copied().unwrap_or(0) + 1;
+            }
+            used.insert(id);
+            id
+        };
+        let reserved = |tag: &str| child_text(chain, tag).and_then(|t| t.trim().parse::<u32>().ok());
+        let drop = |tag: &str, edits: &mut Vec<(Range<usize>, String)>| {
+            if let Some(n) = child(chain, tag) {
+                edits.push((n.range(), String::new()));
+            }
+        };
+        let mut added = Vec::new();
+        if need.motion {
+            let id = take(reserved("DefaultMotionComponentID"), 1);
+            added.push(intrinsic::motion(&mut f, id));
+            drop("DefaultMotion", &mut edits);
+            drop("DefaultMotionComponentID", &mut edits);
+        }
+        if need.opacity {
+            let id = take(reserved("DefaultOpacityComponentID"), 2);
+            added.push(intrinsic::opacity(&mut f, id));
+            drop("DefaultOpacity", &mut edits);
+            drop("DefaultOpacityComponentID", &mut edits);
+        }
+        if let Some(mono) = need.volume {
+            let id = take(reserved("DefaultVolumeComponentID"), 1);
+            let sample = if need.sample > 0 { need.sample } else { TICKS_PER_SECOND / 48_000 };
+            added.push(intrinsic::volume(&mut f, id, mono, sample));
+            drop("DefaultVol", &mut edits);
+            drop("DefaultVolumeComponentID", &mut edits);
+        }
+        // a list only to add borrowed effects to: not without any
+        if added.is_empty() && grafts.is_empty() {
+            continue;
+        }
+        let items: String = added.iter().enumerate().map(|(i, id)| format!("<Component Index=\"{}\" ObjectRef=\"{id}\" />", refs.len() + i)).collect();
+        match list {
+            Some(l) => edits.push(insert_at_end(text, l, &items)),
+            None => edits.push(insert_at_end(text, cc, &format!("<Components Version=\"1\">{items}</Components>"))),
+        }
+    }
+    let r = root.range();
+    let src = &text[r.clone()];
+    let close = "</PremiereData>";
+    if !src.trim_end().ends_with(close) {
+        return Err(err("the project does not end with </PremiereData>"));
+    }
+    let at = r.start + src.trim_end().len() - close.len();
+    let mut added = f.objs.concat();
+    let mut borrowed = HashSet::new();
+    let mut next = f.next;
+    for g in grafts {
+        let first = next;
+        if let Some(objs) = crate::prproj_new::graft_objects(g, &mut next) {
+            borrowed.extend((first..next).map(|i| i.to_string()));
+            added.push_str(&objs.concat());
+        }
+    }
+    edits.push((at..at, added));
+    Ok((apply(text, 0, edits)?, borrowed))
+}
+
+/// `text` without the top-level objects `ids` (by `ObjectID`), which nothing refers to.
+fn drop_objects(text: &str, ids: &HashSet<String>) -> Result<String> {
+    let doc = crate::xml::parse(text).map_err(|e| err(format!("the written project does not parse: {e}")))?;
+    let edits: Vec<(Range<usize>, String)> =
+        doc.root_element().children().filter(|n| n.attribute("ObjectID").is_some_and(|id| ids.contains(id))).map(|n| (n.range(), String::new())).collect();
+    apply(text, 0, edits)
+}
+
+/// The edit that puts `xml` just before `parent`'s closing tag (opening a self-closed one).
+fn insert_at_end(text: &str, parent: Node<'_, '_>, xml: &str) -> (Range<usize>, String) {
+    let r = parent.range();
+    let src = &text[r.clone()];
+    let name = parent.tag_name().name();
+    match src.strip_suffix("/>") {
+        Some(open) => (r, format!("{open}>{xml}</{name}>")),
+        None => {
+            let at = r.end.saturating_sub(name.len() + 3);
+            (at..at, xml.to_string())
+        }
+    }
+}
+
+/// Premiere's "Custom" sequence editing mode (any frame size and timebase).
+const CUSTOM_EDITING_MODE: &str = "9678af98-a7b7-4bdb-b477-7ac9c8df4a4e";
 
 /// The clips written to one Premiere track, as they must read back.
 type WrittenTrack = (TrackKind, usize, Vec<ExportedClip>);
@@ -144,6 +420,17 @@ struct Writer<'a, 'i> {
     clip_objects: HashMap<String, (usize, Node<'a, 'i>)>,
     /// Binary payloads by hash (read on first use).
     payloads: Option<HashMap<&'a str, &'a str>>,
+    /// Track items to disable (`IsMuted`, added last so it follows the clip's transitions).
+    muted: Vec<(usize, Node<'a, 'i>)>,
+    /// Chains that need an intrinsic component Premiere had not written yet (found on the first
+    /// pass; the second pass starts from a document that has them).
+    needs: BTreeMap<String, ChainNeed>,
+    /// Ticks per audio sample of the sequence being written.
+    sample_ticks: i64,
+    /// Effects and transitions FilmCraft added that the project has no layout for.
+    missing: BTreeSet<crate::prproj_new::Need>,
+    /// Layouts missing here will be borrowed (on a second pass).
+    borrow: bool,
 }
 
 /// A media asset copied into the project for media FilmCraft added.
@@ -196,6 +483,11 @@ impl<'a, 'i> Writer<'a, 'i> {
             added_items: Vec::new(),
             clip_objects: HashMap::new(),
             payloads: None,
+            muted: Vec::new(),
+            needs: BTreeMap::new(),
+            sample_ticks: TICKS_PER_SECOND / 48_000,
+            missing: BTreeSet::new(),
+            borrow: false,
         }
     }
 
@@ -501,6 +793,7 @@ impl<'a, 'i> Writer<'a, 'i> {
 
     fn sequence(&mut self, project: &Project, seq: &Sequence, pseq: Node<'a, 'i>) -> Result<Vec<WrittenTrack>> {
         let edits_before = self.edit_count();
+        self.sample_ticks = TICKS_PER_SECOND / i64::from(seq.settings.sample_rate.max(1));
         let frame = (seq.settings.width as f64, seq.settings.height as f64);
         let mut used: HashSet<&'a str> = HashSet::new();
         // FilmCraft clip → written Premiere track item id (for links and transitions)
@@ -556,7 +849,20 @@ impl<'a, 'i> Writer<'a, 'i> {
                     t.items.extend(stay);
                 }
             }
-            while effective.len() > originals.len() && effective.last().is_some_and(|t| t.items.is_empty() && t.transitions.is_empty()) {
+            // the extra tracks the importer made for overlapping clips go when they end up empty;
+            // tracks added in FilmCraft stay, empty or not
+            let imported = self
+                .displaced
+                .iter()
+                .filter(|((u, v, _), _)| *u == seq_uid && *v == (kind == TrackKind::Video))
+                .map(|(_, i)| i + 1)
+                .max()
+                .unwrap_or(0)
+                .max(originals.len());
+            while effective.len() > originals.len()
+                && effective.len() <= imported
+                && effective.last().is_some_and(|t| t.items.is_empty() && t.transitions.is_empty())
+            {
                 effective.pop();
             }
             let ftracks = &effective;
@@ -656,6 +962,91 @@ impl<'a, 'i> Writer<'a, 'i> {
 
     /// Copy the last Premiere track (with the mixer objects it owns, not its clips) until there
     /// are `want` tracks.
+    /// Sequence ▸ Sequence Settings: the name, frame size and timebase. Premiere fixes a
+    /// sequence's audio sample rate and master channels when it is made; changes to those are
+    /// reported, not written.
+    fn sequence_settings(&mut self, name: &str, seq: &Sequence, pseq: Node<'a, 'i>) {
+        let st = &seq.settings;
+        let uid = pseq.attribute("ObjectUID").unwrap_or("");
+        // the name: the sequence, its Project panel item and its master clip
+        if !name.is_empty() && child_text(pseq, "Name") != Some(name) {
+            let si = self.here(pseq);
+            self.set_child(si, pseq, "Name", name);
+            for pi in self.root.children().filter(|n| n.has_tag_name("ClipProjectItem")).collect::<Vec<_>>() {
+                let Some(master) = self.ix.follow(pi, &["MasterClip"]) else { continue };
+                let plays = self
+                    .ix
+                    .list(master, &["Clips"], "Clip")
+                    .iter()
+                    .any(|c| prproj_graph::clip_sequence(&self.ix, *c).and_then(|q| q.attribute("ObjectUID")) == Some(uid));
+                if !plays {
+                    continue;
+                }
+                if let Some(item) = child(pi, "ProjectItem") {
+                    let ii = self.here(pi);
+                    self.set_child(ii, item, "Name", name);
+                }
+                if child(master, "Name").is_some() {
+                    let mi = self.here(master);
+                    self.set_child(mi, master, "Name", name);
+                }
+            }
+        }
+        let custom = self
+            .ix
+            .at(pseq, &["Node", "Properties"])
+            .and_then(|p| child_text(p, "MZ.Sequence.EditingModeGUID"))
+            .is_none_or(|g| g.trim() == CUSTOM_EDITING_MODE);
+        let video = prproj_graph::track_group(&self.ix, pseq, "VideoTrackGroup");
+        let size = video.and_then(|g| crate::prproj::frame_rect(child_text(g, "FrameRect")));
+        let frame = st.frame_rate.frame_duration().0;
+        let rate = video.and_then(|g| path_text(g, &["TrackGroup", "FrameRate"])).and_then(parse_i64);
+        let resized = size.is_some_and(|s| s != (st.width, st.height));
+        let retimed = frame > 0 && rate.is_some_and(|r| r != frame);
+        if (resized || retimed) && !custom {
+            self.report.warn(format!(
+                "sequence \"{name}\": the new frame size or timebase was not written (the Premiere sequence uses a fixed editing mode; set it to Custom in Premiere first)"
+            ));
+        } else {
+            if resized && let Some(g) = video {
+                let gi = self.here(g);
+                self.set_child(gi, g, "FrameRect", &format!("0,0,{},{}", st.width, st.height));
+                if let Some(props) = self.ix.at(pseq, &["Node", "Properties"]) {
+                    let si = self.here(pseq);
+                    for (tag, v) in [("MZ.Sequence.PreviewFrameSizeWidth", st.width), ("MZ.Sequence.PreviewFrameSizeHeight", st.height)] {
+                        if let Some(n) = child(props, tag) {
+                            self.set_text(si, n, &v.to_string());
+                        }
+                    }
+                }
+            }
+            if retimed {
+                for tag in ["VideoTrackGroup", "DataTrackGroup"] {
+                    if let Some(g) = prproj_graph::track_group(&self.ix, pseq, tag)
+                        && let Some(tg) = child(g, "TrackGroup")
+                    {
+                        let gi = self.here(g);
+                        self.set_child(gi, tg, "FrameRate", &frame.to_string());
+                    }
+                }
+            }
+        }
+        let sample = prproj_graph::track_group(&self.ix, pseq, "AudioTrackGroup")
+            .and_then(|g| path_text(g, &["TrackGroup", "FrameRate"]))
+            .and_then(parse_i64)
+            .filter(|t| *t > 0)
+            .map(|t| (TICKS_PER_SECOND / t) as u32);
+        if sample.is_some_and(|r| r != st.sample_rate) {
+            self.report.warn(format!(
+                "sequence \"{name}\": the audio sample rate ({} Hz) was not written; Premiere keeps a sequence's sample rate from when it was made",
+                st.sample_rate
+            ));
+        }
+        if st.audio_master != filmcraft_project::AudioChannels::Stereo {
+            self.report.warn(format!("sequence \"{name}\": the master track's channels were not written; Premiere keeps them from when the sequence was made"));
+        }
+    }
+
     fn add_tracks(&mut self, group: Node<'a, 'i>, ptracks: &mut Vec<(usize, Node<'a, 'i>)>, want: usize) -> Result<()> {
         let Some((_, template)) = ptracks.last().copied() else {
             self.report.warn("the Premiere sequence has no track to copy for FilmCraft's extra tracks");
@@ -786,6 +1177,15 @@ impl<'a, 'i> Writer<'a, 'i> {
                 self.set_child(inst, ti, "End", &end);
             }
         }
+        // Clip ▸ Enable: off is `IsMuted`, which Premiere writes after the clip's transitions
+        if let Some(cti) = child(obj, "ClipTrackItem") {
+            match (c.enabled, child(cti, "IsMuted")) {
+                (false, None) => self.muted.push((inst, cti)),
+                (false, Some(n)) if n.text().map(str::trim) != Some("true") => self.set_text(inst, n, "true"),
+                (true, Some(n)) => self.remove(inst, n),
+                _ => {}
+            }
+        }
         // transitions belong to the original clip only; `transitions` re-adds the kept ones
         if inst_is_copy(&self.instances, inst)
             && let Some(cti) = child(obj, "ClipTrackItem")
@@ -850,6 +1250,20 @@ impl<'a, 'i> Writer<'a, 'i> {
         let ctx = Ctx { source_in: c.source_in.0, speed: c.speed, frame, src: source_frame(project, c.item).unwrap_or(frame) };
         let comps = prproj_fx::chain(&self.ix, chain);
         let targets = prproj_fx::targets(&comps);
+        // Motion, Opacity or clip volume changed on a clip Premiere saved without one
+        let has = |want: fn(&Target) -> bool| targets.iter().any(want);
+        let mut need = ChainNeed { sample: self.sample_ticks, ..ChainNeed::default() };
+        if kind == TrackKind::Video {
+            need.motion = !has(|t| matches!(t, Target::Motion)) && intrinsic_changed(Target::Motion, c.effect("motion"), &ctx);
+            need.opacity = !has(|t| matches!(t, Target::Opacity)) && intrinsic_changed(Target::Opacity, c.effect("opacity"), &ctx);
+        } else if !has(|t| matches!(t, Target::Volume)) && intrinsic_changed(Target::Volume, c.effect("volume"), &ctx) {
+            match chain_is_mono(chain) {
+                Some(mono) => need.volume = Some(mono),
+                None => self
+                    .report
+                    .warn(format!("\"{}\": a volume change on a clip that is neither mono nor stereo is not written to Premiere projects yet", c.name)),
+            }
+        }
         let mut paired: HashMap<&'static str, usize> = HashMap::new();
         let mut keep_refs: Vec<bool> = Vec::with_capacity(comps.len());
         for (comp, target) in comps.iter().zip(targets.iter().copied()) {
@@ -941,6 +1355,7 @@ impl<'a, 'i> Writer<'a, 'i> {
             .unwrap_or(0)
             + 1;
         let mut added_refs: Vec<String> = Vec::new();
+        let mut borrowing = false;
         let mut seen: HashMap<&str, usize> = HashMap::new();
         for e in &c.effects {
             let Some(def) = filmcraft_project::find_effect(&e.effect).filter(|d| !d.intrinsic) else { continue };
@@ -958,8 +1373,11 @@ impl<'a, 'i> Writer<'a, 'i> {
                 continue;
             }
             let Some(model) = self.model_component(def, kind) else {
+                self.missing.insert(crate::prproj_new::Need::Effect(def.id));
+                // a borrowed layout comes on the next pass, which needs a list to add it to
+                borrowing |= self.borrow;
                 self.report.warn(format!(
-                    "effect \"{}\" added in FilmCraft was not written: the Premiere project has no {} to model it on (apply it once in Premiere)",
+                    "effect \"{}\" added in FilmCraft was not written: neither this Premiere project nor the others FilmCraft has opened has a {} to model it on (apply it once in Premiere, or open a Premiere project that uses it in FilmCraft)",
                     def.name, def.name
                 ));
                 continue;
@@ -1020,6 +1438,14 @@ impl<'a, 'i> Writer<'a, 'i> {
                 i += 1;
             }
             self.set_list(chain_inst, list, &refs);
+        } else if (!added_refs.is_empty() || borrowing) && self.ix.at(chain, &["ComponentChain", "Components"]).is_none() {
+            // the chain has no list to add them to yet
+            need.list = true;
+        }
+        if need.any()
+            && let Some(key) = chain.attribute("ObjectID")
+        {
+            self.needs.entry(key.to_string()).or_default().merge(need);
         }
     }
 
@@ -1585,8 +2011,9 @@ impl<'a, 'i> Writer<'a, 'i> {
             .filter(|n| n.has_tag_name(tag))
             .find(|n| path_text(*n, &["TransitionTrackItem", "DisplayName"]).is_some_and(|d| d.eq_ignore_ascii_case(&name)));
         let Some(model) = model else {
+            self.missing.insert(crate::prproj_new::Need::transition(&tr.effect, tag.starts_with("Audio")));
             self.report.warn(format!(
-                "a {name} transition FilmCraft added was not written: the Premiere project has no {name} to model it on (add one in Premiere once)"
+                "a {name} transition FilmCraft added was not written: neither this Premiere project nor the others FilmCraft has opened has a {name} to model it on (add one in Premiere once, or open a Premiere project that uses it in FilmCraft)"
             ));
             return None;
         };
@@ -1735,6 +2162,9 @@ impl<'a, 'i> Writer<'a, 'i> {
     // -----------------------------------------------------------------------------------------
 
     fn finish(&mut self) -> Result<Output> {
+        for (inst, cti) in std::mem::take(&mut self.muted) {
+            self.insert(inst, cti, "<IsMuted>true</IsMuted>");
+        }
         if !self.added_items.is_empty()
             && let Some(rp) = self.root.children().find(|n| n.has_tag_name("RootProjectItem"))
             && let Some(items) = self.ix.at(rp, &["ProjectItemContainer", "Items"])

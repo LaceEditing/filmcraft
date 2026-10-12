@@ -646,6 +646,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         ti.speed = raw_speed.abs().clamp(SPEED_RANGE.0, SPEED_RANGE.1);
         ti.reverse = raw_speed < 0.0;
         ti.origin = item.attribute("ObjectID").map(str::to_string);
+        // Clip ▸ Enable off: Premiere saves `IsMuted` on the track item (video and audio alike)
+        ti.enabled = path_text(item, &["ClipTrackItem", "IsMuted"]).map(str::trim) != Some("true");
         if child_text(clip, "FrameHold") == Some(FRAME_HOLD_AT)
             && let Some(at) = time(child_text(clip, "FrameHoldStart"))
         {

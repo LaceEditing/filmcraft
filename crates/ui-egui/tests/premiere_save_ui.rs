@@ -1,7 +1,7 @@
 //! Headless UI test of Ctrl+S on a project opened from Premiere Pro (Settings ▸ General ▸ Save a
-//! project opened from Premiere Pro, default: a .prproj beside the original): the first Save shows
-//! the Premiere Pro project dialog, later ones write there without asking, and the project counts
-//! as saved.
+//! project opened from Premiere Pro; default: into the .prproj it came from, keeping a backup, or
+//! a .prproj beside it, asked for once), and of the notice listing what a Premiere project could
+//! not hold.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -168,5 +168,50 @@ fn ctrl_s_with_the_copy_preference_asks_once_and_keeps_the_original() {
     assert_eq!(asked.load(Ordering::Relaxed), 1, "not asked again");
     assert_ne!(std::fs::read(&out).unwrap(), first, "written again with the new edit");
     assert_eq!(std::fs::read_to_string(&src).unwrap(), prproj(), "the original is untouched");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ctrl+S that cannot write everything into the Premiere Pro project shows what was left out
+/// (`saveNotes.*`), once: the same notes on the next Save are not shown again.
+#[test]
+fn ctrl_s_shows_what_the_premiere_project_could_not_hold() {
+    let dir = std::env::temp_dir().join(format!("fc-prproj-notes-ui-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("show.prproj");
+    std::fs::write(&src, prproj()).unwrap();
+    let mut s = Session::default();
+    s.prefs_path = Some(dir.join("preferences.json"));
+    s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
+    let (tx, rx) = channel();
+    let app = FilmcraftApp::new(s).with_control(rx);
+    let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).build_eframe(move |_cc| app);
+    let mut d = Driver { harness, tx };
+    d.frames(4);
+    let ids = |d: &mut Driver| -> Vec<String> {
+        let els = d.ok("ui.elements", json!({}));
+        els.as_array().into_iter().flatten().filter_map(|e| e["id"].as_str().map(str::to_string)).collect()
+    };
+    // a save that writes everything: no notice
+    d.ok("engine.execute", json!({"command": "playhead.set", "params": {"seconds": 4.0}}));
+    d.ok("engine.execute", json!({"command": "sequence.addEditAllTracks", "params": {}}));
+    d.ok("ui.key", json!({"key": "Cmd+S"}));
+    d.frames(3);
+    assert!(!ids(&mut d).iter().any(|i| i.starts_with("saveNotes.")));
+    // a sequence made here: the notice lists it
+    d.ok("engine.execute", json!({"command": "file.newSequence", "params": {"name": "Made Here"}}));
+    d.ok("ui.key", json!({"key": "Cmd+S"}));
+    d.frames(3);
+    let shown = ids(&mut d);
+    assert!(shown.iter().any(|i| i == "saveNotes.ok") && shown.iter().any(|i| i == "saveNotes.note.0"), "{shown:?}");
+    assert_eq!(d.harness.state().dialog, Some(filmcraft_ui_egui::Dialog::SaveNotes));
+    d.ok("ui.click", json!({"id": "saveNotes.ok"}));
+    d.frames(3);
+    assert_eq!(d.harness.state().dialog, None);
+    // saved again with the same gap: not shown again
+    d.ok("engine.execute", json!({"command": "playhead.set", "params": {"seconds": 6.0}}));
+    d.ok("engine.execute", json!({"command": "sequence.addEditAllTracks", "params": {}}));
+    d.ok("ui.key", json!({"key": "Cmd+S"}));
+    d.frames(3);
+    assert_eq!(d.harness.state().dialog, None);
     let _ = std::fs::remove_dir_all(&dir);
 }

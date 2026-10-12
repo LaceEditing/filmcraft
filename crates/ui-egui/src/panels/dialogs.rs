@@ -70,7 +70,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             return;
         }
-        Dialog::NewSequence | Dialog::Preferences | Dialog::Recovery | Dialog::RevertConfirm | Dialog::CloseConfirm => {}
+        Dialog::NewSequence | Dialog::Preferences | Dialog::Recovery | Dialog::RevertConfirm | Dialog::CloseConfirm | Dialog::SaveNotes => {}
     }
     if !open {
         app.dialog = None;
@@ -302,6 +302,15 @@ fn sequence_settings(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
     const RATES: [f64; 9] = [23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0, 120.0];
     const MIXES: [&str; 4] = ["Stereo", "Mono", "5.1", "Adaptive"];
+    // as in Premiere Pro, a sequence's sample rate and master channels are set when it is made:
+    // one from a Premiere project keeps them (saving into the project could not change them)
+    let audio_fixed = app
+        .session
+        .state
+        .active_sequence
+        .and_then(|id| app.session.project.item(id))
+        .is_some_and(|i| i.metadata.contains_key(filmcraft_engine::interchange::PREMIERE_SEQUENCE));
+    const FIXED: &str = "Set when the sequence was made in Premiere Pro";
     egui::Window::new("Sequence Settings").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         ui.set_min_width(340.0);
         let label_w = 110.0;
@@ -340,29 +349,33 @@ fn sequence_settings(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new("Audio").strong());
-        ui.horizontal(|ui| {
-            label(ui, "Sample Rate");
-            let shown = format!("{} Hz", d.sample_rate);
-            let r = egui::ComboBox::from_id_salt("sequence-settings-rate").selected_text(&shown).width(ui.available_width()).show_ui(ui, |ui| {
-                for sr in [44_100u32, 48_000, 96_000] {
-                    let text = format!("{sr} Hz");
-                    let o = ui.selectable_value(&mut d.sample_rate, sr, &text);
-                    elems.push((format!("sequenceSettings.sampleRate.option.{sr}"), o.rect, text));
-                }
+        ui.add_enabled_ui(!audio_fixed, |ui| {
+            ui.horizontal(|ui| {
+                label(ui, "Sample Rate");
+                let shown = format!("{} Hz", d.sample_rate);
+                let r = egui::ComboBox::from_id_salt("sequence-settings-rate").selected_text(&shown).width(ui.available_width()).show_ui(ui, |ui| {
+                    for sr in [44_100u32, 48_000, 96_000] {
+                        let text = format!("{sr} Hz");
+                        let o = ui.selectable_value(&mut d.sample_rate, sr, &text);
+                        elems.push((format!("sequenceSettings.sampleRate.option.{sr}"), o.rect, text));
+                    }
+                });
+                elems.push(("sequenceSettings.sampleRate".into(), r.response.rect, shown));
             });
-            elems.push(("sequenceSettings.sampleRate".into(), r.response.rect, shown));
-        });
-        ui.horizontal(|ui| {
-            label(ui, "Master");
-            let shown = d.mix.clone();
-            let r = egui::ComboBox::from_id_salt("sequence-settings-mix").selected_text(&shown).width(ui.available_width()).show_ui(ui, |ui| {
-                for m in MIXES {
-                    let o = ui.selectable_value(&mut d.mix, m.to_string(), m);
-                    elems.push((format!("sequenceSettings.mix.option.{m}"), o.rect, m.to_string()));
-                }
+            ui.horizontal(|ui| {
+                label(ui, "Master");
+                let shown = d.mix.clone();
+                let r = egui::ComboBox::from_id_salt("sequence-settings-mix").selected_text(&shown).width(ui.available_width()).show_ui(ui, |ui| {
+                    for m in MIXES {
+                        let o = ui.selectable_value(&mut d.mix, m.to_string(), m);
+                        elems.push((format!("sequenceSettings.mix.option.{m}"), o.rect, m.to_string()));
+                    }
+                });
+                elems.push(("sequenceSettings.mix".into(), r.response.rect, shown));
             });
-            elems.push(("sequenceSettings.mix".into(), r.response.rect, shown));
-        });
+        })
+        .response
+        .on_disabled_hover_text(FIXED);
         ui.add_space(10.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let o = ui.add(egui::Button::new(egui::RichText::new("OK").color(egui::Color32::WHITE)).fill(app.tokens.accent));
@@ -388,7 +401,11 @@ fn sequence_settings(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     }
     if apply {
         let name = d.name.trim();
-        let mut params = serde_json::json!({"width": d.width, "height": d.height, "fps": d.fps, "sampleRate": d.sample_rate, "mix": d.mix});
+        let mut params = serde_json::json!({"width": d.width, "height": d.height, "fps": d.fps});
+        if !audio_fixed {
+            params["sampleRate"] = serde_json::json!(d.sample_rate);
+            params["mix"] = serde_json::json!(d.mix);
+        }
         if !name.is_empty() {
             params["name"] = serde_json::json!(name);
         }
