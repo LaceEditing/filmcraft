@@ -598,6 +598,9 @@ pub(crate) struct Sources {
     pub(crate) mono: bool,
     /// Ticks per audio sample.
     pub(crate) sample: i64,
+    /// An adjustment layer: Premiere marks every timeline clip of one `AdjustmentLayer` (without
+    /// it the clip plays its black video, hiding everything below).
+    pub(crate) adjustment: bool,
 }
 
 struct Seed<'p> {
@@ -969,8 +972,17 @@ impl<'p> Seed<'p> {
     }
 
     fn video_clip(&mut self, markers: u64, source: u64, range: Option<(i64, i64)>, master: bool) -> u64 {
+        self.video_clip_of(markers, source, range, master, false)
+    }
+
+    /// A video clip; `adjustment`: a timeline clip of an adjustment layer (the master clip's own
+    /// clip is not marked).
+    fn video_clip_of(&mut self, markers: u64, source: u64, range: Option<(i64, i64)>, master: bool, adjustment: bool) -> u64 {
         let clip_id = self.uuid();
-        let body = Self::clip_body(markers, source, range, &clip_id, master);
+        let mut body = Self::clip_body(markers, source, range, &clip_id, master);
+        if adjustment {
+            body.push_str("<AdjustmentLayer>true</AdjustmentLayer>");
+        }
         self.obj("VideoClip", class::VIDEO_CLIP, &body)
     }
 
@@ -1149,6 +1161,7 @@ impl<'p> Seed<'p> {
                 size: (st.width, st.height),
                 mono: false,
                 sample,
+                adjustment: false,
             },
         );
 
@@ -1386,7 +1399,7 @@ impl<'p> Seed<'p> {
             class::VIDEO_CHAIN,
             &format!("<ComponentChain Version=\"3\">{}</ComponentChain>", list("Components", "Component", &[motion, opacity], false)),
         );
-        let clip = self.video_clip(src.markers, source, Some((0, TEMPLATE_LENGTH)), false);
+        let clip = self.video_clip_of(src.markers, source, Some((0, TEMPLATE_LENGTH)), false, src.adjustment);
         let sub = self.sub_clip(clip, src);
         let (w, h) = src.size;
         self.obj(
@@ -1752,7 +1765,7 @@ impl Seed<'_> {
             ),
         );
         self.project_item(item, &name, &master_uid);
-        self.sources.insert(item, Sources { master: master_uid, name, video: Some(source), audio, markers, size, mono: false, sample });
+        self.sources.insert(item, Sources { master: master_uid, name, video: Some(source), audio, markers, size, mono: false, sample, adjustment });
         self.media_uid.push((item, media_uid));
     }
 

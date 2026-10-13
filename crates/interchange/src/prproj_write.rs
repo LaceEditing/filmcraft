@@ -87,8 +87,105 @@ pub fn export_with(project: &Project, original: &[u8], sequences: &[ItemId], des
             }
         }
     };
-    let bytes = if compressed { prproj_graph::compress(out.text.as_bytes()) } else { out.text.into_bytes() };
+    let mut out = out;
+    let (text, marked) = mark_adjustment_clips(&out.text)?;
+    let (text, _) = point_float_values(&text)?;
+    if marked > 0 {
+        out.report.info(format!(
+            "{marked} adjustment layer clip(s) saved by an earlier FilmCraft were marked as adjustment layers (Premiere showed them as black video, hiding what is below them)"
+        ));
+    }
+    let bytes = if compressed { prproj_graph::compress(text.as_bytes()) } else { text.into_bytes() };
     Ok((bytes, out.report))
+}
+
+/// Premiere writes a float parameter's whole-number values with a trailing point (`150.`); earlier
+/// FilmCraft versions wrote some as `150`. Puts the point back in `StartKeyframe` and `Keyframes`
+/// values of float parameters; returns the text and how many parameters changed.
+fn point_float_values(text: &str) -> Result<(String, usize)> {
+    fn pointed(v: &str) -> Option<String> {
+        let t = v.trim();
+        (!t.is_empty() && t.trim_start_matches('-').bytes().all(|b| b.is_ascii_digit()) && t != "-").then(|| format!("{t}."))
+    }
+    // the value field of each `,`-separated keyframe (`;`-separated in `Keyframes`)
+    fn fix(list: &str, sep: Option<char>) -> Option<String> {
+        let mut changed = false;
+        let fix_one = |k: &str, changed: &mut bool| -> String {
+            let mut f: Vec<String> = k.split(',').map(str::to_string).collect();
+            if let Some(v) = f.get_mut(1)
+                && let Some(p) = pointed(v)
+            {
+                *v = p;
+                *changed = true;
+            }
+            f.join(",")
+        };
+        let out = match sep {
+            Some(c) => list.split(c).map(|k| if k.is_empty() { String::new() } else { fix_one(k, &mut changed) }).collect::<Vec<_>>().join(&c.to_string()),
+            None => fix_one(list, &mut changed),
+        };
+        changed.then_some(out)
+    }
+    let doc = crate::xml::parse(text).map_err(|e| err(format!("the written project does not parse: {e}")))?;
+    let mut edits = Vec::new();
+    let mut n = 0;
+    for param in doc
+        .root_element()
+        .children()
+        .filter(|p| p.has_tag_name("VideoComponentParam") && p.attribute("ClassID").is_some_and(|c| c.starts_with("fe47129e") || c.starts_with("a4ff2d6e")))
+    {
+        let mut any = false;
+        for (tag, sep) in [("StartKeyframe", None), ("Keyframes", Some(';'))] {
+            let Some(el) = param.children().find(|c| c.has_tag_name(tag)) else { continue };
+            let Some(t) = el.text() else { continue };
+            if let Some(new) = fix(t, sep) {
+                edits.push((el.range(), format!("<{tag}>{new}</{tag}>")));
+                any = true;
+            }
+        }
+        n += usize::from(any);
+    }
+    Ok((apply(text, 0, edits)?, n))
+}
+
+/// Premiere applies an adjustment layer only through timeline clips marked `AdjustmentLayer`: the
+/// master clip's `IsAdjustmentLayer` alone is not enough (such a clip plays the layer's black
+/// video, hiding everything below it). Marks every adjustment layer clip that is not (earlier
+/// FilmCraft versions wrote them unmarked); returns the text and how many were marked.
+fn mark_adjustment_clips(text: &str) -> Result<(String, usize)> {
+    let doc = crate::xml::parse(text).map_err(|e| err(format!("the written project does not parse: {e}")))?;
+    let root = doc.root_element();
+    let adjustment: HashSet<&str> = root
+        .children()
+        .filter(|n| n.has_tag_name("MasterClip") && child_text(*n, "IsAdjustmentLayer").is_some_and(|v| v.trim() == "true"))
+        .filter_map(|n| n.attribute("ObjectUID"))
+        .collect();
+    if adjustment.is_empty() {
+        return Ok((text.to_string(), 0));
+    }
+    let by_id: HashMap<&str, Node> = root.children().filter_map(|n| Some((n.attribute("ObjectID")?, n))).collect();
+    // a master clip's own clips are never marked
+    let mut seen: HashSet<&str> = root
+        .children()
+        .filter(|n| n.has_tag_name("MasterClip"))
+        .flat_map(|m| m.children().filter(|c| c.has_tag_name("Clips")).flat_map(|c| c.children()))
+        .filter_map(|c| c.attribute("ObjectRef"))
+        .collect();
+    let mut edits = Vec::new();
+    for sub in root.children().filter(|n| n.has_tag_name("SubClip")) {
+        let master = sub.children().find(|c| c.has_tag_name("MasterClip")).and_then(|c| c.attribute("ObjectURef"));
+        if !master.is_some_and(|m| adjustment.contains(m)) {
+            continue;
+        }
+        let Some(id) = sub.children().find(|c| c.has_tag_name("Clip")).and_then(|c| c.attribute("ObjectRef")) else { continue };
+        let Some(clip) = by_id.get(id) else { continue };
+        if !clip.has_tag_name("VideoClip") || !seen.insert(id) || clip.children().any(|c| c.has_tag_name("AdjustmentLayer")) {
+            continue;
+        }
+        edits.push(insert_at_end(text, *clip, "<AdjustmentLayer>true</AdjustmentLayer>"));
+    }
+    let n = edits.len();
+    Ok((apply(text, 0, edits)?, n))
 }
 
 /// How one pass of [`write`] runs.
@@ -273,6 +370,7 @@ fn existing_sources<'a, 'i>(ix: &Index<'a, 'i>, root: Node<'a, 'i>, uid: &str, s
             size,
             mono,
             sample: sample.filter(|s| *s > 0).unwrap_or(TICKS_PER_SECOND / 48_000),
+            adjustment: child_text(master, "IsAdjustmentLayer").is_some_and(|v| v.trim() == "true"),
         });
     }
     None

@@ -47,9 +47,11 @@ fn check(path: &str, out_dir: &str, n: usize) -> Result<String, String> {
     let mut project = imp.project;
     let clips: usize = project.sequences().filter_map(|i| i.as_sequence()).map(|s| s.all_tracks().map(|t| t.items.len()).sum::<usize>()).sum();
 
-    // 1. unchanged → identical
+    // 1. unchanged → identical (but for the repairs of what earlier FilmCraft versions wrote:
+    // float points, adjustment layer clip marks)
     let (same, _) = export_prproj(&project, &bytes, &[], None).map_err(|e| format!("no-op export: {e}"))?;
-    if inflate(&same) != inflate(&bytes) {
+    let repaired = inflate(&same) != inflate(&bytes) && only_repairs(&inflate(&bytes), &inflate(&same));
+    if inflate(&same) != inflate(&bytes) && !repaired {
         let _ = std::fs::write(format!("{out_dir}/{n:03} NOOP-DIFF.prproj"), &same);
         let (a, b) = (inflate(&same), inflate(&bytes));
         let at = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
@@ -217,7 +219,7 @@ fn check(path: &str, out_dir: &str, n: usize) -> Result<String, String> {
         },
         report.entries.len(),
         rep.entries.len()
-    ))
+    ) + if repaired { ", repaired (earlier FilmCraft save)" } else { "" })
 }
 
 fn inflate(b: &[u8]) -> Vec<u8> {
@@ -231,4 +233,25 @@ fn inflate(b: &[u8]) -> Vec<u8> {
     } else {
         b.to_vec()
     }
+}
+
+/// Whether `written` is `orig` with only the writer's repairs: a point after a whole number
+/// (`150` → `150.`) and `<AdjustmentLayer>true</AdjustmentLayer>` marks.
+fn only_repairs(orig: &[u8], written: &[u8]) -> bool {
+    const MARK: &[u8] = b"<AdjustmentLayer>true</AdjustmentLayer>";
+    let (mut i, mut j) = (0, 0);
+    while i < orig.len() && j < written.len() {
+        if written[j..].starts_with(MARK) && !orig[i..].starts_with(MARK) {
+            j += MARK.len();
+        } else if orig[i] == written[j] {
+            i += 1;
+            j += 1;
+        } else if written[j] == b'.' && i > 0 && orig[i - 1].is_ascii_digit() && matches!(orig[i], b',' | b';' | b'<') {
+            j += 1;
+        } else {
+            return false;
+        }
+    }
+    let tail = &written[j..];
+    i == orig.len() && (tail.is_empty() || tail == b"." || tail.starts_with(MARK) && tail.len() == MARK.len())
 }

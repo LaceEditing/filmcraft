@@ -595,17 +595,36 @@ pub(crate) struct ParamText {
     pub current: String,
 }
 
+/// A keyframe value as Premiere writes it: a float parameter's whole number with a trailing point
+/// (`150.`, never `150`), a menu choice as a plain integer (`18`).
+fn fmt_key_val(v: &Val, float: bool) -> String {
+    match v {
+        Val::F(x) if float && x.is_finite() && *x == x.round() && x.abs() < 1e15 => format!("{}.", *x as i64),
+        other => fmt_val(other),
+    }
+}
+
+/// Whether a parameter holds a float (Premiere writes its keyframe values with a point): its
+/// original value says so, else its class (the float and anti-flicker sliders).
+fn is_float_param(original: Node<'_, '_>) -> bool {
+    match child_text(original, "StartKeyframe").and_then(|s| s.split(',').nth(1)) {
+        Some(v) => v.contains('.') || v.contains('e'),
+        None => original.attribute("ClassID").is_some_and(|c| c.starts_with("fe47129e") || c.starts_with("a4ff2d6e")),
+    }
+}
+
 pub(crate) fn encode(original: Node<'_, '_>, pr: Option<&Canon>, fc: &Canon, ctx: &Ctx) -> ParamText {
     let value = fc.keys.first().map(|k| &k.v).unwrap_or(&fc.value);
+    let float = is_float_param(original);
     let start = match child_text(original, "StartKeyframe") {
         Some(s) => {
             let mut f: Vec<String> = s.split(',').map(str::to_string).collect();
             if let Some(slot) = f.get_mut(1) {
-                *slot = fmt_val(value);
+                *slot = fmt_key_val(value, float);
             }
             f.join(",")
         }
-        None => format!("{STATIC_TIME},{},0,0,0,0,0,0", fmt_val(value)),
+        None => format!("{STATIC_TIME},{},0,0,0,0,0,0", fmt_key_val(value, float)),
     };
     let keyframes = (!fc.keys.is_empty()).then(|| {
         let mut s = String::new();
@@ -613,7 +632,7 @@ pub(crate) fn encode(original: Node<'_, '_>, pr: Option<&Canon>, fc: &Canon, ctx
             let reuse = pr.and_then(|pr| pr.keys.iter().find(|o| same_key(o, k, ctx.tolerance()))).and_then(|o| o.raw.clone());
             match reuse {
                 Some(raw) => s.push_str(&raw),
-                None => s.push_str(&format!("{},{},{},{},0,{},0,{}", k.t, fmt_val(&k.v), k.kind.0, k.kind.1, num(k.infl.0), num(k.infl.1))),
+                None => s.push_str(&format!("{},{},{},{},0,{},0,{}", k.t, fmt_key_val(&k.v, float), k.kind.0, k.kind.1, num(k.infl.0), num(k.infl.1))),
             }
             s.push(';');
         }

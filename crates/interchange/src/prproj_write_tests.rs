@@ -746,11 +746,98 @@ fn new_sequences_synthetic_items_and_bins_are_built() {
         .filter_map(|e| if let filmcraft_project::BinEntry::Item(i) = e { back.item(*i).map(|x| x.name.as_str()) } else { None })
         .collect();
     assert_eq!(in_selects, ["interview.mov"]);
-    // saved again unchanged: the same document
     let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    // Premiere applies the adjustment layer only through clips marked as one (unmarked, it plays
+    // its black video over everything below); a float's whole value has a point, as Premiere
+    // writes it (this document's own Scale is written without, so it keeps that)
+    assert_eq!(adjustment_clips(&text), (1, 0), "every adjustment layer clip is marked");
+    assert!(float_values_without_point(&text).is_empty(), "{:?}", float_values_without_point(&text));
+    // saved again unchanged: the same document
     let (again_imp, _) = import(text.as_bytes(), None);
     let (again, _) = export(&again_imp.project, text.as_bytes(), &[], None).unwrap();
     assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
+}
+
+/// Adjustment layer timeline clips (the `VideoClip` of a `SubClip` of a master clip marked
+/// `IsAdjustmentLayer`): (marked `AdjustmentLayer`, not marked).
+fn adjustment_clips(xml: &str) -> (usize, usize) {
+    let d = crate::xml::parse(xml).unwrap();
+    let root = d.root_element();
+    let adj: Vec<&str> = root
+        .children()
+        .filter(|n| n.has_tag_name("MasterClip") && n.children().any(|c| c.has_tag_name("IsAdjustmentLayer") && c.text() == Some("true")))
+        .filter_map(|n| n.attribute("ObjectUID"))
+        .collect();
+    let (mut yes, mut no) = (0, 0);
+    for sub in root.children().filter(|n| n.has_tag_name("SubClip")) {
+        if !sub.children().any(|c| c.has_tag_name("MasterClip") && c.attribute("ObjectURef").is_some_and(|u| adj.contains(&u))) {
+            continue;
+        }
+        let id = sub.children().find(|c| c.has_tag_name("Clip")).and_then(|c| c.attribute("ObjectRef")).unwrap();
+        let clip = root.children().find(|n| n.attribute("ObjectID") == Some(id)).unwrap();
+        if clip.children().any(|c| c.has_tag_name("AdjustmentLayer") && c.text() == Some("true")) {
+            yes += 1;
+        } else {
+            no += 1;
+        }
+    }
+    (yes, no)
+}
+
+/// Float parameter values written without the point Premiere always writes (`150` for `150.`).
+fn float_values_without_point(xml: &str) -> Vec<String> {
+    let d = crate::xml::parse(xml).unwrap();
+    d.root_element()
+        .children()
+        .filter(|n| n.has_tag_name("VideoComponentParam") && n.attribute("ClassID").is_some_and(|c| c.starts_with("fe47129e")))
+        .filter_map(|n| n.children().find(|c| c.has_tag_name("StartKeyframe")).and_then(|c| c.text()))
+        .filter(|t| t.split(',').nth(1).is_some_and(|v| !v.contains('.') && !v.contains('e')))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A project an earlier FilmCraft saved with unmarked adjustment layer clips (Premiere showed
+/// black under them) and a float written as `150`: saving it again repairs both, and says so.
+#[test]
+fn adjustment_layer_clips_saved_unmarked_are_repaired() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let adj = p.add_item(
+        "Zoom",
+        filmcraft_project::Label::Lavender,
+        ItemKind::AdjustmentLayer { width: 1920, height: 1080, rate: filmcraft_time::FrameRate::new(30, 1), duration: Tick(i64::MAX / 4) },
+        None,
+    );
+    {
+        let q = p.sequence_mut(sid).unwrap();
+        let mut a = q.video_tracks[0].items[0].clone();
+        a.id = ClipId(80_001);
+        a.origin = None;
+        a.link = None;
+        a.item = adj;
+        a.source_in = Tick(0);
+        a.effects = filmcraft_project::effect::intrinsic_video();
+        a.effect_mut("motion").unwrap().params.insert("scale".into(), Param::new(ParamValue::Float(150.0)));
+        q.video_tracks.push(Track::new(TrackId(80_000), filmcraft_project::TrackKind::Video, "V3".into()));
+        q.video_tracks.last_mut().unwrap().items.push(a);
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let good = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert_eq!(adjustment_clips(&good), (1, 0), "{report}");
+    assert!(!report.mentions("earlier FilmCraft"), "nothing to repair in a fresh save: {report}");
+    // as the earlier version wrote it
+    let old = good.replace("<AdjustmentLayer>true</AdjustmentLayer>", "").replace(",150.,", ",150,");
+    assert_eq!(adjustment_clips(&old), (0, 1));
+    assert!(!float_values_without_point(&old).is_empty());
+    let (old_imp, _) = import(old.as_bytes(), None);
+    let (fixed, report) = export(&old_imp.project, old.as_bytes(), &[], None).unwrap();
+    let fixed = String::from_utf8(prproj_graph::decompress(&fixed).unwrap().0).unwrap();
+    assert_eq!(adjustment_clips(&fixed), (1, 0), "{report}");
+    assert!(float_values_without_point(&fixed).is_empty(), "{:?}", float_values_without_point(&fixed));
+    assert!(report.mentions("1 adjustment layer clip(s) saved by an earlier FilmCraft were marked"), "{report}");
+    assert_eq!(fixed, good, "repaired to what a fresh save writes");
 }
 
 /// Layouts learned from a layout kit (effects at default settings) are models even when
