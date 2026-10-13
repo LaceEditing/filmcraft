@@ -202,7 +202,7 @@ pub fn show_save_failed(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             ui.label(RichText::new(&e).size(13.0).color(t.danger));
             ui.add_space(10.0);
             ui.label(
-                RichText::new("Your changes are still open here (and in the recovery journal). To keep them while this is sorted out, save a FilmCraft copy: File \u{25b8} Save a Copy\u{2026}, as .fcproj.")
+                RichText::new("Your changes are still open here (and in the recovery journal). To keep them while this is sorted out, save a FilmCraft copy: File > Save a Copy\u{2026}, as .fcproj.")
                     .size(13.0)
                     .color(t.text),
             );
@@ -266,7 +266,7 @@ pub fn show_save_notes(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             ui.add_space(6.0);
             ui.label(
                 RichText::new(format!(
-                    "'{file}' was saved, but these changes cannot be written into a Premiere Pro project yet, so they will be missing when it is opened again. To keep them too, also save a FilmCraft copy (File \u{25b8} Save a Copy\u{2026}, as .fcproj)."
+                    "'{file}' was saved, but these changes cannot be written into a Premiere Pro project yet, so they will be missing when it is opened again. To keep them too, also save a FilmCraft copy (File > Save a Copy\u{2026}, as .fcproj)."
                 ))
                 .size(13.0)
                 .color(t.text),

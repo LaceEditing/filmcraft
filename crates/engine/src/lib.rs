@@ -17,6 +17,7 @@ pub mod clip_ops;
 pub mod color;
 pub mod commands;
 pub mod demo;
+pub mod effect_edit;
 pub mod essential_sound;
 pub mod export_tools;
 pub mod graphic_templates;
@@ -299,6 +300,9 @@ pub struct EditorState {
     /// Sequence markers copied with the clipboard clips (start relative to the copied range).
     #[serde(skip)]
     pub clipboard_markers: Vec<filmcraft_project::Marker>,
+    /// Effect Controls clipboard: copied effects or keyframes.
+    #[serde(skip)]
+    pub fx_clipboard: Option<effect_edit::FxClipboard>,
     /// The last Edit ▸ Find… (Find Next continues it).
     #[serde(default)]
     pub find: Option<project_tools::FindState>,
@@ -1092,6 +1096,8 @@ mod autosave_tests;
 mod clip_ops_tests;
 #[cfg(test)]
 mod color_tests;
+#[cfg(test)]
+mod effect_edit_tests;
 #[cfg(test)]
 mod essential_sound_tests;
 #[cfg(test)]

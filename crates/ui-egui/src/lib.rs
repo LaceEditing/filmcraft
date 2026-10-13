@@ -1504,7 +1504,7 @@ impl FilmcraftApp {
             self.docking.tab_rects.push((g.path.clone(), tabs));
         }
         if dock.is_empty() && maximized.is_none() {
-            docking::hint(ui.painter(), body, &t, "Every panel is closed: open one from the Window menu, or Window ▸ Workspaces ▸ Reset to Saved Layout.");
+            docking::hint(ui.painter(), body, &t, "Every panel is closed: open one from the Window menu, or Window > Workspaces > Reset to Saved Layout.");
         }
         if maximized.is_none() {
             self.ui.dock = dock;

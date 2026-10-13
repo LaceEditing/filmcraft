@@ -2256,20 +2256,33 @@ fn build() -> Vec<CommandSpec> {
             })?;
             Ok(Value::Null)
         }),
-        cmd!("effects.remove", "Remove Effect", [], None, r#"{"clip":id,"index":n}"#, has_seq, |s, p| {
+        cmd!("effects.remove", "Remove Effect", [], None, r#"{"clip":id,"index":n}|{"clip":id,"indices":[n]}"#, has_seq, |s, p| {
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.remove", "need `clip`"))?;
-            let idx = u64_p(p, "index").ok_or_else(|| bad("effects.remove", "need `index`"))? as usize;
-            s.edit_sequence("Remove Effect", |q, _, _| {
+            let mut idx: Vec<usize> = match p.get("indices").and_then(Value::as_array) {
+                Some(a) => a.iter().filter_map(Value::as_u64).map(|i| i as usize).collect(),
+                None => vec![u64_p(p, "index").ok_or_else(|| bad("effects.remove", "need `index` or `indices`"))? as usize],
+            };
+            idx.sort_unstable();
+            idx.dedup();
+            let n = s.edit_sequence(if idx.len() > 1 { "Remove Effects" } else { "Remove Effect" }, |q, _, _| {
                 let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
-                if it.effects.get(idx).and_then(|e| e.def()).is_some_and(|d| d.intrinsic) {
+                // the fixed effects (Motion, Opacity, Volume…) stay; several go in one step
+                let present: Vec<usize> = idx.iter().copied().filter(|i| *i < it.effects.len()).collect();
+                if present.is_empty() {
+                    return Err(bad("effects.remove", "no effect at that index"));
+                }
+                let removable: Vec<usize> = present.into_iter().filter(|i| !it.effects.get(*i).and_then(|e| e.def()).is_some_and(|d| d.intrinsic)).collect();
+                if removable.is_empty() {
                     return Err(EngineError::Other("intrinsic effects cannot be removed".into()));
                 }
-                if idx < it.effects.len() {
-                    it.effects.remove(idx);
+                for i in removable.iter().rev() {
+                    if *i < it.effects.len() {
+                        it.effects.remove(*i);
+                    }
                 }
-                Ok(())
+                Ok(removable.len())
             })?;
-            Ok(Value::Null)
+            Ok(json!({"removed": n}))
         }),
         cmd!(
             "effects.setParam",
@@ -2554,6 +2567,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::project_manager::commands());
     v.extend(crate::masks::commands());
     v.extend(crate::presets::commands());
+    v.extend(crate::effect_edit::commands());
     v.extend(crate::export_tools::commands());
     v.extend(crate::transcript::commands());
     v.extend(crate::panels::commands());
@@ -2633,15 +2647,7 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
             }
             _ => {
                 let at = mtime.unwrap_or(mt_now);
-                let kind = match interp.as_deref().unwrap_or("linear").to_ascii_lowercase().as_str() {
-                    "bezier" => filmcraft_project::Interpolation::Bezier,
-                    "autobezier" => filmcraft_project::Interpolation::AutoBezier,
-                    "continuousbezier" => filmcraft_project::Interpolation::ContinuousBezier,
-                    "hold" => filmcraft_project::Interpolation::Hold,
-                    "easein" => filmcraft_project::Interpolation::EaseIn,
-                    "easeout" => filmcraft_project::Interpolation::EaseOut,
-                    _ => filmcraft_project::Interpolation::Linear,
-                };
+                let kind = crate::effect_edit::interpolation(interp.as_deref().unwrap_or("linear"));
                 let k = prm.keyframes.iter_mut().find(|k| k.time == at).ok_or_else(|| bad("keyframe", "no keyframe at that time"))?;
                 k.interp = kind;
             }
@@ -3430,7 +3436,7 @@ fn open_foreign(s: &mut Session, path: &str, bytes: &[u8], format: filmcraft_int
     };
     let mut msg = format!("Opened {name} ({}). {save}", format.name());
     if offline > 0 {
-        msg.push_str(&format!("; {offline} media file(s) are offline (File ▸ Link Media)"));
+        msg.push_str(&format!("; {offline} media file(s) are offline (File > Link Media)"));
     }
     if warnings > 0 {
         msg.push_str(&format!("; {warnings} item(s) could not be carried over (see the import report)"));

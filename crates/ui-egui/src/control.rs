@@ -238,8 +238,14 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             }
             // the Type tool's text editing state: {"clip", "layer", "caret", "anchor"} (byte offsets) or null
             if let Some(v) = p.get("gfxEdit") {
-                match serde_json::from_value(v.clone()) {
-                    Ok(e) => app.ui.gfx_edit = e,
+                match serde_json::from_value::<Option<crate::state::GfxEdit>>(v.clone()) {
+                    Ok(e) => {
+                        // typing happens on the Program monitor
+                        if e.is_some() {
+                            app.ui.focused = crate::dock::PanelKind::Program;
+                        }
+                        app.ui.gfx_edit = e;
+                    }
                     Err(e) => return err(format!("`gfxEdit`: {e}")),
                 }
             }

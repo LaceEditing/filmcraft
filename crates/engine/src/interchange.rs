@@ -350,7 +350,7 @@ pub fn save_as_premiere(s: &mut Session, path: Option<&str>) -> Option<Result<Va
     let target = path.map(str::to_string).or_else(|| premiere_save_target(s));
     let Some(target) = target else {
         return Some(Err(EngineError::Other(
-            "file.save: where should the Premiere Pro project go? (pass `path`, or use File ▸ Export ▸ Premiere Pro Project once)".into(),
+            "file.save: where should the Premiere Pro project go? (pass `path`, or use File > Export > Premiere Pro Project once)".into(),
         )));
     };
     let source = premiere_source(s).unwrap_or_default();

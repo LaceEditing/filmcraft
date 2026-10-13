@@ -160,6 +160,8 @@ fn main() -> eframe::Result {
                 }
             }
             let mut app = FilmcraftApp::new(session);
+            // the font pickers list the system's fonts: find them while the window opens
+            filmcraft_ui_egui::panels::font_picker::scan_in_background();
             if recover == Some(false) {
                 app.dialog = None;
             }

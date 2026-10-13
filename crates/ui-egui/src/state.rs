@@ -387,6 +387,10 @@ pub struct UiState {
     /// together. Not persisted.
     #[serde(skip)]
     pub fx_selected: Vec<(u64, usize)>,
+    /// Effect Controls: the selected keyframes (click, Shift/Cmd-click, or a box dragged in the
+    /// keyframe lane). Delete deletes them, a drag moves them together, Copy / Paste copies them.
+    #[serde(default)]
+    pub kf_selected: Vec<KfSel>,
     pub show_menu_bar: bool,
     pub dark: bool,
     /// Lumetri scopes visible in the Program monitor area.
@@ -449,6 +453,9 @@ pub struct UiState {
     /// On-monitor text editing (Type tool / double-click on a text layer).
     #[serde(default)]
     pub gfx_edit: Option<GfxEdit>,
+    /// Fonts picked recently (the font picker lists them first).
+    #[serde(default)]
+    pub recent_fonts: Vec<String>,
     /// Pen tool: path points placed so far (sequence pixels).
     #[serde(default)]
     pub pen_points: Vec<[f64; 2]>,
@@ -776,6 +783,29 @@ impl Default for DeleteTracksDraft {
     }
 }
 
+/// A keyframe selected in Effect Controls: its clip, effect index, parameter (and mask) and the
+/// media time it is stored at.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KfSel {
+    pub clip: u64,
+    pub effect: usize,
+    pub param: String,
+    #[serde(default)]
+    pub mask: Option<usize>,
+    pub time: i64,
+}
+
+impl KfSel {
+    /// As `effects.*Keyframes` commands take it.
+    pub fn key_json(&self) -> serde_json::Value {
+        let mut k = serde_json::json!({"effect": self.effect, "param": self.param, "mediaTime": self.time});
+        if let Some(m) = self.mask {
+            k["mask"] = serde_json::json!(m);
+        }
+        k
+    }
+}
+
 /// The text layer being edited on the Program monitor: caret and selection anchor are byte
 /// offsets into the layer's text.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -784,6 +814,16 @@ pub struct GfxEdit {
     pub layer: usize,
     pub caret: usize,
     pub anchor: usize,
+    /// This typing session's own undo / redo (Cmd+Z / Cmd+Shift+Z while editing): the text, caret
+    /// and anchor before each change, a word at a time.
+    #[serde(skip)]
+    pub undo: Vec<(String, usize, usize)>,
+    #[serde(skip)]
+    pub redo: Vec<(String, usize, usize)>,
+    /// The last change (1 typed, 2 deleted, 3 other) and the input time it was made at, to group
+    /// changes into words.
+    #[serde(skip)]
+    pub last: Option<(u8, f64)>,
 }
 
 fn captions_tab() -> String {
@@ -814,6 +854,7 @@ impl Default for UiState {
             lumetri_grid_folder: None,
             collapsed_fx: vec![],
             fx_selected: vec![],
+            kf_selected: vec![],
             show_menu_bar: true,
             dark: true,
             show_scopes: false,
@@ -836,6 +877,7 @@ impl Default for UiState {
             sequence_settings: SequenceSettingsDraft::default(),
             delete_tracks: DeleteTracksDraft::default(),
             gfx_edit: None,
+            recent_fonts: Vec::new(),
             pen_points: vec![],
             link_media: None,
             create_proxies: None,

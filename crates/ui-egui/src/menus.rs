@@ -161,6 +161,13 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
 }
 
 fn invoke_inner(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    // Clear / Cut / Copy / Paste without a target act on the focused panel's selection: keyframes
+    // and effects in Effect Controls, graphic layers in the Program monitor
+    if params.as_object().is_none_or(|o| o.is_empty())
+        && let Some(r) = crate::panels::effect_controls::route(app, id)
+    {
+        return r;
+    }
     if matches!(id, "app.language.english" | "app.language.japanese" | "app.language.spanish") {
         // Japanese needs the craft-fonts (built with CRAFT_FONTS_DIR) or a font installed on the system
         if id == "app.language.japanese" && !crate::i18n::install_japanese_font(ctx) {

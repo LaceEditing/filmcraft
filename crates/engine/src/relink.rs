@@ -719,7 +719,7 @@ pub fn on_open(s: &mut Session) -> usize {
     let list = refresh(s);
     s.offline.prompt = !s.offline.missing.is_empty();
     if !s.offline.missing.is_empty() {
-        s.toast(format!("{} media file(s) are missing; File ▸ Link Media… reconnects them", s.offline.missing.len()));
+        s.toast(format!("{} media file(s) are missing; File > Link Media… reconnects them", s.offline.missing.len()));
     }
     list.len()
 }

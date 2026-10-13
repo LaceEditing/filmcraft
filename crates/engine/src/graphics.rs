@@ -751,7 +751,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Text",
             &["Graphics and Titles", "New Layer"],
             Some("Cmd+T"),
-            r#"{"text":str="New Text","position":[x,y]?,"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
+            r#"{"text":str="New Text","position":[x,y]?,"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"boxWidth":px?,"topLeft":bool?,"seconds":f64=5,"track":index?,"time":ticks?} (boxWidth: paragraph text wrapping at that width; topLeft: position is the text's top-left corner, as a box dragged with the Type tool)"#,
             has_seq,
             |s, p| {
                 let text = str_p(p, "text").unwrap_or("New Text").to_string();
@@ -774,6 +774,13 @@ pub fn commands() -> Vec<CommandSpec> {
                     if let Some(v) = str_p(p, k) {
                         layer.params.insert(id.into(), filmcraft_project::Param::new(ParamValue::Text(v.into())));
                     }
+                }
+                // a text box (Type tool drag): paragraph text, its position the box's top-left corner
+                if let Some(w) = f64_p(p, "boxWidth").filter(|w| w.is_finite() && *w > 0.0) {
+                    layer.params.insert("box_width".into(), filmcraft_project::Param::new(ParamValue::Float(w.min(100_000.0))));
+                }
+                if p.get("topLeft").and_then(Value::as_bool) == Some(true) {
+                    layer.params.insert("top_left_origin".into(), filmcraft_project::Param::new(ParamValue::Bool(true)));
                 }
                 let into = if p.get("newClip").and_then(Value::as_bool) == Some(true) { None } else { u64_p(p, "clip").map(ClipId) };
                 let into = into.filter(|c| s.active_sequence().is_some_and(|q| is_graphic(s, q, *c)));

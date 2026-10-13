@@ -82,6 +82,41 @@ pub fn selected_graphic(app: &FilmcraftApp) -> Option<(ClipId, TrackItem)> {
     app.session.state.selection.iter().copied().find(|c| is_graphic_clip(app, *c)).and_then(|c| q.find_item(c).map(|(_, it)| (c, it.clone())))
 }
 
+/// Delete in the Program monitor with graphic layers selected (not while typing): those layers
+/// go, in one undo step; the whole clip when every layer of it is selected. None: no layer is
+/// selected (Clear acts on the timeline selection).
+pub fn clear_selected_layers(app: &mut FilmcraftApp) -> Option<Result<Value, String>> {
+    if app.ui.gfx_edit.is_some() {
+        return None;
+    }
+    let mut layers = app.session.state.graphic_layers.clone();
+    if layers.is_empty() {
+        return None;
+    }
+    let (clip, it) = selected_graphic(app)?;
+    let count = layer_indices(&it.effects).len();
+    layers.sort_unstable();
+    layers.dedup();
+    layers.retain(|l| *l < count);
+    if layers.is_empty() {
+        return None;
+    }
+    if layers.len() >= count {
+        return Some(app.session.execute("edit.clear", json!({"clips": [clip.0]})).map_err(|e| e.to_string()));
+    }
+    // back to front so the indices of the layers still to go stay valid; one undo step
+    let prev = app.session.merge_scope.replace(format!("delete-layers-{}", app.session.revision));
+    let mut r = Ok(Value::Null);
+    for l in layers.iter().rev() {
+        if let Err(e) = app.session.execute("graphics.deleteLayer", json!({"clip": clip.0, "layer": l})) {
+            r = Err(e.to_string());
+            break;
+        }
+    }
+    app.session.merge_scope = prev;
+    Some(r.map(|_| json!({"deleted": layers.len()})))
+}
+
 /// Layers of the graphic clips visible at the playhead, front-most first.
 pub fn visible_layers(app: &FilmcraftApp, pic: Rect, frame: (u32, u32)) -> Vec<LayerView> {
     let Some(seq) = app.session.active_sequence() else { return Vec::new() };
@@ -154,6 +189,8 @@ enum DragKind {
     /// Handle `n` of the layer's box (see [`handle_points`]): scales it with the opposite side held in place.
     Scale(usize),
     NewShape,
+    /// Type tool on empty picture: a text box (paragraph text) of the dragged size.
+    NewText,
     TextSelect,
 }
 
@@ -289,10 +326,19 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
         }
     }
 
-    // ---- text editing
+    // ---- text editing: typed on the monitor while it has the focus. The panels that style the
+    // text (Properties, Essential Graphics, Effect Controls) keep the selection for their controls
+    // and have the keys; a click anywhere else (the Timeline…) ends it, so Delete deletes the clip
+    use crate::dock::PanelKind;
+    let focus = app.ui.focused;
+    if editing.is_some() && !matches!(focus, PanelKind::Program | PanelKind::Properties | PanelKind::EssentialGraphics | PanelKind::EffectControls) {
+        end_edit(app, ui);
+    }
+    let editing = app.ui.gfx_edit.clone();
     if let Some(ed) = editing.clone() {
         match views.iter().find(|v| v.clip.0 == ed.clip && v.layer == ed.layer && v.is_text()) {
-            Some(v) => text_edit(app, ui, v, ed, &resp, &mut actions),
+            Some(v) if focus == PanelKind::Program => text_edit(app, ui, v, ed, &resp, &mut actions),
+            Some(_) => ui.memory_mut(|m| m.surrender_focus(egui::Id::new(TEXT_EDIT_ID))),
             None => end_edit(app, ui),
         }
     }
@@ -330,6 +376,11 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                         .find_map(|v| handle_points(&v.quad()).iter().position(|c| (*c - p).length() <= 7.0).map(|n| (v.clip, v.layer, n)));
                     if let Some((c, l, n)) = handle {
                         drag = Some(DragState { kind: DragKind::Scale(n), clip: c, layer: l, start: p });
+                    } else if tool == Tool::Type && !views.iter().any(|v| v.is_text() && v.hit(p)) {
+                        if editing.is_some() {
+                            end_edit(app, ui);
+                        }
+                        drag = Some(DragState { kind: DragKind::NewText, clip: ClipId(0), layer: 0, start: p });
                     } else if tool == Tool::Selection
                         && let Some(v) = views.iter().find(|v| v.hit(p))
                     {
@@ -380,6 +431,9 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                     let h = HandleScale::new(&v.quad(), n, d.start, cur);
                     painter.add(egui::Shape::closed_line(v.quad().iter().map(|q| h.apply(*q)).collect(), Stroke::new(1.0, Color32::WHITE)));
                 }
+            }
+            DragKind::NewText => {
+                painter.rect_stroke(Rect::from_two_pos(d.start, cur), 0.0, Stroke::new(1.0, accent), StrokeKind::Middle);
             }
             DragKind::NewShape => {
                 let r = Rect::from_two_pos(d.start, cur);
@@ -438,6 +492,23 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                         }
                         actions.push(("graphics.set".into(), json!({"clip": v.clip.0, "layer": v.layer, "props": props})));
                     }
+                }
+                DragKind::NewText => {
+                    // a box: paragraph text that wraps at its width, starting at its top-left
+                    // corner; a drag too small to be a box is a click (point text there)
+                    let (into, m) = canvas_target(app, pic, frame);
+                    let (a, b) = (to_canvas(&m, d.start), to_canvas(&m, cur));
+                    let size = 100.0 * frame.1 as f64 / 1080.0;
+                    let box_w = (b.x - a.x).abs();
+                    let mut prm = if (cur - d.start).length() > 8.0 && box_w > 4.0 {
+                        json!({"text": "", "position": [a.x.min(b.x), a.y.min(b.y)], "size": size.round(), "boxWidth": box_w, "topLeft": true})
+                    } else {
+                        json!({"text": "", "position": [a.x, a.y], "size": size.round()})
+                    };
+                    if let Some(cl) = into {
+                        prm["clip"] = json!(cl.0);
+                    }
+                    actions.push(("graphics.newText#edit".into(), prm));
                 }
                 DragKind::NewShape if moved => {
                     let (into, m) = canvas_target(app, pic, frame);
@@ -567,7 +638,7 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
         match app.session.execute(&cmd, p) {
             Ok(r) => {
                 if then_edit && let (Some(c), Some(l)) = (r["clip"].as_u64(), r["layer"].as_u64()) {
-                    app.ui.gfx_edit = Some(GfxEdit { clip: c, layer: l as usize, caret: 0, anchor: 0 });
+                    app.ui.gfx_edit = Some(GfxEdit { clip: c, layer: l as usize, caret: 0, anchor: 0, ..Default::default() });
                     app.ui.focused = crate::dock::PanelKind::Program;
                 }
             }
@@ -607,7 +678,7 @@ fn start_edit_at(app: &mut FilmcraftApp, ui: &egui::Ui, v: &LayerView, p: Pos2, 
     let Some(tp) = text_of(&v.spec) else { return };
     let l = text_layout(tp);
     let caret = v.to_local(p).map_or(tp.text.len(), |(x, y)| l.hit(x, y));
-    app.ui.gfx_edit = Some(GfxEdit { clip: v.clip.0, layer: v.layer, caret, anchor: caret });
+    app.ui.gfx_edit = Some(GfxEdit { clip: v.clip.0, layer: v.layer, caret, anchor: caret, ..Default::default() });
     app.ui.focused = crate::dock::PanelKind::Program;
     let _ = ui;
     actions.push(("graphics.selectLayer".into(), json!({"clip": v.clip.0, "layers": [v.layer]})));
@@ -629,9 +700,25 @@ fn text_edit(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &LayerView, mut ed: G
     ed.caret = ed.caret.min(text.len());
     ed.anchor = ed.anchor.min(text.len());
     let l = text_layout(tp);
-    let events = ui.input(|i| i.events.clone());
+    let (events, now) = ui.input(|i| (i.events.clone(), i.time));
     let mut changed = false;
     let mut stop = false;
+    // undo history: a snapshot before a change that starts a new group (a new word, deleting
+    // after typing, a pause, or after the caret moved)
+    let snapshot = |ed: &mut GfxEdit, text: &str, kind: u8, word_start: bool| {
+        let new_group = match ed.last {
+            None => true,
+            Some((k, at)) => k != kind || word_start || now - at > 1.5,
+        };
+        if new_group {
+            ed.undo.push((text.to_string(), ed.caret, ed.anchor));
+            if ed.undo.len() > 500 {
+                ed.undo.remove(0);
+            }
+        }
+        ed.redo.clear();
+        ed.last = Some((kind, now));
+    };
     let sel = |ed: &GfxEdit| (ed.caret.min(ed.anchor), ed.caret.max(ed.anchor));
     let delete_sel = |text: &mut String, ed: &mut GfxEdit| -> bool {
         let (a, b) = sel(ed);
@@ -645,11 +732,15 @@ fn text_edit(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &LayerView, mut ed: G
     };
     for ev in events {
         match ev {
-            egui::Event::Text(s) | egui::Event::Paste(s) => {
+            egui::Event::Text(ref s) | egui::Event::Paste(ref s) => {
                 let s: String = s.chars().filter(|c| !c.is_control() || *c == '\n').collect();
                 if s.is_empty() {
                     continue;
                 }
+                // a word starts after a space or a line break (and a paste is a change of its own)
+                let word_start = matches!(ev, egui::Event::Paste(_))
+                    || text.get(..ed.caret).and_then(|b| b.chars().last()).is_some_and(char::is_whitespace) && !s.starts_with(char::is_whitespace);
+                snapshot(&mut ed, &text, 1, word_start);
                 delete_sel(&mut text, &mut ed);
                 text.insert_str(ed.caret, &s);
                 ed.caret += s.len();
@@ -661,6 +752,7 @@ fn text_edit(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &LayerView, mut ed: G
                 if a < b {
                     ui.ctx().copy_text(text[a..b].to_string());
                     if matches!(ev, egui::Event::Cut) {
+                        snapshot(&mut ed, &text, 3, true);
                         changed |= delete_sel(&mut text, &mut ed);
                     }
                 }
@@ -670,7 +762,21 @@ fn text_edit(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &LayerView, mut ed: G
                 let mut moved = None;
                 match key {
                     egui::Key::Escape => stop = true,
+                    // this typing session's undo / redo
+                    egui::Key::Z | egui::Key::Y if modifiers.command => {
+                        let redo = key == egui::Key::Y || modifiers.shift;
+                        let (from, to) = if redo { (&mut ed.redo, &mut ed.undo) } else { (&mut ed.undo, &mut ed.redo) };
+                        if let Some((t, c, a)) = from.pop() {
+                            to.push((text.clone(), ed.caret, ed.anchor));
+                            text = t;
+                            ed.caret = c.min(text.len());
+                            ed.anchor = a.min(text.len());
+                            ed.last = None;
+                            changed = true;
+                        }
+                    }
                     egui::Key::Enter => {
+                        snapshot(&mut ed, &text, 1, true);
                         delete_sel(&mut text, &mut ed);
                         text.insert(ed.caret, '\n');
                         ed.caret += 1;
@@ -678,6 +784,7 @@ fn text_edit(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &LayerView, mut ed: G
                         changed = true;
                     }
                     egui::Key::Backspace => {
+                        snapshot(&mut ed, &text, 2, false);
                         if !delete_sel(&mut text, &mut ed) && ed.caret > 0 {
                             let p = if modifiers.alt || modifiers.command { word_left(&text, ed.caret) } else { prev_boundary(&text, ed.caret) };
                             text.replace_range(p..ed.caret, "");
@@ -687,6 +794,7 @@ fn text_edit(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &LayerView, mut ed: G
                         changed = true;
                     }
                     egui::Key::Delete => {
+                        snapshot(&mut ed, &text, 2, false);
                         if !delete_sel(&mut text, &mut ed) && ed.caret < text.len() {
                             let n = next_boundary(&text, ed.caret);
                             text.replace_range(ed.caret..n, "");
@@ -739,6 +847,8 @@ fn text_edit(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &LayerView, mut ed: G
                     if !shift {
                         ed.anchor = ed.caret;
                     }
+                    // typing after moving the caret is a new step
+                    ed.last = None;
                 }
             }
             _ => {}
@@ -1222,39 +1332,14 @@ pub fn properties(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 ParamValue::Text(f) => f,
                 _ => String::new(),
             };
-            let fams = filmcraft_text::families();
             let (_, mut vui) = cx.row(ui, "Font");
-            let r = egui::ComboBox::from_id_salt(("gfx-font", clip.0, l)).selected_text(&family).width(170.0).height(400.0).show_ui(&mut vui, |ui| {
-                if !filmcraft_text::fonts::system_scanned() {
-                    filmcraft_text::fonts::scan_system();
-                }
-                for (f, _) in &fams {
-                    if ui.selectable_label(*f == family, f).clicked() {
-                        cx.set("font", json!(f));
-                    }
-                }
-            });
-            cx.auto("font", r.response.rect, "Font");
-            let styles: Vec<String> = fams.iter().find(|(f, _)| f.eq_ignore_ascii_case(&family)).map(|(_, s)| s.clone()).unwrap_or_default();
+            if let Some(f) = crate::panels::font_picker::font_picker(app, &mut vui, ("gfx", clip.0, l), &family, 170.0, "graphics.prop.font") {
+                cx.set("font", json!(f));
+            }
             let (_, mut vui) = cx.row(ui, "Font Style");
-            let r = egui::ComboBox::from_id_salt(("gfx-style", clip.0, l)).selected_text(&style).width(170.0).show_ui(&mut vui, |ui| {
-                for st in styles.iter().map(String::as_str).chain(["Bold", "Italic", "Bold Italic"]).filter({
-                    let mut seen = Vec::new();
-                    move |x: &&str| {
-                        if seen.contains(x) {
-                            false
-                        } else {
-                            seen.push(*x);
-                            true
-                        }
-                    }
-                }) {
-                    if ui.selectable_label(st == style, st).clicked() {
-                        cx.set("font_style", json!(st));
-                    }
-                }
-            });
-            cx.auto("font_style", r.response.rect, "Font Style");
+            if let Some(st) = crate::panels::font_picker::style_picker(app, &mut vui, ("gfx", clip.0, l), &family, &style, 170.0, "graphics.prop.font_style") {
+                cx.set("font_style", json!(st));
+            }
             cx.number(ui, "Font Size", "size", 0.5, (1.0, 2000.0), 0, "");
             let align = match pv(e, "align", mt) {
                 ParamValue::Choice(c) => c,

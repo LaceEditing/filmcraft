@@ -189,3 +189,167 @@ fn several_effects_select_and_save_as_one_preset() {
     assert_eq!(d.app().ui.fx_selected.len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+impl Driver {
+    /// Media times of the Scale keyframes shown in the lane.
+    fn scale_keys(&mut self) -> Vec<i64> {
+        let mut v: Vec<i64> = self
+            .ok("ui.elements", json!({"prefix": "effectControls.motion.scale.keyframe."}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["id"].as_str()?.rsplit('.').next()?.parse().ok())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Scale keyframes at 1, 2 and 3 s (100, 150, 120).
+    fn three_scale_keys(&mut self) -> Vec<i64> {
+        self.exec("playhead.set", json!({"seconds": 1.0}));
+        self.frames(2);
+        self.ok("ui.click", json!({"id": "effectControls.motion.scale.stopwatch"}));
+        self.frames(2);
+        let clip = self.app().session.active_sequence().unwrap().video_tracks[0].items[0].id.0;
+        for (s, v) in [(2.0, 150.0), (3.0, 120.0)] {
+            self.exec("playhead.set", json!({"seconds": s}));
+            self.exec("effects.setParam", json!({"clip": clip, "effect": "motion", "param": "scale", "value": v}));
+        }
+        self.frames(3);
+        let keys = self.scale_keys();
+        assert_eq!(keys.len(), 3, "{keys:?}");
+        keys
+    }
+
+    fn key_id(t: i64) -> String {
+        format!("effectControls.motion.scale.keyframe.{t}")
+    }
+
+    fn selected_times(&mut self) -> Vec<i64> {
+        let mut v: Vec<i64> = self.app().ui.kf_selected.iter().map(|k| k.time).collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn clip_count(&mut self) -> usize {
+        self.app().session.active_sequence().unwrap().video_tracks[0].items.len()
+    }
+}
+
+/// Keyframes in the lane: click selects one, Shift-click adds, a drag of a selected one moves them
+/// all together (one undo step; this deadlocked once), Delete in Effect Controls deletes the
+/// selected keyframes and never the clip, a box dragged in the lane selects what it covers, and
+/// Copy / Paste puts them at the playhead.
+#[test]
+fn keyframes_select_move_delete_and_paste_together() {
+    let dir = data_dir("kf-select");
+    let (mut d, _) = Driver::with_clip(&dir);
+    let k = d.three_scale_keys();
+    d.ok("ui.click", json!({"id": Driver::key_id(k[0])}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": Driver::key_id(k[2]), "modifiers": {"shift": true}}));
+    d.frames(2);
+    assert_eq!(d.selected_times(), vec![k[0], k[2]]);
+    // drag the first selected keyframe 30 px right: both selected ones move, the middle one stays
+    let steps = d.app().session.history.undo.len();
+    d.ok("ui.drag", json!({"from": {"id": Driver::key_id(k[0])}, "to": {"id": Driver::key_id(k[0]), "fx": 3.2}, "steps": 12}));
+    d.frames(3);
+    let moved = d.scale_keys();
+    assert_eq!(moved.len(), 3, "{moved:?}");
+    assert!(moved.contains(&k[1]), "the unselected keyframe stayed: {moved:?}");
+    let by = moved[0] - k[0];
+    assert!(by > 0, "moved right: {moved:?} from {k:?}");
+    assert_eq!(moved[2] - k[2], by, "both by the same amount");
+    assert_eq!(d.selected_times(), vec![moved[0], moved[2]], "the selection follows");
+    assert_eq!(d.app().session.history.undo.len(), steps + 1);
+    // Delete with Effect Controls focused: the two selected keyframes go, the clip stays
+    let clips = d.clip_count();
+    d.ok("ui.key", json!({"key": "Delete"}));
+    d.frames(2);
+    assert_eq!(d.scale_keys(), vec![k[1]]);
+    assert_eq!(d.clip_count(), clips, "Delete in Effect Controls never deletes the clip");
+    d.ok("ui.key", json!({"key": "Cmd+Z"}));
+    d.frames(2);
+    assert_eq!(d.scale_keys(), moved, "one undo brings both back");
+    // nothing selected: Delete there does nothing to the clip either
+    d.app().ui.kf_selected.clear();
+    d.ok("ui.key", json!({"key": "Delete"}));
+    d.frames(2);
+    assert_eq!(d.clip_count(), clips);
+    assert_eq!(d.scale_keys(), moved);
+    // a box over the first two keyframes selects them
+    let r0 = d.ok("ui.elements", json!({"prefix": Driver::key_id(moved[0])}))[0]["rect"].clone();
+    let r1 = d.ok("ui.elements", json!({"prefix": Driver::key_id(moved[1])}))[0]["rect"].clone();
+    let (x0, y0) = (r0[0].as_f64().unwrap() - 8.0, r0[1].as_f64().unwrap() - 6.0);
+    let (x1, y1) = (r1[0].as_f64().unwrap() + r1[2].as_f64().unwrap() + 6.0, r1[1].as_f64().unwrap() + r1[3].as_f64().unwrap() + 6.0);
+    d.ok("ui.drag", json!({"from": {"x": x0, "y": y0}, "to": {"x": x1, "y": y1}, "steps": 8}));
+    d.frames(2);
+    assert_eq!(d.selected_times(), vec![moved[0], moved[1]], "the box selected the keyframes in it");
+    // Copy, playhead to 4 s, Paste: two keyframes there with the same spacing, selected
+    d.ok("ui.key", json!({"key": "Cmd+C"}));
+    d.exec("playhead.set", json!({"seconds": 4.0}));
+    d.frames(2);
+    d.ok("ui.key", json!({"key": "Cmd+V"}));
+    d.frames(2);
+    let after = d.scale_keys();
+    assert_eq!(after.len(), 5, "{after:?}");
+    let pasted = d.selected_times();
+    assert_eq!(pasted.len(), 2);
+    assert_eq!(pasted[1] - pasted[0], moved[1] - moved[0], "spacing kept");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Effects: an effect dragged by its name moves among the standard effects, Copy / Paste of the
+/// selected effects adds copies, Delete removes the selected effect (Motion and Opacity stay).
+#[test]
+fn effects_reorder_copy_paste_and_delete() {
+    let dir = data_dir("fx-order");
+    let (mut d, clip) = Driver::with_clip(&dir);
+    d.exec("effects.apply", json!({"clips": [clip], "effect": "Gaussian Blur"}));
+    d.exec("effects.apply", json!({"clips": [clip], "effect": "Tint"}));
+    let fixed: Vec<String> = d.app().session.active_sequence().unwrap().video_tracks[0].items[0]
+        .effects
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.def().is_some_and(|d| d.intrinsic))
+        .map(|(i, _)| format!("{clip}:{i}"))
+        .collect();
+    d.app().ui.collapsed_fx.extend(fixed);
+    d.frames(3);
+    let order = |d: &mut Driver| -> Vec<String> {
+        d.app().session.active_sequence().unwrap().video_tracks[0].items[0]
+            .effects
+            .iter()
+            .map(|e| e.effect.clone())
+            .filter(|e| e == "gaussian_blur" || e == "tint")
+            .collect()
+    };
+    assert_eq!(order(&mut d), ["gaussian_blur", "tint"]);
+    let clips = d.clip_count();
+    // Tint dragged above Gaussian Blur
+    d.ok("ui.drag", json!({"from": {"id": "effectControls.effect.tint", "fx": 0.3}, "to": {"id": "effectControls.effect.gaussian_blur", "fx": 0.3, "fy": 0.1}, "steps": 16}));
+    d.frames(3);
+    assert_eq!(order(&mut d), ["tint", "gaussian_blur"]);
+    // Copy Tint, Paste: a second Tint
+    d.ok("ui.click", json!({"id": "effectControls.effect.tint", "fx": 0.3}));
+    d.frames(2);
+    d.ok("ui.key", json!({"key": "Cmd+C"}));
+    d.ok("ui.key", json!({"key": "Cmd+V"}));
+    d.frames(2);
+    assert_eq!(order(&mut d), ["tint", "gaussian_blur", "tint"]);
+    // Delete the selected Gaussian Blur; the clip and its fixed effects stay
+    d.ok("ui.click", json!({"id": "effectControls.effect.gaussian_blur", "fx": 0.3}));
+    d.frames(2);
+    d.ok("ui.key", json!({"key": "Delete"}));
+    d.frames(2);
+    assert_eq!(order(&mut d), ["tint", "tint"]);
+    assert_eq!(d.clip_count(), clips, "the clip stays");
+    // Motion selected: Delete refuses (it is fixed)
+    d.ok("ui.click", json!({"id": "effectControls.effect.motion", "fx": 0.3}));
+    d.frames(2);
+    let n = d.app().session.active_sequence().unwrap().video_tracks[0].items[0].effects.len();
+    d.ok("ui.key", json!({"key": "Delete"}));
+    d.frames(2);
+    assert_eq!(d.app().session.active_sequence().unwrap().video_tracks[0].items[0].effects.len(), n);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -688,7 +688,7 @@ fn rack(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, tr: &Track, id:
         let fx = tr.effects.get(k);
         let name = fx.map(|e| e.def().map(|d| d.name).unwrap_or(&e.effect).to_string());
         let text = match (fx, &name) {
-            (Some(e), Some(n)) => format!("{}{n}", if e.post_fader { "▸ " } else { "" }),
+            (Some(e), Some(n)) => format!("{}{n}", if e.post_fader { "» " } else { "" }),
             _ => String::new(),
         };
         let resp = ui.interact(r, egui::Id::new((ap, "fx", k)), Sense::click_and_drag());

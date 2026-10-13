@@ -152,3 +152,109 @@ fn type_tool_edit_style_and_move() {
     d.ok("ui.set", json!({"tool": "Selection"}));
     d.shot("shape-layer");
 }
+
+/// The Type tool dragged on the picture makes a paragraph text box; Cmd+Z / Cmd+Shift+Z while
+/// typing undo and redo a word at a time; a click on the clip in the Timeline ends the typing so
+/// Delete there deletes the clip (it used to go to the text). The Program monitor's Delete takes
+/// the selected layer only; Effect Controls' font picker searches the system's fonts.
+#[test]
+fn type_tool_box_typing_undo_and_delete_from_the_timeline() {
+    let mut d = Driver::demo();
+    d.exec("playhead.set", json!({"seconds": 2}));
+    d.ok("ui.set", json!({"tool": "Type"}));
+    d.frames(3);
+    let pic = d.rect("program.picture");
+    d.ok(
+        "ui.drag",
+        json!({"from": {"x": pic[0] + pic[2] * 0.1, "y": pic[1] + pic[3] * 0.2}, "to": {"x": pic[0] + pic[2] * 0.5, "y": pic[1] + pic[3] * 0.5}, "steps": 8}),
+    );
+    d.frames(2);
+    let list = d.exec("graphics.list", json!({}));
+    let clip = list["clip"].as_u64().expect("a graphic clip");
+    let seq = d.exec("sequence.inspect", json!({"detail": true}));
+    assert!(seq.to_string().contains("box_width"), "a text box: {seq}");
+    d.ok("ui.type", json!({"text": "one "}));
+    d.ok("ui.type", json!({"text": "two "}));
+    d.ok("ui.type", json!({"text": "three"}));
+    let text = |d: &mut Driver| d.exec("graphics.list", json!({"clip": clip}))["layers"][0]["text"].as_str().unwrap_or("").to_string();
+    assert_eq!(text(&mut d), "one two three");
+    d.ok("ui.key", json!({"key": "Cmd+Z"}));
+    assert_eq!(text(&mut d), "one two ", "a word at a time");
+    d.ok("ui.key", json!({"key": "Cmd+Z"}));
+    assert_eq!(text(&mut d), "one ");
+    d.ok("ui.key", json!({"key": "Cmd+Shift+Z"}));
+    assert_eq!(text(&mut d), "one two ");
+    assert!(d.harness.state().ui.gfx_edit.is_some(), "still typing");
+
+    // the clip clicked in the Timeline: typing ends, Delete deletes the clip
+    d.ok("ui.click", json!({"id": format!("timeline.clip.{clip}")}));
+    d.frames(3);
+    assert!(d.harness.state().ui.gfx_edit.is_none(), "typing ended");
+    d.ok("ui.key", json!({"key": "Delete"}));
+    d.frames(2);
+    let gone = d.harness.state().session.active_sequence().unwrap().find_item(filmcraft_project::ClipId(clip)).is_none();
+    assert!(gone, "Delete in the Timeline deleted the text clip");
+    d.ok("ui.key", json!({"key": "Cmd+Z"}));
+    d.frames(2);
+
+    // two layers; one selected on the Program monitor: Delete takes that one only
+    d.exec("graphics.newRectangle", json!({"clip": clip}));
+    d.ok("ui.set", json!({"tool": "Selection"}));
+    d.frames(3);
+    d.ok("ui.click", json!({"id": format!("program.layer.{clip}.0")}));
+    d.frames(2);
+    assert_eq!(d.harness.state().session.state.graphic_layers, vec![0]);
+    d.ok("ui.key", json!({"key": "Delete"}));
+    d.frames(2);
+    let layers = d.exec("graphics.list", json!({"clip": clip}))["layers"].as_array().unwrap().len();
+    assert_eq!(layers, 1, "only the selected layer was deleted");
+
+    // Effect Controls: the text layer's font from the searchable picker
+    d.ok("ui.key", json!({"key": "Cmd+Z"}));
+    d.frames(2);
+    d.exec("window.panel.EffectControls", json!({}));
+    // the fixed effects folded, so the text layer's rows are in view
+    let fixed: Vec<String> = d
+        .harness
+        .state()
+        .session
+        .active_sequence()
+        .unwrap()
+        .find_item(filmcraft_project::ClipId(clip))
+        .unwrap()
+        .1
+        .effects
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.def().is_some_and(|d| d.intrinsic))
+        .map(|(i, _)| format!("{clip}:{i}"))
+        .collect();
+    d.harness.state_mut().ui.collapsed_fx.extend(fixed);
+    d.frames(3);
+    let fonts = filmcraft_text::families();
+    let Some((family, _)) = fonts.iter().find(|(f, _)| f != "Inter").cloned() else { return };
+    d.ok("ui.click", json!({"id": "effectControls.graphic_text.font"}));
+    d.frames(2);
+    let open = d.ok("ui.elements", json!({"prefix": "effectControls.graphic_text.font.search"}));
+    assert_eq!(open.as_array().map(Vec::len), Some(1), "the list opened with its search field: {open}");
+    d.ok("ui.type", json!({"text": family.clone()}));
+    d.frames(2);
+    d.ok("ui.key", json!({"key": "Enter"}));
+    d.frames(2);
+    let font = d
+        .harness
+        .state()
+        .session
+        .active_sequence()
+        .unwrap()
+        .find_item(filmcraft_project::ClipId(clip))
+        .unwrap()
+        .1
+        .effects
+        .iter()
+        .find(|e| e.effect == filmcraft_project::graphic::TEXT_LAYER)
+        .and_then(|e| e.params.get("font"))
+        .map(|p| p.value.clone());
+    assert_eq!(font, Some(filmcraft_project::ParamValue::Text(family.clone())), "picked from the list");
+    assert_eq!(d.harness.state().ui.recent_fonts.first(), Some(&family), "remembered as recent");
+}
