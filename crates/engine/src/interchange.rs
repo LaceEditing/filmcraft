@@ -227,8 +227,12 @@ fn learn_layouts(s: &Session, bytes: &[u8], at_defaults: bool) -> usize {
             Err(_) => true,
             Ok(old) => {
                 let old_defaults = old.windows(26).any(|w| w == b"FilmCraftLayoutAtDefaults=");
-                let old_animated = filmcraft_interchange::prproj_layouts(&old, old_defaults).first().is_some_and(|o| o.animated);
-                (l.at_defaults && !old_defaults) || (l.at_defaults == old_defaults && old_animated && !l.animated)
+                let old_layouts = filmcraft_interchange::prproj_layouts(&old, old_defaults);
+                let old_animated = old_layouts.first().is_some_and(|o| o.animated);
+                // one stored for another effect (a Premiere effect FilmCraft once took for this
+                // one) is replaced
+                let stale = !old_layouts.iter().any(|o| o.key == l.key);
+                stale || (l.at_defaults && !old_defaults) || (l.at_defaults == old_defaults && old_animated && !l.animated)
             }
         };
         if better {

@@ -115,7 +115,7 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
         if let Some(uid) = n.attribute("ObjectUID")
             && !imp.seq_items.contains_key(uid)
         {
-            imp.reserve_sequence(n, child_text(n, "Name").unwrap_or("Sequence"), None);
+            imp.reserve_sequence(n, crate::xml::name_text(n, "Name").unwrap_or("Sequence"), None);
         }
     }
     let seqs = std::mem::take(&mut imp.seq_nodes);
@@ -220,7 +220,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let Some(items) = self.ix.at(container, &["ProjectItemContainer", "Items"]) else { return };
         for r in items.children().filter(|n| n.has_tag_name("Item")) {
             let Some(item) = self.ix.resolve(Some(r)) else { continue };
-            let name = path_text(item, &["ProjectItem", "Name"]).unwrap_or("Untitled");
+            let name = crate::xml::path_name(item, &["ProjectItem", "Name"]).unwrap_or("Untitled");
             match item.tag_name().name() {
                 "BinProjectItem" => {
                     let b = self.b.bin(name, bin);
@@ -522,11 +522,19 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     /// (that is what Premiere itself tries first after a project moves), else the absolute path.
     fn media_path(&self, media: Node<'a, 'i>) -> String {
         let absolute = child_text(media, "ActualMediaFilePath").or_else(|| child_text(media, "FilePath")).unwrap_or("").trim();
+        // Premiere escapes `RelativePath` twice (`&amp;amp;` for `&`); earlier FilmCraft versions
+        // wrote that into every path of projects they created
+        let absolute = crate::common::unescape_twice(absolute);
         let relative = child_text(media, "RelativePath").map(str::trim).filter(|r| !r.is_empty() && !r.contains(':') && !is_absolute(r));
         if let (Some(rel), Some(base)) = (relative, self.opts.base_dir.as_deref()) {
-            return resolve_path(&rel.replace('\\', "/"), Some(base));
+            let resolved = resolve_path(&crate::common::unescape_twice(rel).replace('\\', "/"), Some(base));
+            // the relative path where it finds the file (or nothing finds it), else the absolute one
+            let found = |p: &str| std::path::Path::new(p).exists();
+            if found(&resolved) || !found(&absolute) {
+                return resolved;
+            }
         }
-        absolute.to_string()
+        absolute
     }
 
     // -----------------------------------------------------------------------------------------
@@ -546,7 +554,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         {
             settings.sample_rate = (TICKS_PER_SECOND / t) as u32;
         }
-        let name = child_text(seq, "Name").unwrap_or(name);
+        let name = crate::xml::name_text(seq, "Name").unwrap_or(name);
         let id = self.b.reserve_sequence(name, settings, bin);
         if let Some(it) = self.b.p.item_mut(id) {
             it.metadata.insert(META_SEQUENCE.to_string(), uid.to_string());
@@ -581,11 +589,14 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         if seq.audio_tracks.is_empty() {
             self.b.ensure_tracks(&mut seq, TrackKind::Audio, 1);
         }
-        if let Some(uid) = node.attribute("ObjectUID")
-            && let Some(m) = self.seq_markers.remove(uid)
-        {
-            seq.markers = m;
+        // sequence markers: the Sequence's own (where Premiere lists them) and those on its master
+        // clip (notes some tools put there; Premiere does not list them, FilmCraft shows them too)
+        let mut markers = node.attribute("ObjectUID").and_then(|uid| self.seq_markers.remove(uid)).unwrap_or_default();
+        if let Some(own) = self.ix.follow(node, &["MarkerOwner", "Markers"]) {
+            markers.extend(self.markers(own));
         }
+        markers.sort_by_key(|m| m.start);
+        seq.markers = markers;
         self.b.put_sequence(id, seq);
     }
 
@@ -619,7 +630,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         }
         let sub = self.ix.follow(item, &["ClipTrackItem", "SubClip"])?;
         let clip = self.ix.follow(sub, &["Clip"])?;
-        let name = child_text(sub, "Name").unwrap_or("Clip").to_string();
+        let name = crate::xml::name_text(sub, "Name").unwrap_or("Clip").to_string();
         let target = if let Some(seq) = prproj_graph::clip_sequence(&self.ix, clip) {
             let id = seq.attribute("ObjectUID").and_then(|u| self.seq_items.get(u).copied());
             if let Some(id) = id {
@@ -649,6 +660,9 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         ti.origin = item.attribute("ObjectID").map(str::to_string);
         // Clip ▸ Enable off: Premiere saves `IsMuted` on the track item (video and audio alike)
         ti.enabled = path_text(item, &["ClipTrackItem", "IsMuted"]).map(str::trim) != Some("true");
+        if kind == TrackKind::Audio {
+            ti.gain_db = clip_gain_db(clip);
+        }
         if child_text(clip, "FrameHold") == Some(FRAME_HOLD_AT)
             && let Some(at) = time(child_text(clip, "FrameHoldStart"))
         {
@@ -692,12 +706,23 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 Target::Effect(def) => {
                     // an effect FilmCraft has: one instance per Premiere component, in order
                     let mut e = def.instance();
-                    // Premiere's audio effect settings are saved on scales FilmCraft can't read
-                    // yet: shown switched off rather than played with other settings (Premiere
-                    // keeps its own: on/off is not written back)
+                    // Premiere's audio effect settings are saved on scales of their own: those
+                    // FilmCraft reads come in as they are (switched off where Premiere bypasses
+                    // them); the others are shown switched off rather than played with other
+                    // settings (Premiere keeps its own: on/off is not written back)
                     if def.kind == filmcraft_project::EffectKind::Audio {
-                        e.enabled = false;
-                        *self.audio_off.entry(def.name.to_string()).or_insert(0) += 1;
+                        let bypassed = c
+                            .params
+                            .iter()
+                            .find(|p| child_text(**p, "Name").is_some_and(|n| n.trim().eq_ignore_ascii_case("Bypass")))
+                            .and_then(|p| prproj_fx::start_value(*p))
+                            .is_some_and(|v| v == "true" || v == "1");
+                        if bypassed {
+                            e.enabled = false;
+                        } else if !prproj_fx::audio_effect_read(def.id) {
+                            e.enabled = false;
+                            *self.audio_off.entry(def.name.to_string()).or_insert(0) += 1;
+                        }
                     }
                     ti.effects.push(e);
                 }
@@ -712,7 +737,13 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 };
                 self.unmapped.entry(label).or_default().extend(unmapped);
             }
+            // a FilmCraft parameter several Premiere ones map onto (Amplify's Left and Right) takes
+            // the first
+            let mut taken = std::collections::HashSet::new();
             for m in maps {
+                if !taken.insert((m.effect, m.param)) {
+                    continue;
+                }
                 let Some(p) = prproj_fx::import_param(&m, ctx) else { continue };
                 if let Target::Effect(_) = target {
                     // the instance just pushed is the last one with this id
@@ -884,6 +915,15 @@ pub(crate) fn frame_rect(s: Option<&str>) -> Option<(u32, u32)> {
 /// Ticks per frame → frame rate (exact: 8 467 200 000 → 30, 10 594 584 000 → 24000/1001).
 pub(crate) fn rate_of(ticks_per_frame: i64) -> Option<FrameRate> {
     (ticks_per_frame > 0 && TICKS_PER_SECOND / ticks_per_frame <= 1000).then(|| FrameRate::new(TICKS_PER_SECOND, ticks_per_frame))
+}
+
+/// Clip ▸ Audio Gain of a clip (`Gain`, linear) in dB; 0 without one.
+pub(crate) fn clip_gain_db(clip: Node<'_, '_>) -> f64 {
+    child_text(clip, "Gain")
+        .and_then(|g| g.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
+        .map(|g| (20.0 * g.log10()).clamp(-96.0, 96.0))
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

@@ -483,3 +483,30 @@ fn selection_follows_playhead() {
     s.execute("playhead.set", json!({"frame": 10})).unwrap();
     assert_eq!(s.state.selection, sel, "off again");
 }
+
+/// A clip pasted into a sequence of another frame size keeps its place in the frame (Premiere
+/// keeps Motion ▸ Position relative to the frame): centred in a 4K sequence → centred in HD.
+#[test]
+fn paste_into_another_frame_size_keeps_the_position_in_the_frame() {
+    let mut s = demo();
+    let first = s.active_sequence().unwrap().video_tracks[0].items[0].clone();
+    let (w, h) = {
+        let q = s.active_sequence().unwrap();
+        (q.settings.width, q.settings.height)
+    };
+    // an explicit position: a quarter in from the top-left
+    s.execute("effects.setParam", json!({"clip": first.id.0, "effect": "motion", "param": "position", "value": [f64::from(w) / 4.0, f64::from(h) / 4.0]}))
+        .unwrap();
+    s.execute("timeline.select", json!({"clips": [first.id.0]})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    s.execute("file.newSequence", json!({"name": "Half", "width": w / 2, "height": h / 2})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.settings.width, q.settings.height), (w / 2, h / 2), "the new sequence is the half size");
+    s.execute("playhead.set", json!({"frame": 0})).unwrap();
+    s.execute("edit.paste", json!({})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let it = q.video_tracks[0].items.first().expect("pasted");
+    let pos = it.effect("motion").unwrap().params["position"].value.clone();
+    let filmcraft_project::ParamValue::Vec2(v) = pos else { panic!("{pos:?}") };
+    assert!((v.x - f64::from(w) / 8.0).abs() < 1e-6 && (v.y - f64::from(h) / 8.0).abs() < 1e-6, "{v:?}");
+}

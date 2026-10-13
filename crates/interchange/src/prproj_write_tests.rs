@@ -896,3 +896,94 @@ fn a_clip_starting_before_its_source_is_saved() {
     // the source's 0 s was at sequence 3 s, and still is
     assert_eq!((a.start, a.duration, a.source_in), (Tick(3 * S), Tick(2 * S), Tick(0)), "{report}");
 }
+
+/// A marker added in FilmCraft goes on the `Sequence` (where Premiere lists sequence markers; on
+/// the master clip it was invisible there); the master clip's own markers stay where they were.
+/// Clip gain is written as Premiere's linear `Gain` and read back.
+#[test]
+fn new_sequence_markers_go_on_the_sequence_and_clip_gain_is_written() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let q = p.sequence_mut(sid).unwrap();
+        assert_eq!(q.markers.len(), 1, "the fixture's master clip marker");
+        let mut m = q.markers[0].clone();
+        m.name = "Round trip".into();
+        m.start = Tick(3 * S);
+        m.comment.clear();
+        q.markers.push(m);
+        q.audio_tracks[0].items[0].gain_db = 3.0;
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    let d = crate::xml::parse(&text).unwrap();
+    let root = d.root_element();
+    let seq = root.children().find(|n| n.has_tag_name("Sequence")).unwrap();
+    let owner = seq.children().find(|c| c.has_tag_name("MarkerOwner")).expect("a MarkerOwner on the Sequence");
+    let id = owner.children().find(|c| c.has_tag_name("Markers")).and_then(|c| c.attribute("ObjectRef")).unwrap();
+    let list = root.children().find(|n| n.attribute("ObjectID") == Some(id)).unwrap();
+    let entries = list.descendants().filter(|n| n.has_tag_name("Marker")).count();
+    assert_eq!(entries, 1, "only the new marker is on the Sequence: {report}");
+    // the master clip's list still holds its own marker only
+    let master_list = root.children().find(|n| n.attribute("ObjectID") == Some("22")).unwrap();
+    assert_eq!(master_list.descendants().filter(|n| n.has_tag_name("Marker")).count(), 1);
+    assert!(text.contains("<Gain>1.41253754462275"), "+3 dB as a linear gain");
+    let back = read(&out);
+    let q = back.sequences().find_map(|i| i.as_sequence()).unwrap();
+    let names: Vec<&str> = q.markers.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["Act 2", "Round trip"]);
+    assert!((q.audio_tracks[0].items[0].gain_db - 3.0).abs() < 1e-6);
+    // saved again unchanged: the same document
+    let (again_imp, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&again_imp.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
+}
+
+/// Premiere's audio effects come in with their settings in FilmCraft's units (scales measured in
+/// Premiere: Bass Boost −24…+24 dB, a Single-band Compressor's Threshold −60…0 dB; a setting at
+/// the top of its range is saved with no value) and switched on; edits are written back on
+/// Premiere's 0…1 scale.
+#[test]
+fn audio_effect_settings_read_and_write_in_their_units() {
+    let comps = "<AudioFilterComponent ObjectID=\"900\"><AudioComponent><Component><Params><Param Index=\"0\" ObjectRef=\"901\"/><Param Index=\"1\" ObjectRef=\"902\"/></Params></Component></AudioComponent><FilterMatchName>Internal Bass</FilterMatchName></AudioFilterComponent>\n  \
+         <AudioComponentParam ObjectID=\"901\" ClassID=\"32657501-3aa4-445f-a49b-d09ecb9fa1ae\"><Name>Bypass</Name></AudioComponentParam>\n  \
+         <AudioComponentParam ObjectID=\"902\" ClassID=\"a714635e-a628-4b27-9d59-77eba47dbc1a\"><StartKeyframe>-91445760000000000,0.75,0,0,0,0,0,0</StartKeyframe><CurrentValue>0.75</CurrentValue><Name>Boost</Name></AudioComponentParam>\n  \
+         <AudioFilterComponent ObjectID=\"910\"><AudioComponent><Component><Params><Param Index=\"0\" ObjectRef=\"911\"/><Param Index=\"1\" ObjectRef=\"912\"/></Params></Component></AudioComponent><FilterMatchName>2da3e2bc-5005-481c-bbeb-7689d3169edf</FilterMatchName></AudioFilterComponent>\n  \
+         <AudioComponentParam ObjectID=\"911\" ClassID=\"32657501-3aa4-445f-a49b-d09ecb9fa1ae\"><Name>Bypass</Name></AudioComponentParam>\n  \
+         <AudioComponentParam ObjectID=\"912\" ClassID=\"a714635e-a628-4b27-9d59-77eba47dbc1a\"><Name>Threshold</Name></AudioComponentParam>\n";
+    let text = doc()
+        .replace(
+            "<Components><Component Index=\"0\" ObjectRef=\"74\"/></Components>",
+            "<Components><Component Index=\"0\" ObjectRef=\"74\"/><Component Index=\"1\" ObjectRef=\"900\"/><Component Index=\"2\" ObjectRef=\"910\"/></Components>",
+        )
+        .replace("</PremiereData>", &format!("  {comps}</PremiereData>"));
+    assert!(text.contains("ObjectRef=\"910\""), "the fixture changed");
+    let (imp, report) = import(text.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let a1 = &p.sequence(sid).unwrap().audio_tracks[0].items[0];
+    let bass = a1.effect("bass").expect("Bass");
+    assert!(bass.enabled, "read, so switched on: {report}");
+    assert_eq!(bass.params["boost"].value, ParamValue::Float(12.0), "0.75 of −24…+24 dB");
+    let comp = a1.effect("single_band_compressor").expect("compressor");
+    assert_eq!(comp.params["threshold"].value, ParamValue::Float(0.0), "no value: the top of −60…0 dB");
+    {
+        let a1 = &mut p.sequence_mut(sid).unwrap().audio_tracks[0].items[0];
+        a1.effect_mut("bass").unwrap().params.insert("boost".into(), Param::new(ParamValue::Float(-12.0)));
+        a1.effect_mut("single_band_compressor").unwrap().params.insert("threshold".into(), Param::new(ParamValue::Float(-30.0)));
+    }
+    let (out, report) = export(&p, text.as_bytes(), &[], None).unwrap();
+    let written = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(written.contains("-91445760000000000,0.25,"), "−12 dB is 0.25: {report}");
+    assert!(written.contains("-91445760000000000,0.5,"), "−30 dB is 0.5");
+    let back = read(&out);
+    let a1 = &back.sequences().find_map(|i| i.as_sequence()).unwrap().audio_tracks[0].items[0];
+    assert_eq!(a1.effect("bass").unwrap().params["boost"].value, ParamValue::Float(-12.0));
+    assert_eq!(a1.effect("single_band_compressor").unwrap().params["threshold"].value, ParamValue::Float(-30.0));
+    // unchanged: the same document
+    let (again_imp, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&again_imp.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
+}

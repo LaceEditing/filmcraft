@@ -145,8 +145,14 @@ fn a_filmcraft_project_becomes_a_premiere_project() {
 
 #[test]
 fn motion_opacity_volume_links_and_markers_are_written() {
-    let (p, _, _) = project();
+    let (mut p, main, _) = project();
+    {
+        let q = p.sequence_mut(main).unwrap();
+        q.audio_tracks[0].items[0].gain_db = -4.5;
+        q.video_tracks[1].items[0].enabled = false;
+    }
     let (bytes, report) = create(&p, &opts()).unwrap();
+    assert!(!report.mentions("audio gain") && !report.mentions("disabled"), "{report}");
     let (back, _) = read(&bytes);
     let seq = back.items.values().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
     let v1 = &seq.video_tracks[0];
@@ -168,6 +174,17 @@ fn motion_opacity_volume_links_and_markers_are_written() {
     let text = String::from_utf8(xml).unwrap();
     assert!(text.contains("Internal Volume Mono") && text.contains("Internal Volume Stereo") && text.contains("Internal Channel Volume Stereo"));
     assert!(text.contains(&format!("<StartKeyframe>{NO_TIME},0.70794578438")), "-3 dB on the A1 fader");
+    // clip gain and Clip ▸ Enable off survive
+    assert!((a1.gain_db + 4.5).abs() < 1e-6, "{}", a1.gain_db);
+    assert!(!logo.enabled, "the disabled clip");
+    // the sequence marker is on the Sequence, where Premiere lists it
+    let d = crate::xml::parse(&text).unwrap();
+    let s = d
+        .root_element()
+        .children()
+        .find(|n| n.has_tag_name("Sequence") && n.children().any(|c| c.has_tag_name("Name") && c.text() == Some("Main Edit")))
+        .unwrap();
+    assert!(s.children().any(|c| c.has_tag_name("MarkerOwner")), "markers on the Sequence");
 }
 
 #[test]

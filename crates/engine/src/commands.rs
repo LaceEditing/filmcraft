@@ -2814,21 +2814,35 @@ fn copy_selection(s: &mut Session) {
             }
         }
     }
+    let frame = (q.settings.width, q.settings.height);
     s.state.clipboard = clip;
     s.state.clipboard_markers = markers;
+    s.state.clipboard_frame = Some(frame);
 }
 
 fn paste(s: &mut Session, insert: bool) -> Result<Value> {
     let at = s.playhead();
     let clip = s.state.clipboard.clone();
+    let from = s.state.clipboard_frame;
     let markers = if s.state.copy_paste_sequence_markers { s.state.clipboard_markers.clone() } else { Vec::new() };
     let end = s.edit_sequence(if insert { "Paste Insert" } else { "Paste" }, |q, ctx, st| {
         let mut placements = Vec::new();
         let mut links = std::collections::HashMap::new();
+        // from a sequence of another frame size: Motion positions keep their place in the frame
+        let to = (q.settings.width, q.settings.height);
+        let ratio = from.filter(|f| *f != to && f.0 > 0 && f.1 > 0).map(|f| (f64::from(to.0) / f64::from(f.0), f64::from(to.1) / f64::from(f.1)));
         for (kind, ti, item) in clip {
             let tracks = q.tracks(kind);
             let Some(t) = tracks.get(ti).or(tracks.last()) else { continue };
             let mut it = item.clone();
+            if let (Some((kx, ky)), TrackKind::Video) = (ratio, kind)
+                && let Some(p) = it.effect_mut("motion").and_then(|e| e.params.get_mut("position"))
+            {
+                p.map_values(|v| match v {
+                    ParamValue::Vec2(v) if v.x.is_finite() && v.y.is_finite() => ParamValue::Vec2(filmcraft_geom::Vec2::new(v.x * kx, v.y * ky)),
+                    other => other,
+                });
+            }
             it.id = ClipId(ctx.alloc());
             it.start += at;
             if let Some(l) = it.link {

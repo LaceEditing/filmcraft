@@ -26,6 +26,15 @@ pub(crate) fn is_absolute(p: &str) -> bool {
     p.starts_with('/') || p.starts_with("\\\\") || is_windows_abs(p)
 }
 
+/// Undo the second escaping Premiere applies to `RelativePath` (`&amp;amp;` is read back as the
+/// text `&amp;`): the XML entities left in an already-parsed path become their characters.
+pub(crate) fn unescape_twice(p: &str) -> String {
+    if !p.contains('&') {
+        return p.to_string();
+    }
+    p.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());

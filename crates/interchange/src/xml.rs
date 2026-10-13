@@ -155,6 +155,23 @@ pub(crate) fn child_text<'a>(n: Node<'a, '_>, name: &str) -> Option<&'a str> {
     child(n, name).map(text)
 }
 
+/// A name as written: Premiere keeps a name's own spaces (`lace kendra intro `), which `text`
+/// trims; only line breaks / tabs of pretty-printing around it are dropped.
+pub(crate) fn name_text<'a>(n: Node<'a, '_>, name: &str) -> Option<&'a str> {
+    let t = child(n, name)?.text().unwrap_or("");
+    Some(if t.contains(['\n', '\r', '\t']) { t.trim() } else { t })
+}
+
+/// [`name_text`] of the element at `path` below `n`.
+pub(crate) fn path_name<'a>(n: Node<'a, '_>, path: &[&str]) -> Option<&'a str> {
+    let (last, parents) = path.split_last()?;
+    let mut cur = n;
+    for p in parents {
+        cur = child(cur, p)?;
+    }
+    name_text(cur, last)
+}
+
 pub(crate) fn child_i64(n: Node<'_, '_>, name: &str) -> Option<i64> {
     child_text(n, name).and_then(|t| t.parse::<i64>().ok().or_else(|| t.parse::<f64>().ok().map(|f| f.round() as i64)))
 }

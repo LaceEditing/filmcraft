@@ -591,3 +591,60 @@ fn the_current_gaussian_blur_amount_comes_in() {
     let (out, rep) = crate::prproj_write::export(&imp.project, doc.as_bytes(), &[], None).unwrap();
     assert_eq!(String::from_utf8(out).unwrap(), doc, "unchanged ({rep})");
 }
+
+/// Premiere escapes `RelativePath` twice (`&amp;amp;` for `&`): the path read is the file's real
+/// name, so the media is found (it used to keep `&amp;` and be written back as `&amp;amp;` in
+/// every path, offline in Premiere).
+#[test]
+fn ampersands_in_media_paths_are_read_once() {
+    let text = doc()
+        .replace(r"<RelativePath>.\Footage\interview.mov</RelativePath>", r"<RelativePath>.\Footage\Morning &amp;amp; Night.mov</RelativePath>")
+        .replace(r"<FilePath>L:\Edit\Footage\interview.mov</FilePath>", r"<FilePath>L:\Edit\Footage\Morning &amp; Night.mov</FilePath>");
+    let path_of = |imp: &crate::Imported| -> String {
+        imp.project
+            .items
+            .values()
+            .find_map(|i| match &i.kind {
+                ItemKind::Media(m) => match &m.media {
+                    MediaRef::File { path } => Some(path.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap()
+    };
+    let (imp, _) = import(text.as_bytes(), Some("/edits/show"));
+    assert_eq!(path_of(&imp), "/edits/show/Footage/Morning & Night.mov");
+    let (imp, _) = import(text.as_bytes(), None);
+    assert_eq!(path_of(&imp), r"L:\Edit\Footage\Morning & Night.mov");
+    // an earlier FilmCraft wrote the absolute path escaped twice too
+    let twice = text.replace(r"Morning &amp; Night.mov</FilePath>", r"Morning &amp;amp; Night.mov</FilePath>");
+    let (imp, _) = import(twice.as_bytes(), None);
+    assert_eq!(path_of(&imp), r"L:\Edit\Footage\Morning & Night.mov");
+}
+
+/// Sequence markers in Premiere's own place (the `Sequence`'s `MarkerOwner`) are read with the
+/// ones on its master clip; clip gain (`Gain` on an audio clip, linear) is read in dB.
+#[test]
+fn sequence_markers_on_the_sequence_and_clip_gain_are_read() {
+    let text = doc()
+        .replace(
+            "<Sequence ObjectUID=\"seq1\">\n    <Name>Main Edit</Name>",
+            "<Sequence ObjectUID=\"seq1\">\n    <MarkerOwner Version=\"1\"><Markers ObjectRef=\"990\"/></MarkerOwner>\n    <Name>Main Edit</Name>",
+        )
+        .replace(
+            "</PremiereData>",
+            "  <Markers ObjectID=\"990\"><Markers><Marker Index=\"0\"><First>m9</First><Second ObjectRef=\"991\"/></Marker></Markers></Markers>\n  <Marker ObjectID=\"991\"><DVAMarker>{\"DVAMarker\":{\"mMarkerID\":\"m9\",\"mStartTime\":{\"ticks\":762048000000},\"mName\":\"On the sequence\",\"mType\":\"Comment\"}}</DVAMarker></Marker>\n</PremiereData>",
+        )
+        .replace(
+            "<AudioClip ObjectID=\"72\"><Clip><Source ObjectRef=\"76\"/><InPoint>2540160000000</InPoint><OutPoint>3810240000000</OutPoint></Clip></AudioClip>",
+            "<AudioClip ObjectID=\"72\"><Clip><Source ObjectRef=\"76\"/><InPoint>2540160000000</InPoint><OutPoint>3810240000000</OutPoint></Clip><Gain>1.4125375446227544</Gain></AudioClip>",
+        );
+    assert!(text.contains("<Gain>"), "the fixture changed");
+    let (imp, _) = import(text.as_bytes(), None);
+    let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+    let names: Vec<&str> = seq.markers.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["Act 2", "On the sequence"]);
+    let gain = seq.audio_tracks[0].items[0].gain_db;
+    assert!((gain - 3.0).abs() < 1e-6, "{gain}");
+}

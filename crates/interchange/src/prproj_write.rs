@@ -419,7 +419,7 @@ fn write(project: &Project, text: &str, sequences: &[ItemId], dest_dir: Option<&
         };
         let exported = w.sequence(project, seq, pseq)?;
         w.sequence_settings(&item.name, seq, pseq);
-        w.owner_markers(pseq.attribute("ObjectUID").unwrap_or(""), true, &seq.markers, &format!("sequence \"{}\"", item.name));
+        w.sequence_markers(pseq, &seq.markers, &format!("sequence \"{}\"", item.name));
         written.push((*id, uid.clone(), exported));
     }
     if first && (!w.needs.is_empty() || (borrow && !w.missing.is_empty())) {
@@ -1486,7 +1486,7 @@ impl<'a, 'i> Writer<'a, 'i> {
         let st = &seq.settings;
         let uid = pseq.attribute("ObjectUID").unwrap_or("");
         // the name: the sequence, its Project panel item and its master clip
-        if !name.is_empty() && child_text(pseq, "Name") != Some(name) {
+        if !name.is_empty() && crate::xml::name_text(pseq, "Name") != Some(name) {
             let si = self.here(pseq);
             self.set_child(si, pseq, "Name", name);
             for pi in self.root.children().filter(|n| n.has_tag_name("ClipProjectItem")).collect::<Vec<_>>() {
@@ -1717,7 +1717,7 @@ impl<'a, 'i> Writer<'a, 'i> {
         }
         let Some(sub) = self.ix.follow(obj, &["ClipTrackItem", "SubClip"]) else { return };
         let sub_inst = self.inst_of(sub, copies);
-        if child_text(sub, "Name") != Some(c.name.as_str()) && !c.name.is_empty() {
+        if crate::xml::name_text(sub, "Name") != Some(c.name.as_str()) && !c.name.is_empty() {
             self.set_child(sub_inst, sub, "Name", &c.name);
         }
         let Some(clip) = self.ix.follow(sub, &["Clip"]) else { return };
@@ -1762,6 +1762,17 @@ impl<'a, 'i> Writer<'a, 'i> {
                             self.remove(clip_inst, n);
                         }
                     }
+                }
+            }
+        }
+        // Clip ▸ Audio Gain: a linear `Gain` on the clip (Premiere writes none at 0 dB)
+        if kind == TrackKind::Audio {
+            let old = crate::prproj::clip_gain_db(clip);
+            if (old - c.gain_db).abs() > 1e-6 {
+                match (c.gain_db.abs() < 1e-9, child(clip, "Gain")) {
+                    (true, Some(n)) => self.remove(clip_inst, n),
+                    (true, None) => {}
+                    (false, _) => self.set_child(clip_inst, clip, "Gain", &crate::xml::num(10f64.powf(c.gain_db.clamp(-96.0, 96.0) / 20.0))),
                 }
             }
         }
@@ -1837,7 +1848,13 @@ impl<'a, 'i> Writer<'a, 'i> {
                 _ => None,
             };
             let (maps, _) = prproj_fx::mappings(comp, target);
+            // a FilmCraft parameter several Premiere ones map onto (Amplify's Left and Right) was
+            // read from the first: unchanged there, none of them is touched
+            let mut changed: HashMap<&'static str, bool> = HashMap::new();
             for m in maps {
+                if changed.get(m.param) == Some(&false) {
+                    continue;
+                }
                 let fc_param = instance.and_then(|e| e.params.get(m.param).cloned()).or_else(|| {
                     def.or_else(|| filmcraft_project::find_effect(m.effect))
                         .and_then(|d| d.params.iter().find(|p| p.id == m.param))
@@ -1857,6 +1874,10 @@ impl<'a, 'i> Writer<'a, 'i> {
                         default.and_then(|d| prproj_fx::from_param(&d, m.conv, &ctx)).is_some_and(|d| prproj_fx::same(&d, &fc, &ctx))
                     }
                 };
+                let first = !changed.contains_key(m.param);
+                if first {
+                    changed.insert(m.param, !unchanged);
+                }
                 if unchanged {
                     continue;
                 }
@@ -2085,11 +2106,56 @@ impl<'a, 'i> Writer<'a, 'i> {
         self.report.info(format!("markers of {what} added"));
     }
 
-    /// Rewrite a `Markers` object when FilmCraft's markers differ from Premiere's. Markers that
-    /// match keep their Premiere identity; the others are written new.
-    fn markers(&mut self, owner: Node<'a, 'i>, want: &[filmcraft_project::Marker], what: &str) {
-        // Premiere's markers as the importer read them
-        let mut have: Vec<(String, Option<&'a str>, MarkerKey)> = Vec::new();
+    /// A sequence's markers. Premiere lists the markers held by the `Sequence` itself
+    /// (`MarkerOwner`); markers on the sequence's master clip (notes some tools put there) are
+    /// not listed, and stay there. FilmCraft shows both: the ones that came from the master clip
+    /// go back to it, every other one is written on the Sequence (made when it has none).
+    fn sequence_markers(&mut self, pseq: Node<'a, 'i>, want: &[filmcraft_project::Marker], what: &str) {
+        let uid = pseq.attribute("ObjectUID").unwrap_or("");
+        let (_, master) = self.master_clips_of(uid, true);
+        let mut master_keys: Vec<MarkerKey> = master.map(|m| self.have_markers(m).into_iter().map(|h| h.2).collect()).unwrap_or_default();
+        let (mut on_master, mut on_seq) = (Vec::new(), Vec::new());
+        for m in want {
+            let k = MarkerKey::of(m);
+            match master_keys.iter().position(|h| *h == k) {
+                Some(i) => {
+                    master_keys.swap_remove(i);
+                    on_master.push(m.clone());
+                }
+                None => on_seq.push(m.clone()),
+            }
+        }
+        if let Some(m) = master {
+            self.markers(m, &on_master, what);
+        }
+        match self.ix.follow(pseq, &["MarkerOwner", "Markers"]) {
+            Some(own) => self.markers(own, &on_seq, what),
+            None if !on_seq.is_empty() => {
+                let id = self.alloc_id();
+                let entries = self.marker_entries(&on_seq, &[]);
+                self.created.push(format!(
+                    "<Markers ObjectID=\"{id}\" ClassID=\"bee50706-b524-416c-9f03-b596ce5f6866\" Version=\"4\"><Markers Version=\"1\">{entries}</Markers><ByGUID>byGUID</ByGUID><LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState><LastContentState>00000000-0000-0000-0000-000000000000</LastContentState></Markers>\n\t"
+                ));
+                // where Premiere puts it: after the Sequence's Node, before its links
+                let at = child(pseq, "PersistentGroupContainer")
+                    .map(|c| c.range().start)
+                    .or_else(|| child(pseq, "Node").map(|c| c.range().end))
+                    .or_else(|| pseq.first_child().map(|c| c.range().start));
+                let inst = self.here(pseq);
+                let owner = format!("<MarkerOwner Version=\"1\"><Markers ObjectRef=\"{id}\"/></MarkerOwner>");
+                match at {
+                    Some(at) => self.edit(inst, at..at, owner),
+                    None => self.insert(inst, pseq, &owner),
+                }
+                self.report.info(format!("markers of {what} added"));
+            }
+            None => {}
+        }
+    }
+
+    /// Premiere's markers in a `Markers` object as the importer read them: GUID, object id, value.
+    fn have_markers(&self, owner: Node<'a, 'i>) -> Vec<(String, Option<&'a str>, MarkerKey)> {
+        let mut have = Vec::new();
         if let Some(list) = child(owner, "Markers") {
             for m in list.children().filter(|n| n.has_tag_name("Marker")) {
                 let guid = child_text(m, "First").unwrap_or("").to_string();
@@ -2098,6 +2164,13 @@ impl<'a, 'i> Writer<'a, 'i> {
                 have.push((guid, obj.attribute("ObjectID"), key));
             }
         }
+        have
+    }
+
+    /// Rewrite a `Markers` object when FilmCraft's markers differ from Premiere's. Markers that
+    /// match keep their Premiere identity; the others are written new.
+    fn markers(&mut self, owner: Node<'a, 'i>, want: &[filmcraft_project::Marker], what: &str) {
+        let have = self.have_markers(owner);
         let mut want_keys: Vec<MarkerKey> = want.iter().map(MarkerKey::of).collect();
         want_keys.sort_by_key(|a| a.start);
         let mut have_sorted: Vec<&MarkerKey> = have.iter().map(|h| &h.2).collect();

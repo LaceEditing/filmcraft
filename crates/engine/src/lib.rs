@@ -249,6 +249,10 @@ pub struct EditorState {
     /// Timeline clipboard (serialized track items with their relative track index).
     #[serde(skip)]
     pub clipboard: Vec<(TrackKind, usize, filmcraft_project::TrackItem)>,
+    /// Frame size of the sequence the clipboard clips were copied from: pasted into a sequence of
+    /// another size, their Motion position keeps its place in the frame (as in Premiere).
+    #[serde(skip)]
+    pub clipboard_frame: Option<(u32, u32)>,
     pub default_video_transition: String,
     pub default_audio_transition: String,
     /// Selected edit points (trim mode).

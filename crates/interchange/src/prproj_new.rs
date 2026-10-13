@@ -244,12 +244,6 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
                         _ => {}
                     }
                 }
-                if c.gain_db.abs() > 1e-9 {
-                    *unwritten.entry("audio gain").or_insert(0) += 1;
-                }
-                if !c.enabled {
-                    *unwritten.entry("disabled clips (written enabled)").or_insert(0) += 1;
-                }
             }
         }
     }
@@ -1127,7 +1121,10 @@ impl<'p> Seed<'p> {
 
         // master clip: an audio and a video clip of the sequence
         let master_uid = self.uuid();
-        let markers = self.markers(&seq.markers);
+        // the master clip's own (source) markers stay empty; sequence markers belong to the
+        // Sequence itself, where Premiere shows them
+        let markers = self.markers(&[]);
+        let seq_markers = (!seq.markers.is_empty()).then(|| self.markers(&seq.markers));
         let logging = self.obj("ClipLoggingInfo", class::LOGGING, "");
         let chain = self.default_audio_chain(sample, false);
         let src_body = format!(
@@ -1299,7 +1296,8 @@ impl<'p> Seed<'p> {
             "Sequence",
             class::SEQUENCE,
             &format!(
-                "<Node Version=\"1\"><Properties Version=\"1\">{props}</Properties></Node><PersistentGroupContainer Version=\"1\"><LinkContainer Version=\"1\"></LinkContainer></PersistentGroupContainer><TrackGroups Version=\"1\">{groups}</TrackGroups>{}",
+                "<Node Version=\"1\"><Properties Version=\"1\">{props}</Properties></Node>{}<PersistentGroupContainer Version=\"1\"><LinkContainer Version=\"1\"></LinkContainer></PersistentGroupContainer><TrackGroups Version=\"1\">{groups}</TrackGroups>{}",
+                seq_markers.map(|m| format!("<MarkerOwner Version=\"1\"><Markers ObjectRef=\"{m}\"/></MarkerOwner>")).unwrap_or_default(),
                 el("Name", &name)
             ),
         );
