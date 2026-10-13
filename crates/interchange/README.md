@@ -162,9 +162,17 @@ committed).
   removed mask is reported. `prproj_mask.rs`.
 - Gaussian Blur (Legacy): Premiere's Blurriness is about 0.285 × Blurriness pixels of Gaussian σ
   in linear light (Blurriness 30 = σ 8.54 px, fitted to a Premiere export; a gamma-space blur fits
-  60 times worse), which FilmCraft's Gaussian Blur now uses.
+  60 times worse), which FilmCraft's Gaussian Blur now uses. Confirmed by a calibration render
+  (Blurriness 10 → σ 2.96 px, 60 → 17.5 px).
+- Gaussian Blur (the current one, `AE.Impact_Blur_FX`): a Gaussian in linear light with
+  σ ≈ 1.624 × Amount px (calibration render: Amount 2, 5, 20, 50 → σ 3.37, 8.24, 32.9, 81.0).
+- Mask Feather: a Gaussian edge across the (expanded) mask edge, σ = 0.362 × Feather px, centred
+  on the edge (calibration render: ellipse Feather 60 and rectangle Feather 20, rms error under
+  0.5/255; a linear or smoothstep ramp fits 4–9 times worse). Shape, expansion, rotation, scale
+  and inversion matched the render to within 0.02/255 on average.
 - Synthetic media (`ImplementationID` `42008e7a-…`, `FilePath` a four-character code): `COLR`
-  Color Matte (colour = the first three bytes of `ImporterPrefs`, R G B), `BLAK` Black Video,
+  Color Matte (colour = the first three bytes of `ImporterPrefs`, R G B — confirmed: FF8000 is
+  stored `FF 80 00 00 01 00 00 00` and renders 255,128,0), `BLAK` Black Video,
   `BARS` Bars and Tone, `TRNV` Transparent Video become FilmCraft's generators; a master clip with
   `IsAdjustmentLayer` true (over a Black Video) becomes an adjustment layer; `GRFV` is a graphic
   (title).

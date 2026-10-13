@@ -584,10 +584,10 @@ fn the_current_gaussian_blur_amount_comes_in() {
     let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();
     let blur = seq.video_tracks[0].items[1].effect("gaussian_blur").expect("the blur");
     let p = &blur.params["blurriness"];
-    // keyed 0 → 40 Amount: Blurriness × 1 / 0.285
+    // keyed 0 → 40 Amount: Blurriness × 1.624 / 0.285 (measured against a Premiere render)
     let ParamValue::Float(end) = p.keyframes.last().unwrap().value else { panic!() };
-    assert!((end - 40.0 / 0.285).abs() < 1e-6, "{end}");
-    assert!(report.to_string().contains("approximately"), "{report}");
+    assert!((end - 40.0 * 1.624 / 0.285).abs() < 1e-6, "{end}");
+    assert!(!report.to_string().contains("approximately"), "{report}");
     let (out, rep) = crate::prproj_write::export(&imp.project, doc.as_bytes(), &[], None).unwrap();
     assert_eq!(String::from_utf8(out).unwrap(), doc, "unchanged ({rep})");
 }

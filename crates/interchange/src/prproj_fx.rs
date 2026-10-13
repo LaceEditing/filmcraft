@@ -82,15 +82,64 @@ impl Component<'_, '_> {
             "" if self.display.is_none() => return Target::Ignore,
             _ => {}
         }
+        let want = if self.audio { EffectKind::Audio } else { EffectKind::Video };
+        // Premiere's own audio effects are saved by a GUID, usually without a display name
+        if self.audio
+            && let Some(id) = AUDIO_EFFECT_GUIDS.iter().find(|(g, _)| g.eq_ignore_ascii_case(self.match_name)).map(|(_, id)| *id)
+            && let Some(d) = filmcraft_project::find_effect(id).filter(|d| d.kind == want && !d.intrinsic)
+        {
+            return Target::Effect(d);
+        }
         let name = self.label().trim();
         let base = name.strip_suffix("(Legacy)").map(str::trim).unwrap_or(name);
-        let want = if self.audio { EffectKind::Audio } else { EffectKind::Video };
         match find_effect_by_name(base) {
             Some(d) if d.kind == want && !d.intrinsic => Target::Effect(d),
             _ => Target::Unsupported,
         }
     }
 }
+
+/// Premiere's audio effects by the GUID it saves as their `FilterMatchName` → FilmCraft's effect.
+/// Identified from a layout kit (every audio effect applied once, at defaults) by their parameter
+/// names, and where several share a parameter set (DeNoise / DeReverb, Single-band / Tube-modeled
+/// Compressor) by the order Premiere lists them in; Single-band Compressor, Parametric Equalizer,
+/// Studio Reverb and Automatic Click Remover also appear with their display names in projects.
+pub(crate) const AUDIO_EFFECT_GUIDS: &[(&str, &str)] = &[
+    ("433322b0-d25a-4cfa-a4f1-4a1ab2d7615b", "declicker"),
+    ("25f78adc-442b-4221-8a59-d19d3bf14687", "dehummer"),
+    ("8edcd326-33de-4a4d-985b-f1bf48ed1427", "parametric_eq"),
+    ("c4ad21d8-9748-4d79-b4a3-d88ab7e4be34", "analog_delay"),
+    ("c5ca9e29-df07-42a6-8800-ba80324e5cbc", "channel_mixer_a"),
+    ("1ffc7dd8-df1b-475b-bff6-f5240aa6a097", "chorus_flanger"),
+    ("99c2e75f-0bdb-48d8-8b51-2bac2e26b2cf", "convolution_reverb"),
+    ("ffbe710f-cd69-4139-ad26-65603616d9d4", "deesser"),
+    ("9b66ab13-4d1b-469a-88c6-b807fcf1df16", "distortion"),
+    ("f76dad9c-77da-477a-9939-eefefc5c23bd", "dynamics"),
+    ("4f327230-f04c-4c34-9ea5-a998b4459221", "fft_filter"),
+    ("d30b6731-3e00-4a11-9650-e816f58a9d12", "flanger"),
+    ("3792d46f-5036-4be6-ab5a-177622246a5d", "graphic_eq"),
+    ("0e133ef5-2371-48db-9b72-b4c441460391", "graphic_eq_20"),
+    ("c6ba8ed5-e0d5-4ed9-a209-08adec9b18a9", "graphic_eq_30"),
+    ("c23a8acb-affc-4ff4-9ca6-2b560b340a56", "guitar_suite"),
+    ("e0b23f05-f1a7-4ef7-9b50-7ec3e3002058", "hard_limiter"),
+    ("43f746b7-b34e-402b-8fb4-479cf3466264", "loudness_radar"),
+    ("094e8ed0-1fcc-4bec-ac4a-b358c4ce1f27", "mastering"),
+    ("3981e750-c8ae-40a2-889f-41a01c7efa03", "multiband_compressor"),
+    ("ee38cdc5-5914-4a75-b7dd-73a265e55c31", "notch"),
+    ("1eee85a7-3087-439e-906d-dc6204330e25", "dynamics_rack"),
+    ("d7ca44f4-7ac1-4243-a79e-59e283b71cca", "phaser"),
+    ("164b4e8a-7105-406b-b23b-1ef2cc4d8957", "pitch_shifter"),
+    ("4d0a6193-2769-4497-a28e-30e42d1bc376", "scientific_filter"),
+    ("2da3e2bc-5005-481c-bbeb-7689d3169edf", "single_band_compressor"),
+    ("f527fd12-24bf-411f-a46e-5b997cec32d4", "tube_compressor"),
+    ("fe767733-0969-46cf-bf45-fbf3d58ec46a", "stereo_expander"),
+    ("7ea99d31-ca8f-454f-acd7-81a258efb336", "studio_reverb"),
+    ("6e496ba0-3dbc-4c41-a272-7071daff0d95", "surround_reverb"),
+    ("82882adc-18cb-475b-b237-597576a5e707", "vocal_enhancer"),
+    ("c6762838-e451-4d22-9c90-b0eaa734605a", "denoise"),
+    ("aeb0b5ea-5024-4f02-8097-81f8fd7aba92", "dereverb"),
+    ("f14fee7d-fe5f-4202-b790-f53209e56411", "channel_volume_a"),
+];
 
 /// The targets of a chain's components. Only the first Motion, Opacity and clip volume of a clip
 /// map onto FilmCraft's intrinsic effects; a second one (Premiere allows it) is left as it is.
@@ -131,14 +180,18 @@ pub(crate) enum Conv {
     /// A number FilmCraft holds multiplied by this factor (Premiere's Gaussian Blur "Amount" ↔
     /// FilmCraft's Blurriness).
     Scale(f64),
+    /// A popup whose value `on` is FilmCraft's switch on, any other value off (the current
+    /// Gaussian Blur's Edge Behavior: 1, its default, repeats the edge pixels; written 1 / 0).
+    Flag(i64),
 }
 
 /// Match name of Premiere's current Gaussian Blur (the one that is not "Legacy").
 pub(crate) const IMPACT_BLUR: &str = "AE.Impact_Blur_FX";
-/// Blurriness per unit of that blur's Amount. PROVISIONAL: taken as Amount ≈ σ in pixels (how the
-/// effect is used in the projects seen: 2–3 to soften, 20 to hide a face); not yet measured
-/// against a Premiere render. FilmCraft's Blurriness is σ / 0.285 (see the README).
-pub(crate) const IMPACT_BLUR_AMOUNT: f64 = 1.0 / 0.285;
+/// Blurriness per unit of that blur's Amount. Measured on a Premiere render of Amount 2, 5, 20
+/// and 50 (a Gaussian in linear light, as the legacy blur): σ ≈ 1.624 px per unit of Amount
+/// (least squares through 0; 3.37, 8.24, 32.9 and 81.0 px). FilmCraft's Blurriness is
+/// σ / 0.285, so Blurriness = Amount × 1.624 / 0.285.
+pub(crate) const IMPACT_BLUR_AMOUNT: f64 = 1.624 / 0.285;
 
 /// One Premiere parameter mapped onto a FilmCraft parameter.
 pub(crate) struct Mapping<'a, 'i> {
@@ -180,13 +233,39 @@ pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Ma
             // Premiere's current Gaussian Blur: Amount (and Thickness, the same with Uniform Blur
             // on, as in every project seen) is the strength; the rest has no FilmCraft equivalent
             add(named("Amount"), "gaussian_blur", "blurriness", Conv::Scale(IMPACT_BLUR_AMOUNT));
+            // Edge Behavior 1 (the default) keeps the edges opaque, as Repeat Edge Pixels
+            add(named("Edge Behavior"), "gaussian_blur", "repeat_edge", Conv::Flag(1));
             for (name, neutral) in [("Uniform Blur", "true"), ("Chromatic Aberration", "0")] {
                 if named(name).and_then(start_value).is_some_and(|v| v.trim_end_matches('.') != neutral) {
                     unmapped.push(name.to_string());
                 }
             }
         }
+        // Premiere saves every setting of its audio effects normalized to 0…1 (Maximum Amplitude
+        // −0.1 dB is 0.999, an Attack of a few ms 0.02), on scales not measured yet: none is read
+        // or written as if it were in the effect's units
+        Target::Effect(def) if def.kind == EffectKind::Audio => {
+            for p in &c.params {
+                if let Some(name) = child_text(*p, "Name").map(str::trim).filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("Bypass"))
+                    && !unmapped.iter().any(|u| u == name)
+                {
+                    unmapped.push(name.to_string());
+                }
+            }
+        }
         Target::Effect(def) => {
+            // the legacy Gaussian Blur's Repeat Edge Pixels (parameter 3) is saved without a name
+            // by current Premiere versions (on by default: 6 601 of 6 601 in the projects seen)
+            if def.id == "gaussian_blur" {
+                let repeat = c.params.iter().copied().find(|p| {
+                    child_text(*p, "Name").is_none_or(|n| n.trim().is_empty())
+                        && child_text(*p, "ParameterID").map(str::trim) == Some("3")
+                        && start_value(*p).is_some_and(|v| v == "true" || v == "false")
+                });
+                if let Some(n) = repeat {
+                    out.push(Mapping { node: n, effect: def.id, param: "repeat_edge", conv: Conv::Bool });
+                }
+            }
             // a name Premiere uses for several parameters of one effect (Lumetri's "Intensity")
             // cannot be mapped by name; each FilmCraft parameter takes at most one value
             let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -311,6 +390,7 @@ fn parse_val(s: &str, conv: Conv) -> Option<Val> {
             (n >= 0 && (n as usize) < len).then_some(Val::F(n as f64))
         }
         Conv::Color => s.parse::<u64>().ok().map(Val::C),
+        Conv::Flag(on) => s.trim_end_matches('.').parse::<i64>().ok().map(|n| Val::F(if n == on { on as f64 } else { 0.0 })),
     }
 }
 
@@ -383,6 +463,7 @@ fn to_value(v: &Val, conv: Conv, ctx: &Ctx) -> ParamValue {
     match (v, conv) {
         (Val::F(x), Conv::Db) => ParamValue::Float(if *x > 0.0 { (20.0 * (x / UNITY_LEVEL).log10()).max(-200.0) } else { -200.0 }),
         (Val::F(x), Conv::Choice(_)) => ParamValue::Choice(x.round().max(0.0) as u32),
+        (Val::F(x), Conv::Flag(on)) => ParamValue::Bool(x.round() as i64 == on),
         (Val::C(c), _) => ParamValue::Color(unpack_color(*c)),
         (Val::F(x), Conv::Scale(k)) => ParamValue::Float(x * k),
         (Val::F(x), _) => ParamValue::Float(*x),
@@ -401,6 +482,7 @@ fn from_value(v: &ParamValue, conv: Conv, ctx: &Ctx) -> Option<Val> {
         (ParamValue::Choice(n), Conv::Choice(len)) if (*n as usize) < len => Val::F(*n as f64),
         (ParamValue::Color(c), Conv::Color) => Val::C(pack_color(*c)),
         (ParamValue::Bool(b), Conv::Bool) => Val::B(*b),
+        (ParamValue::Bool(b), Conv::Flag(on)) => Val::F(if *b { on as f64 } else { 0.0 }),
         (ParamValue::Vec2(p), Conv::FramePoint) => Val::P(norm(p.x, ctx.frame.0), norm(p.y, ctx.frame.1)),
         (ParamValue::Vec2(p), Conv::SourcePoint) => Val::P(norm(p.x, ctx.src.0), norm(p.y, ctx.src.1)),
         _ => return None,

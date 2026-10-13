@@ -394,6 +394,25 @@ pub(crate) fn layouts_in(bytes: &[u8], at_defaults: bool) -> Vec<(Need, bool, Gr
 /// The root attribute of a layout FilmCraft keeps that was learned at default settings.
 pub(crate) const AT_DEFAULTS: &str = "FilmCraftLayoutAtDefaults";
 
+/// Each audio effect component of `bytes`: match name, parameter names, display name if any.
+pub(crate) fn audio_components(bytes: &[u8]) -> Vec<(String, Vec<String>, Option<String>)> {
+    let mut out = Vec::new();
+    let Ok((raw, _)) = prproj_graph::decompress(bytes) else { return out };
+    let Ok(text) = std::str::from_utf8(&raw) else { return out };
+    let Ok(doc) = crate::xml::parse(text) else { return out };
+    let root = doc.root_element();
+    let ix = prproj_graph::Index::new(root);
+    for n in root.children().filter(|n| n.has_tag_name("AudioFilterComponent")) {
+        let Some(c) = crate::prproj_fx::component(&ix, n) else { continue };
+        if c.match_name.starts_with("Internal") {
+            continue;
+        }
+        let names = c.params.iter().filter_map(|p| crate::xml::child_text(*p, "Name")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        out.push((c.match_name.to_string(), names, c.display.map(str::to_string)));
+    }
+    out
+}
+
 /// Each effect component of `bytes`: its label and whether clips can be modelled on it.
 pub(crate) fn effect_census(bytes: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();

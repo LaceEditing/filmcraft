@@ -63,18 +63,34 @@ pub fn prepare(masks: &[Mask], t: Tick, px_scale: f32) -> Vec<FlatMask> {
         .collect()
 }
 
-/// The falloff of a signed (expanded) distance for a feather width.
+/// Premiere's mask feather is a Gaussian edge: σ = this × Feather, centred on the (expanded)
+/// edge (fitted to Premiere renders of feathered ellipse and rectangle masks: rms < 0.5/255).
+pub const FEATHER_SIGMA: f32 = 0.362;
+
+/// erf(x), Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
 #[inline]
-pub fn falloff(s: f32, feather: f32) -> f32 {
-    let w = feather.max(1.0);
-    let u = (s / w + 0.5).clamp(0.0, 1.0);
-    let smooth = u * u * (3.0 - 2.0 * u);
-    u + (smooth - u) * feather.min(1.0)
+pub fn erf(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let y = 1.0 - (((((1.061_405_4 * t - 1.453_152) * t) + 1.421_413_8) * t - 0.284_496_74) * t + 0.254_829_6) * t * (-x * x).exp();
+    if x < 0.0 { -y } else { y }
 }
 
-/// Distance band beyond which coverage is saturated (0 or 1).
+/// The falloff of a signed (expanded) distance for a feather width: a one-pixel antialiased edge
+/// at Feather 0, Premiere's Gaussian edge from Feather 1 (blended in between).
+#[inline]
+pub fn falloff(s: f32, feather: f32) -> f32 {
+    let u = (s + 0.5).clamp(0.0, 1.0);
+    if feather <= 0.0 {
+        return u;
+    }
+    let sigma = (FEATHER_SIGMA * feather).max(0.3);
+    let g = 0.5 * (1.0 + erf(s / (sigma * std::f32::consts::SQRT_2)));
+    u + (g - u) * feather.min(1.0)
+}
+
+/// Distance band beyond which coverage is saturated (0 or 1): four σ of the feather.
 fn band(m: &FlatMask) -> f32 {
-    m.expansion.abs() + m.feather.max(1.0) * 0.5 + 1.0
+    m.expansion.abs() + (4.0 * FEATHER_SIGMA * m.feather).max(0.5) + 1.0
 }
 
 #[inline]
@@ -271,15 +287,27 @@ mod tests {
     }
 
     #[test]
-    fn feather_is_a_symmetric_distance_falloff() {
-        let m = mask(MaskPath::rect(20.0, -100.0, 200.0, 200.0), 10.0);
-        let c = effect_coverage(&[m], Tick(0), 1.0, 60, 4).unwrap();
-        // edge at x = 20: 0.5 there, saturated 5 px away, symmetric
+    fn feather_is_premieres_gaussian_edge() {
+        let m = mask(MaskPath::rect(40.0, -100.0, 200.0, 200.0), 20.0);
+        let c = effect_coverage(&[m], Tick(0), 1.0, 120, 4).unwrap();
+        // edge at x = 40: 0.5 there, symmetric, monotonic
         let at = |x: usize| c[x];
-        assert!((at(19) + at(20) - 1.0).abs() < 1e-5, "{} {}", at(19), at(20));
-        assert!(at(13) < 1e-6 && at(26) > 1.0 - 1e-6, "{} {}", at(13), at(26));
-        for x in 14..26 {
+        assert!((at(39) + at(40) - 1.0).abs() < 1e-4, "{} {}", at(39), at(40));
+        for x in 1..100 {
             assert!(at(x + 1) >= at(x), "monotonic");
+        }
+        // 10-90 % across 2.563 σ = 0.928 × Feather (Premiere: 18.7 px at Feather 20)
+        let cross = |v: f32| (0..119).find(|&x| at(x + 1) >= v).map(|x| x as f32 + (v - at(x)) / (at(x + 1) - at(x))).unwrap();
+        let w = cross(0.9) - cross(0.1);
+        assert!((w - 18.56).abs() < 0.5, "{w}");
+        // saturated four σ away
+        assert!(at(5) < 1e-4 && at(75) > 1.0 - 1e-4, "{} {}", at(5), at(75));
+    }
+
+    #[test]
+    fn erf_is_accurate() {
+        for (x, want) in [(0.0f32, 0.0f32), (0.5, 0.520_499_9), (1.0, 0.842_700_8), (2.0, 0.995_322_3), (-1.0, -0.842_700_8)] {
+            assert!((erf(x) - want).abs() < 2e-6, "{x}: {}", erf(x));
         }
     }
 

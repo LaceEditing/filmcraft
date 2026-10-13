@@ -103,7 +103,7 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
         nested: HashSet::new(),
         unmapped: BTreeMap::new(),
         mask_skips: BTreeMap::new(),
-        impact_blurs: 0,
+        audio_off: BTreeMap::new(),
     };
     imp.collect_links(root);
     match root.children().find(|n| n.has_tag_name("RootProjectItem")) {
@@ -126,10 +126,11 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
         let list: Vec<&str> = params.iter().map(String::as_str).collect();
         imp.report.warn(format!("effect \"{effect}\": parameter(s) {} not carried over (kept as they are when exporting back to Premiere)", list.join(", ")));
     }
-    if imp.impact_blurs > 0 {
-        imp.report.info(format!(
-            "{} Gaussian Blur effect(s): Premiere's blur Amount was converted to Blurriness approximately (not yet measured against Premiere)",
-            imp.impact_blurs
+    if !imp.audio_off.is_empty() {
+        let list: Vec<String> = imp.audio_off.iter().map(|(n, k)| if *k > 1 { format!("{n} (×{k})") } else { n.clone() }).collect();
+        imp.report.warn(format!(
+            "audio effects {} are shown switched off: Premiere saves their settings in a form FilmCraft can't read yet (Premiere keeps them as they are)",
+            list.join(", ")
         ));
     }
     for ((effect, why), n) in std::mem::take(&mut imp.mask_skips) {
@@ -188,8 +189,8 @@ struct Imp<'a, 'i, 'r> {
     unmapped: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// Effect masks that could not be carried over, by effect name and reason.
     mask_skips: BTreeMap<(String, prproj_mask::Skipped), usize>,
-    /// Premiere Gaussian Blurs (the current one) whose Amount was converted approximately.
-    impact_blurs: usize,
+    /// Premiere audio effects brought in switched off, by name.
+    audio_off: BTreeMap<String, usize>,
 }
 
 impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
@@ -690,16 +691,26 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 }
                 Target::Effect(def) => {
                     // an effect FilmCraft has: one instance per Premiere component, in order
-                    ti.effects.push(def.instance());
-                    if c.match_name == prproj_fx::IMPACT_BLUR {
-                        self.impact_blurs += 1;
+                    let mut e = def.instance();
+                    // Premiere's audio effect settings are saved on scales FilmCraft can't read
+                    // yet: shown switched off rather than played with other settings (Premiere
+                    // keeps its own: on/off is not written back)
+                    if def.kind == filmcraft_project::EffectKind::Audio {
+                        e.enabled = false;
+                        *self.audio_off.entry(def.name.to_string()).or_insert(0) += 1;
                     }
+                    ti.effects.push(e);
                 }
                 Target::Motion | Target::Opacity | Target::Volume => {}
             }
             let (maps, unmapped) = prproj_fx::mappings(c, target);
-            if !unmapped.is_empty() {
-                self.unmapped.entry(c.label().to_string()).or_default().extend(unmapped);
+            let audio = matches!(target, Target::Effect(d) if d.kind == filmcraft_project::EffectKind::Audio);
+            if !unmapped.is_empty() && !audio {
+                let label = match target {
+                    Target::Effect(d) => d.name.to_string(),
+                    _ => c.label().to_string(),
+                };
+                self.unmapped.entry(label).or_default().extend(unmapped);
             }
             for m in maps {
                 let Some(p) = prproj_fx::import_param(&m, ctx) else { continue };

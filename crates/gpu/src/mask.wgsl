@@ -27,11 +27,22 @@ struct MaskInfo {
 @group(0) @binding(5) var<storage, read_write> out_px: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read_write> out_cov: array<f32>;
 
+// erf, Abramowitz & Stegun 7.1.26 (as the CPU path)
+fn erf_approx(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.3275911 * abs(x));
+    let y = 1.0 - (((((1.0614054 * t - 1.453152) * t) + 1.4214138) * t - 0.28449674) * t + 0.2548296) * t * exp(-x * x);
+    return select(y, -y, x < 0.0);
+}
+
+// Premiere's feather: a Gaussian edge, sigma = 0.362 x Feather (one-pixel edge at Feather 0)
 fn falloff(s: f32, feather: f32) -> f32 {
-    let w = max(feather, 1.0);
-    let u = clamp(s / w + 0.5, 0.0, 1.0);
-    let smooth_u = u * u * (3.0 - 2.0 * u);
-    return u + (smooth_u - u) * min(feather, 1.0);
+    let u = clamp(s + 0.5, 0.0, 1.0);
+    if (feather <= 0.0) {
+        return u;
+    }
+    let sigma = max(0.362 * feather, 0.3);
+    let g = 0.5 * (1.0 + erf_approx(s / (sigma * 1.41421356)));
+    return u + (g - u) * min(feather, 1.0);
 }
 
 // MaskMode index: None 0, Add 1, Subtract 2, Intersect 3, Lighten 4, Darken 5, Difference 6.
@@ -67,7 +78,7 @@ fn seg_dist2(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 }
 
 fn mask_value(m: MaskInfo, p: vec2<f32>) -> f32 {
-    let band = abs(m.expansion) + max(m.feather, 1.0) * 0.5 + 1.0;
+    let band = abs(m.expansion) + max(4.0 * 0.362 * m.feather, 0.5) + 1.0;
     var sd = -band;
     if (m.len >= 3u) {
         var wind = 0;

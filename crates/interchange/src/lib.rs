@@ -471,6 +471,12 @@ pub fn prproj_test_document() -> String {
     prproj::test_document()
 }
 
+/// Every audio effect component of a `.prproj` (development aid): its `FilterMatchName` (a GUID for
+/// Premiere's own audio effects), parameter names, and display name when the project has one.
+pub fn prproj_audio_components(bytes: &[u8]) -> Vec<(String, Vec<String>, Option<String>)> {
+    prproj_new::audio_components(bytes)
+}
+
 /// Every effect component in a `.prproj` (development aid): its label and what FilmCraft makes of it
 /// (`model` when clips can be modelled on it, else why not).
 pub fn prproj_effect_census(bytes: &[u8]) -> Vec<(String, String)> {
