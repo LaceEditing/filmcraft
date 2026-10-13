@@ -432,8 +432,10 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
     // an effect or transition added here that this project has never used is laid out as in
     // another Premiere project FilmCraft has opened
     let models = premiere_layouts(s);
+    let measured = titles_from_top_left(&s.project);
+    let project = measured.as_ref().unwrap_or(&s.project);
     let (bytes, report) =
-        filmcraft_interchange::export_prproj_with(&s.project, &base, written, std::path::Path::new(&path).parent().and_then(|d| d.to_str()), &models)
+        filmcraft_interchange::export_prproj_with(project, &base, written, std::path::Path::new(&path).parent().and_then(|d| d.to_str()), &models)
             .map_err(|e| bad(e.to_string()))?;
     s.services.write_file(&path, &bytes).map_err(|e| bad(format!("{path}: {e}")))?;
     // Saving to Premiere Pro (Settings ▸ General): this is where Save writes from now on, and
@@ -458,6 +460,47 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"path": path, "sequences": wanted.iter().map(|i| i.0).collect::<Vec<_>>(), "report": lines, "unsaved": unsaved}))
 }
 
+/// Premiere places a text layer by the top-left corner of its text; a FilmCraft text layer may be
+/// placed by its text's own origin (`top_left_origin` off, the first line's baseline). Such layers
+/// are given to the writer measured from the top-left, their anchor moved so the text stays where
+/// it is. None: every text layer already is.
+pub(crate) fn titles_from_top_left(project: &filmcraft_project::Project) -> Option<filmcraft_project::Project> {
+    use filmcraft_project::{ParamValue, graphic};
+    let needs = |e: &filmcraft_project::EffectInstance| {
+        e.effect == graphic::TEXT_LAYER && !matches!(e.params.get("top_left_origin").map(|p| &p.value), Some(ParamValue::Bool(true)))
+    };
+    let any =
+        project.sequences().filter_map(|i| i.as_sequence()).flat_map(|q| q.all_tracks()).flat_map(|t| t.items.iter()).flat_map(|c| c.effects.iter()).any(needs);
+    if !any {
+        return None;
+    }
+    let mut p = project.clone();
+    for it in p.items.values_mut() {
+        let filmcraft_project::ItemKind::Sequence(q) = &mut it.kind else { continue };
+        let frame = (q.settings.width, q.settings.height);
+        for t in q.all_tracks_mut() {
+            for c in &mut t.items {
+                for e in c.effects.iter_mut().filter(|e| needs(e)) {
+                    let Some(spec) = graphic::eval_layer(e, filmcraft_time::Tick(0), frame) else { continue };
+                    let graphic::LayerContent::Text(tp) = &spec.content else { continue };
+                    let b = filmcraft_render::graphic_clip::text_layout(tp).bounds;
+                    let (dx, dy) = (f64::from(b[0]), f64::from(b[1]));
+                    if let Some(a) = e.params.get_mut("anchor") {
+                        a.map_values(|v| match v {
+                            ParamValue::Vec2(v) => ParamValue::Vec2(filmcraft_geom::Vec2::new(v.x - dx, v.y - dy)),
+                            other => other,
+                        });
+                    } else {
+                        e.params.insert("anchor".into(), filmcraft_project::Param::new(ParamValue::Vec2(filmcraft_geom::Vec2::new(-dx, -dy))));
+                    }
+                    e.params.insert("top_left_origin".into(), filmcraft_project::Param::new(ParamValue::Bool(true)));
+                }
+            }
+        }
+    }
+    Some(p)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Premiere Pro projects: new ones
 // ---------------------------------------------------------------------------------------------
@@ -470,7 +513,8 @@ pub fn create_prproj(s: &mut Session, path: &str, adopt: bool) -> Result<Value> 
     let path_map = premiere_drives(s);
     let models = if needs_layouts(&s.project) { premiere_layouts(s) } else { Vec::new() };
     let opts = filmcraft_interchange::prproj_new::CreateOptions { dest_dir, path_map: path_map.clone(), models };
-    let (bytes, report) = filmcraft_interchange::create_prproj(&s.project, &opts).map_err(|e| bad(e.to_string()))?;
+    let measured = titles_from_top_left(&s.project);
+    let (bytes, report) = filmcraft_interchange::create_prproj(measured.as_ref().unwrap_or(&s.project), &opts).map_err(|e| bad(e.to_string()))?;
     let mut lines = report_json(&report);
     // a .prproj FilmCraft did not write for this project is kept
     let ours = s.premiere_save_path.as_deref() == Some(path);

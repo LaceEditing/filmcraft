@@ -1,145 +1,5 @@
-//! Premiere Pro titles: the value of a text layer's `Source Text` parameter (component
-//! `AE.ADBE Text`), read from project files Premiere saved; no application internals were
-//! inspected. The value is base64 in `StartKeyframeValue`: an 8-byte length, the marker
-//! `44 33 22 11`, then a FlatBuffers buffer (root table → field 0: the text document).
-//!
-//! Observed fields of the text document (field numbers are vtable slots), checked against a
-//! title in a project and the same frame of the video Premiere exported from it:
-//! - 0: the text runs, each a table of (0) its text and (1) its style;
-//! - 1: the font PostScript names used (`FatFrank-Heavy`);
-//! - 2, 3: the text box width and height in pixels; 4: 2 for paragraph (area) text;
-//! - 5: paragraph alignment (absent / 0 left, 1 centre, 2 right).
-//!
-//! Style: 1 font size in pixels (absent: 100); 2 fill colour, a table of red / green / blue bytes
-//! that are 255 unless stored (absent: white); 4 stroke colour (same layout); 5 stroke on (1);
-//! 6 stroke width in pixels. The layer's origin (Position, Anchor Point) is the top-left corner of
-//! the text's bounds. Shadows, backgrounds, gradients and per-character styles are not read.
-
-/// A decoded Premiere title.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Title {
-    pub text: String,
-    /// PostScript name of the first font (`FatFrank-Heavy`).
-    pub font: Option<String>,
-    pub size: f32,
-    pub fill: [u8; 3],
-    /// Stroke colour and width.
-    pub stroke: Option<([u8; 3], f32)>,
-    /// Paragraph text box (width, height); None for point text.
-    pub area: Option<(f32, f32)>,
-    /// 0 left, 1 centre, 2 right.
-    pub align: u32,
-}
-
-/// Bounds-checked FlatBuffers reads over a buffer of untrusted bytes.
-struct Fb<'a> {
-    b: &'a [u8],
-}
-
-impl Fb<'_> {
-    fn bytes<const N: usize>(&self, at: usize) -> Option<[u8; N]> {
-        self.b.get(at..at.checked_add(N)?)?.try_into().ok()
-    }
-    fn u8(&self, at: usize) -> Option<u8> {
-        self.b.get(at).copied()
-    }
-    fn u16(&self, at: usize) -> Option<u16> {
-        self.bytes::<2>(at).map(u16::from_le_bytes)
-    }
-    fn u32(&self, at: usize) -> Option<u32> {
-        self.bytes::<4>(at).map(u32::from_le_bytes)
-    }
-    fn i32(&self, at: usize) -> Option<i32> {
-        self.bytes::<4>(at).map(i32::from_le_bytes)
-    }
-    fn f32(&self, at: usize) -> Option<f32> {
-        self.bytes::<4>(at).map(f32::from_le_bytes).filter(|v| v.is_finite())
-    }
-    /// The position an offset stored at `at` points to.
-    fn deref(&self, at: usize) -> Option<usize> {
-        at.checked_add(self.u32(at)? as usize).filter(|p| *p < self.b.len())
-    }
-    /// Where field `slot` of the table at `t` is stored (None: absent).
-    fn field(&self, t: usize, slot: usize) -> Option<usize> {
-        let vt = (t as i64).checked_sub(self.i32(t)? as i64)?;
-        let vt = usize::try_from(vt).ok()?;
-        let vsize = self.u16(vt)? as usize;
-        let entry = 4 + 2 * slot;
-        if entry + 2 > vsize {
-            return None;
-        }
-        let off = self.u16(vt + entry)? as usize;
-        (off != 0).then(|| t + off)
-    }
-    fn table(&self, t: usize, slot: usize) -> Option<usize> {
-        self.deref(self.field(t, slot)?)
-    }
-    fn string_at(&self, at: usize) -> Option<String> {
-        let s = self.deref(at)?;
-        let len = self.u32(s)? as usize;
-        let bytes = self.b.get(s.checked_add(4)?..s.checked_add(4)?.checked_add(len)?)?;
-        Some(String::from_utf8_lossy(bytes).into_owned())
-    }
-    /// The element positions of a vector of offsets (at most 10 000).
-    fn vector(&self, t: usize, slot: usize) -> Vec<usize> {
-        let Some(v) = self.field(t, slot).and_then(|f| self.deref(f)) else { return Vec::new() };
-        let n = self.u32(v).unwrap_or(0).min(10_000) as usize;
-        (0..n).map(|i| v + 4 + 4 * i).take_while(|p| p + 4 <= self.b.len()).collect()
-    }
-    /// An RGB table whose channels are 255 unless stored.
-    fn rgb(&self, t: usize) -> [u8; 3] {
-        [0, 1, 2].map(|i| self.field(t, i).and_then(|f| self.u8(f)).unwrap_or(255))
-    }
-}
-
-/// Decode a `Source Text` value (the bytes behind its base64).
-pub(crate) fn decode(bytes: &[u8]) -> Option<Title> {
-    if bytes.get(8..12)? != [0x44, 0x33, 0x22, 0x11] {
-        return None;
-    }
-    let fb = Fb { b: bytes.get(12..)? };
-    let root = fb.deref(0)?;
-    let doc = fb.table(root, 0)?;
-    let runs = fb.vector(doc, 0);
-    let mut text = String::new();
-    let mut style = None;
-    for r in &runs {
-        let Some(run) = fb.deref(*r) else { continue };
-        if let Some(s) = fb.field(run, 0).and_then(|f| fb.string_at(f)) {
-            text.push_str(&s);
-        }
-        if style.is_none() {
-            style = fb.table(run, 1);
-        }
-    }
-    let font = fb.vector(doc, 1).first().and_then(|p| fb.string_at(*p));
-    let mut size = 100.0;
-    let mut fill = [255; 3];
-    let mut stroke = None;
-    if let Some(st) = style {
-        if let Some(v) = fb.field(st, 1).and_then(|f| fb.f32(f)) {
-            size = v.clamp(0.1, 100_000.0);
-        }
-        if let Some(t) = fb.table(st, 2) {
-            fill = fb.rgb(t);
-        }
-        let on = fb.field(st, 5).and_then(|f| fb.u8(f)) == Some(1);
-        if on {
-            let colour = fb.table(st, 4).map(|t| fb.rgb(t)).unwrap_or([255; 3]);
-            let width = fb.field(st, 6).and_then(|f| fb.f32(f)).unwrap_or(0.0).clamp(0.0, 10_000.0);
-            if width > 0.0 {
-                stroke = Some((colour, width));
-            }
-        }
-    }
-    let dim = |slot| fb.field(doc, slot).and_then(|f| fb.f32(f)).filter(|v| *v > 0.0 && *v < 100_000.0);
-    let area = match (fb.field(doc, 4).and_then(|f| fb.u32(f)), dim(2), dim(3)) {
-        (Some(2), Some(w), Some(h)) => Some((w, h)),
-        _ => None,
-    };
-    let align = fb.field(doc, 5).and_then(|f| fb.u32(f)).filter(|a| *a <= 2).unwrap_or(0);
-    Some(Title { text, font, size, fill, stroke, area, align })
-}
+//! Base64 for Premiere's binary values (titles, colour mattes, masks) and a hand-built title
+//! value used by tests; titles themselves are read and written by `prproj_title`.
 
 /// Base64 (standard alphabet; whitespace skipped, `=` ends the data) → bytes. None on any other
 /// character.
@@ -183,24 +43,6 @@ pub(crate) fn base64_encode(b: &[u8]) -> String {
         }
     }
     out
-}
-
-/// A PostScript font name as (family, style): `FatFrank-Heavy` → (`FatFrank`, `Heavy`),
-/// `Lato-BoldItalic` → (`Lato`, `Bold Italic`), `Impact` → (`Impact`, `Regular`).
-pub(crate) fn font_family_style(ps: &str) -> (String, String) {
-    let (family, style) = match ps.rsplit_once('-') {
-        Some((f, s)) if !f.is_empty() && !s.is_empty() => (f, s),
-        _ => (ps, "Regular"),
-    };
-    // `BoldItalic` → `Bold Italic`
-    let mut spaced = String::new();
-    for (i, c) in style.chars().enumerate() {
-        if i > 0 && c.is_uppercase() && !spaced.ends_with(' ') {
-            spaced.push(' ');
-        }
-        spaced.push(c);
-    }
-    (family.to_string(), spaced)
 }
 
 #[cfg(test)]
@@ -268,23 +110,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_premiere_title_is_decoded() {
-        let t = decode(&fifty()).expect("decodes");
-        assert_eq!(t.text, "50");
-        assert_eq!(t.font.as_deref(), Some("FatFrank-Heavy"));
-        assert!((t.size - 399.41).abs() < 1e-3);
-        assert_eq!(t.fill, [255, 255, 255], "no fill stored: white");
-        assert_eq!(t.stroke, Some(([0, 0, 0], 26.0)));
-        assert_eq!((t.area, t.align), (Some((2125.0, 539.0)), 1));
-    }
-
-    #[test]
     fn damaged_values_never_panic() {
         let good = fifty();
-        assert!(decode(&[]).is_none());
-        assert!(decode(&good[..11]).is_none());
-        for cut in 12..good.len() {
-            let _ = decode(&good[..cut]);
+        for cut in 0..good.len() {
+            let _ = crate::prproj_title::Tree::read(&good[..cut]);
         }
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         for _ in 0..2000 {
@@ -296,7 +125,7 @@ pub(crate) mod tests {
                 let i = 12 + (seed as usize) % (b.len() - 12);
                 b[i] = (seed >> 32) as u8;
             }
-            let _ = decode(&b);
+            let _ = crate::prproj_title::Tree::read(&b);
         }
     }
 
@@ -313,12 +142,5 @@ pub(crate) mod tests {
         assert_eq!(base64("AQA=").as_deref(), Some(&[1u8, 0][..]));
         assert_eq!(base64("SGVs\nbG8=").as_deref(), Some(&b"Hello"[..]));
         assert!(base64("not*base64").is_none());
-    }
-
-    #[test]
-    fn postscript_names_split_into_family_and_style() {
-        assert_eq!(font_family_style("FatFrank-Heavy"), ("FatFrank".into(), "Heavy".into()));
-        assert_eq!(font_family_style("Lato-BoldItalic"), ("Lato".into(), "Bold Italic".into()));
-        assert_eq!(font_family_style("Impact"), ("Impact".into(), "Regular".into()));
     }
 }

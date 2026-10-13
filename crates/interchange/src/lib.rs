@@ -42,6 +42,7 @@ mod prproj_intrinsic;
 mod prproj_mask;
 pub mod prproj_new;
 mod prproj_text;
+mod prproj_title;
 mod prproj_write;
 
 mod common;

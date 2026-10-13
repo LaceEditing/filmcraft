@@ -66,6 +66,8 @@ pub struct FaceInfo {
     pub style: String,
     pub weight: u16,
     pub italic: bool,
+    /// PostScript name (empty if the face has none).
+    pub postscript: String,
     pub index: u32,
     pub data: FaceData,
     /// "bundled", "system", …
@@ -143,7 +145,7 @@ impl FontSource for DirectorySource {
 }
 
 fn info_from(n: FaceNames, data: FaceData, origin: &'static str) -> FaceInfo {
-    FaceInfo { family: n.family, style: n.style, weight: n.weight, italic: n.italic, index: n.index, data, origin }
+    FaceInfo { family: n.family, style: n.style, weight: n.weight, italic: n.italic, postscript: n.postscript, index: n.index, data, origin }
 }
 
 /// A loaded (or loadable) face.
@@ -421,6 +423,31 @@ fn resolve_in(family: &str, style: &str) -> Option<Resolved> {
         italic_pen + (f.info.weight as i32 - w as i32).unsigned_abs()
     })?;
     Some(Resolved { face: best.id, synth_bold: w >= 600 && best.info.weight <= 500, synth_italic: it && !best.info.italic, missing: false })
+}
+
+/// The PostScript name of the face a family + style resolves to (`Arial`, `Bold` → `Arial-BoldMT`),
+/// as Premiere titles name fonts. None: the family is not installed or the face has no name.
+pub fn postscript_name(family: &str, style: &str) -> Option<String> {
+    let r = resolve(family, style);
+    if r.missing {
+        return None;
+    }
+    let f = face(r.face);
+    (!f.info.postscript.is_empty() && f.info.family.eq_ignore_ascii_case(family)).then(|| f.info.postscript.clone())
+}
+
+/// The family and style of an installed face by its PostScript name (`ArialMT` → `Arial`,
+/// `Regular`); None when no installed face has it.
+pub fn by_postscript(ps: &str) -> Option<(String, String)> {
+    let find = || all_faces().into_iter().find(|f| !f.info.postscript.is_empty() && f.info.postscript.eq_ignore_ascii_case(ps));
+    let f = find().or_else(|| {
+        if system_scanned() {
+            return None;
+        }
+        scan_system();
+        find()
+    })?;
+    Some((f.info.family.clone(), f.info.style.clone()))
 }
 
 /// Whether a family name reads as a serif face (Noto Serif, Shippori Mincho, …), to pick a Mincho

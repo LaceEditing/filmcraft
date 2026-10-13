@@ -220,6 +220,8 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
                 // ids from another Premiere project mean nothing here
                 c.origin = None;
                 c.effects.retain(|e| match filmcraft_project::effect::find_effect(&e.effect) {
+                    // a title's text layers are written into its own Premiere text layers
+                    Some(d) if d.id == filmcraft_project::graphic::TEXT_LAYER => true,
                     Some(d) if d.intrinsic || have.contains(&Need::Effect(d.id)) => true,
                     d => {
                         *effects.entry(d.map(|d| d.name.to_string()).unwrap_or_else(|| e.effect.clone())).or_insert(0) += 1;
@@ -297,7 +299,7 @@ fn playable(p: &Project, item: ItemId) -> std::result::Result<ItemId, &'static s
                 continue;
             }
             ItemKind::AdjustmentLayer { .. } => Ok(id),
-            ItemKind::Graphic { .. } => Err("graphics and titles"),
+            ItemKind::Graphic { .. } => Ok(id),
         };
     }
     Err("subclips")
@@ -595,6 +597,9 @@ pub(crate) struct Sources {
     /// An adjustment layer: Premiere marks every timeline clip of one `AdjustmentLayer` (without
     /// it the clip plays its black video, hiding everything below).
     pub(crate) adjustment: bool,
+    /// A title: its template clip holds a text layer (Premiere's `AE.ADBE Text` component), not
+    /// Motion and Opacity.
+    pub(crate) graphic: bool,
 }
 
 struct Seed<'p> {
@@ -1159,6 +1164,7 @@ impl<'p> Seed<'p> {
                 mono: false,
                 sample,
                 adjustment: false,
+                graphic: false,
             },
         );
 
@@ -1389,14 +1395,124 @@ impl<'p> Seed<'p> {
         )
     }
 
-    fn video_template(&mut self, src: &Sources, source: u64) {
-        let motion = intrinsic::motion(self, 1);
-        let opacity = intrinsic::opacity(self, 2);
-        let chain = self.obj(
-            "VideoComponentChain",
-            class::VIDEO_CHAIN,
-            &format!("<ComponentChain Version=\"3\">{}</ComponentChain>", list("Components", "Component", &[motion, opacity], false)),
+    /// A text layer as Premiere writes one (Graphics ▸ New Layer ▸ Text: `AE.ADBE Text` with its
+    /// 22 parameters), empty; the writer puts the text, formatting and transform in.
+    fn text_component(&mut self) -> u64 {
+        const ARB_PARAM: (&str, u32) = ("313e54d4-6903-49ad-b0bf-8262cdd10f4e", 3);
+        let value = crate::prproj_title::Tree::new_title("", "ArialMT").write();
+        let source = self.obj(
+            "ArbVideoComponentParam",
+            ARB_PARAM,
+            &format!(
+                "<Node Version=\"1\"><Properties Version=\"1\"><ECP.Graphics.Expanded>true</ECP.Graphics.Expanded></Properties></Node><Name>Source Text</Name><ParameterControlType>9</ParameterControlType><ParameterID>1</ParameterID><StartKeyframePosition>{NO_TIME}</StartKeyframePosition><StartKeyframeValue Encoding=\"base64\" BinaryHash=\"{}\">{}</StartKeyframeValue>",
+                crate::prproj_title::binary_hash(&value),
+                crate::prproj_text::base64_encode(&value)
+            ),
         );
+        let key = |v: &str| format!("<StartKeyframe>{NO_TIME},{v},0,0,0,0,0,0</StartKeyframe>");
+        let point = |v: &str| format!("<StartKeyframe>{NO_TIME},{v},0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe>");
+        // (class, body) of parameters 2…22, as Premiere 26.5 writes a new text layer
+        let rest: Vec<((&str, u32), String)> = vec![
+            (
+                class::BOOL_PARAM,
+                format!(
+                    "<Name>Transform</Name><ParameterControlType>11</ParameterControlType><ParameterID>2</ParameterID>{}<UpperBound>false</UpperBound>",
+                    key("false")
+                ),
+            ),
+            (class::POINT_PARAM, format!("<Name>Position</Name><ParameterID>3</ParameterID>{}", point("0.5:0.5"))),
+            (
+                class::FLOAT_PARAM,
+                format!("<Name>Scale</Name><ParameterID>4</ParameterID>{}<LowerBound>0</LowerBound><UpperBound>4000</UpperBound>", key("100.")),
+            ),
+            (
+                class::FLOAT_PARAM,
+                format!("<Name>Horizontal Scale</Name><ParameterID>5</ParameterID>{}<LowerBound>0</LowerBound><UpperBound>4000</UpperBound>", key("100.")),
+            ),
+            (class::BOOL_PARAM, format!("<Name> </Name><ParameterID>6</ParameterID>{}", key("true"))),
+            (
+                class::FLOAT_PARAM,
+                format!(
+                    "<Name>Rotation</Name><ParameterControlType>3</ParameterControlType><ParameterID>7</ParameterID>{}<LowerBound>-32768</LowerBound><UpperBound>32767</UpperBound>",
+                    key("0.")
+                ),
+            ),
+            (
+                class::FLOAT_PARAM,
+                format!("<Name>Opacity</Name><ParameterID>8</ParameterID>{}<LowerBound>0</LowerBound><UpperBound>100</UpperBound>", key("100.")),
+            ),
+            (class::POINT_PARAM, format!("<Name>Anchor Point</Name><ParameterID>9</ParameterID>{}", point("0:0"))),
+            (
+                class::BOOL_PARAM,
+                format!("<ParameterControlType>12</ParameterControlType><ParameterID>10</ParameterID>{}<UpperBound>false</UpperBound>", key("false")),
+            ),
+            (class::SLIDER_PARAM, format!("<Name> </Name><ParameterID>11</ParameterID>{}<LowerBound>0</LowerBound><UpperBound>32768</UpperBound>", key("0."))),
+            (class::SLIDER_PARAM, format!("<Name> </Name><ParameterID>12</ParameterID>{}<LowerBound>0</LowerBound><UpperBound>32768</UpperBound>", key("0."))),
+            (
+                class::SLIDER_PARAM,
+                format!("<Name>start</Name><ParameterID>13</ParameterID>{}<LowerBound>-100</LowerBound><UpperBound>1000000000</UpperBound>", key("-1.")),
+            ),
+            (
+                class::SLIDER_PARAM,
+                format!("<Name>end</Name><ParameterID>14</ParameterID>{}<LowerBound>-100</LowerBound><UpperBound>1000000000</UpperBound>", key("-1.")),
+            ),
+            (class::BOOL_PARAM, format!("<Name> </Name><ParameterID>15</ParameterID>{}", key("false"))),
+            (class::BOOL_PARAM, format!("<Name> </Name><ParameterID>16</ParameterID>{}", key("false"))),
+            (class::BOOL_PARAM, format!("<Name> </Name><ParameterID>17</ParameterID>{}", key("false"))),
+            (class::BOOL_PARAM, format!("<Name> </Name><ParameterID>18</ParameterID>{}", key("false"))),
+            (
+                class::FLOAT_PARAM,
+                format!("<Name>Parent Width</Name><ParameterID>19</ParameterID>{}<LowerBound>0</LowerBound><UpperBound>20000</UpperBound>", key("0.")),
+            ),
+            (
+                class::FLOAT_PARAM,
+                format!("<Name>Parent Height</Name><ParameterID>20</ParameterID>{}<LowerBound>0</LowerBound><UpperBound>20000</UpperBound>", key("0.")),
+            ),
+            (
+                class::FLOAT_PARAM,
+                format!(
+                    "<Name>Parent Rotation</Name><ParameterControlType>3</ParameterControlType><ParameterID>21</ParameterID>{}<LowerBound>-32768</LowerBound><UpperBound>32767</UpperBound>",
+                    key("0.")
+                ),
+            ),
+            (class::BOOL_PARAM, format!("<Name> </Name><ParameterID>22</ParameterID>{}", key("false"))),
+        ];
+        let tag = |c: (&str, u32)| if c == class::POINT_PARAM { "PointComponentParam" } else { "VideoComponentParam" };
+        let mut params = vec![source];
+        for (c, body) in rest {
+            params.push(self.obj(tag(c), c, &body));
+        }
+        self.obj(
+            "VideoFilterComponent",
+            class::VIDEO_FILTER,
+            &format!(
+                "<Component Version=\"7\">{}<ID>4</ID><DisplayName>Text</DisplayName></Component><PremiereFilterPrivateData Encoding=\"base64\" BinaryHash=\"c40c6399-6b26-8c2c-feaf-d01b0000000d\">AA==</PremiereFilterPrivateData><MatchName>AE.ADBE Text</MatchName><VideoFilterType>2</VideoFilterType>",
+                list("Params", "Param", &params, false)
+            ),
+        )
+    }
+
+    fn video_template(&mut self, src: &Sources, source: u64) {
+        let chain = if src.graphic {
+            // a title: default Motion and Opacity (none written), one text layer
+            let text = self.text_component();
+            self.obj(
+                "VideoComponentChain",
+                class::VIDEO_CHAIN,
+                &format!(
+                    "<DefaultMotion>true</DefaultMotion><DefaultOpacity>true</DefaultOpacity><DefaultMotionComponentID>1</DefaultMotionComponentID><DefaultOpacityComponentID>2</DefaultOpacityComponentID><ComponentChain Version=\"3\">{}</ComponentChain>",
+                    list("Components", "Component", &[text], false)
+                ),
+            )
+        } else {
+            let motion = intrinsic::motion(self, 1);
+            let opacity = intrinsic::opacity(self, 2);
+            self.obj(
+                "VideoComponentChain",
+                class::VIDEO_CHAIN,
+                &format!("<ComponentChain Version=\"3\">{}</ComponentChain>", list("Components", "Component", &[motion, opacity], false)),
+            )
+        };
         let clip = self.video_clip_of(src.markers, source, Some((0, TEMPLATE_LENGTH)), false, src.adjustment);
         let sub = self.sub_clip(clip, src);
         let (w, h) = src.size;
@@ -1612,6 +1728,8 @@ enum Synth {
     Matte([f32; 4]),
     Black,
     Bars,
+    /// A title (Graphics ▸ New Layer): `GRFV`, its layers on the clips.
+    Graphic,
 }
 
 /// `ImporterPrefs` of a new Bars and Tone (Rec 709) as Premiere saves it, with its hash.
@@ -1621,7 +1739,7 @@ const BARS_PREFS_HASH: &str = "073f2208-9c94-ecfe-928d-e63100000054";
 /// Whether FilmCraft can build an item as Premiere synthetic media.
 pub(crate) fn is_synthetic(item: &filmcraft_project::ProjectItem) -> bool {
     match &item.kind {
-        ItemKind::AdjustmentLayer { .. } => true,
+        ItemKind::AdjustmentLayer { .. } | ItemKind::Graphic { .. } => true,
         ItemKind::Media(m) => {
             matches!(
                 &m.media,
@@ -1648,6 +1766,7 @@ impl Seed<'_> {
         let (w0, h0, rate0) = seq.as_ref().map(|q| (q.width, q.height, q.frame_rate)).unwrap_or((1920, 1080, filmcraft_time::FrameRate::FPS_30));
         let (size, rate, adjustment, kind) = match &it.kind {
             ItemKind::AdjustmentLayer { width, height, rate, .. } => ((*width, *height), *rate, true, Synth::Black),
+            ItemKind::Graphic { width, height, rate } => ((*width, *height), *rate, false, Synth::Graphic),
             ItemKind::Media(m) => {
                 let size = m.info.video.as_ref().map(|v| (v.width, v.height)).unwrap_or((w0, h0));
                 let rate = m.info.video.as_ref().map(|v| v.frame_rate).unwrap_or(rate0);
@@ -1665,6 +1784,7 @@ impl Seed<'_> {
             Synth::Matte(_) => (*b"COLR", "Color Matte"),
             Synth::Black => (*b"BLAK", "Black Video"),
             Synth::Bars => (*b"BARS", "Bars and Tone - Rec 709"),
+            Synth::Graphic => (*b"GRFV", "Graphic"),
         };
         let fourcc = u32::from_be_bytes(fourcc);
         let name = it.name.clone();
@@ -1732,7 +1852,7 @@ impl Seed<'_> {
             }
             // Premiere's settings of a new Bars and Tone (Rec 709), as it saves them
             Synth::Bars => format!("<ImporterPrefs Encoding=\"base64\" BinaryHash=\"{BARS_PREFS_HASH}\">{BARS_PREFS}</ImporterPrefs>"),
-            Synth::Black => String::new(),
+            Synth::Black | Synth::Graphic => String::new(),
         };
         let conformed = if audio.is_some() { format!("<ConformedAudioRate>{sample}</ConformedAudioRate>") } else { String::new() };
         self.uobj(
@@ -1762,8 +1882,12 @@ impl Seed<'_> {
                 el("Name", &name)
             ),
         );
-        self.project_item(item, &name, &master_uid);
-        self.sources.insert(item, Sources { master: master_uid, name, video: Some(source), audio, markers, size, mono: false, sample, adjustment });
+        // a title made with Graphics ▸ New Layer has no Project panel item in Premiere
+        let graphic = matches!(kind, Synth::Graphic);
+        if !graphic {
+            self.project_item(item, &name, &master_uid);
+        }
+        self.sources.insert(item, Sources { master: master_uid, name, video: Some(source), audio, markers, size, mono: false, sample, adjustment, graphic });
         self.media_uid.push((item, media_uid));
     }
 

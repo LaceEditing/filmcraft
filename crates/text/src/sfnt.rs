@@ -11,6 +11,9 @@ pub struct FaceNames {
     pub family: String,
     pub style: String,
     pub full_name: String,
+    /// The PostScript name (`ArialMT`, `Arial-BoldMT`), as Premiere titles name fonts; empty when
+    /// the face has none.
+    pub postscript: String,
     pub weight: u16,
     pub italic: bool,
 }
@@ -75,6 +78,7 @@ fn read_face<R: Read + Seek>(r: &mut R, off: u64, index: u32) -> Option<FaceName
     let family = get(16).or_else(|| get(1))?;
     let style = get(17).or_else(|| get(2)).unwrap_or_else(|| "Regular".into());
     let full_name = get(4).unwrap_or_else(|| format!("{family} {style}"));
+    let postscript = get(6).unwrap_or_default();
     let (mut weight, mut italic) = (400u16, false);
     if let Some((oo, ol)) = os2
         && let Some(ob) = read_at(r, oo, ol.min(78))
@@ -84,7 +88,7 @@ fn read_face<R: Read + Seek>(r: &mut R, off: u64, index: u32) -> Option<FaceName
     }
     let sl = style.to_ascii_lowercase();
     italic |= sl.contains("italic") || sl.contains("oblique");
-    Some(FaceNames { index, family, style, full_name, weight, italic })
+    Some(FaceNames { index, family, style, full_name, postscript, weight, italic })
 }
 
 /// A name-table string by id, preferring Windows Unicode English, then any Unicode, then Mac Roman.

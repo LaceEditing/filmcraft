@@ -53,7 +53,7 @@ pub const META_FINGERPRINT: &str = "premiere.fingerprint";
 /// file (`FilePath` is a type code) and a still video stream the size of the canvas.
 const GRAPHIC_IMPORTER: &str = "42008e7a-de6f-4270-96de-7e287abb9b4b";
 /// Premiere's text layer component.
-const TEXT_COMPONENT: &str = "AE.ADBE Text";
+pub(crate) const TEXT_COMPONENT: &str = "AE.ADBE Text";
 
 /// Nested bins deeper than this are not followed.
 const MAX_DEPTH: usize = 64;
@@ -463,8 +463,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     fn title(&mut self, ti: &mut filmcraft_project::TrackItem, c: &prproj_fx::Component<'a, 'i>, ctx: &Ctx) {
         let Some(def) = filmcraft_project::effect::find_effect(filmcraft_project::graphic::TEXT_LAYER) else { return };
         let source = c.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim() == "Source Text"));
-        let decoded = source.and_then(|p| child(p, "StartKeyframeValue")).and_then(|v| self.binary(v)).and_then(|b| crate::prproj_text::decode(&b));
-        let Some(t) = decoded else {
+        let decoded = source.and_then(|p| child(p, "StartKeyframeValue")).and_then(|v| self.binary(v)).and_then(|b| crate::prproj_title::Tree::read(&b));
+        let Some(tree) = decoded else {
             self.report.warn("a Premiere title's text could not be read; it was imported empty");
             ti.effects.push(def.instance());
             return;
@@ -473,27 +473,12 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             self.report.info("animated title text was imported as its first value");
         }
         let mut e = def.instance();
-        let mut set = |id: &str, v: ParamValue| {
-            e.params.insert(id.to_string(), Param::new(v));
-        };
-        set("text", ParamValue::Text(t.text.clone()));
-        if let Some(ps) = &t.font {
-            let (family, style) = crate::prproj_text::font_family_style(ps);
-            set("font", ParamValue::Text(family));
-            set("font_style", ParamValue::Text(style));
-        }
-        set("size", ParamValue::Float(f64::from(t.size)));
-        set("align", ParamValue::Choice(t.align));
-        if let Some((w, _)) = t.area {
-            set("box_width", ParamValue::Float(f64::from(w)));
-        }
-        set("top_left_origin", ParamValue::Bool(true));
-        let rgb = |c: [u8; 3]| ParamValue::Color([f32::from(c[0]) / 255.0, f32::from(c[1]) / 255.0, f32::from(c[2]) / 255.0, 1.0]);
-        set("fill_color", rgb(t.fill));
-        if let Some((colour, width)) = t.stroke {
-            set("stroke", ParamValue::Bool(true));
-            set("stroke_color", rgb(colour));
-            set("stroke_width", ParamValue::Float(f64::from(width)));
+        let unread = crate::prproj_title::to_layer(&tree, &mut e);
+        for (what, on) in [("gradient fills", unread.gradient), ("kerning between characters", unread.kerning), ("more than two strokes", unread.more_strokes)]
+        {
+            if on {
+                self.unmapped.entry("Text".to_string()).or_default().insert(what.to_string());
+            }
         }
         // the transform, by name as for any effect
         let (maps, unmapped) = prproj_fx::mappings(c, prproj_fx::Target::Effect(def));

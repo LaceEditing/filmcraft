@@ -371,6 +371,7 @@ fn existing_sources<'a, 'i>(ix: &Index<'a, 'i>, root: Node<'a, 'i>, uid: &str, s
             mono,
             sample: sample.filter(|s| *s > 0).unwrap_or(TICKS_PER_SECOND / 48_000),
             adjustment: child_text(master, "IsAdjustmentLayer").is_some_and(|v| v.trim() == "true"),
+            graphic: false,
         });
     }
     None
@@ -439,6 +440,7 @@ fn write(project: &Project, text: &str, sequences: &[ItemId], dest_dir: Option<&
     if !borrowed.is_empty() {
         out.text = drop_objects(&out.text, borrowed)?;
     }
+    out.text = restore_payloads(&out.text, text)?;
     let known = problems(text);
     if !known.is_empty() {
         w.report.warn(format!("the original project already has {} unresolved reference(s); they were left as they are", known.len()));
@@ -624,6 +626,41 @@ fn drop_objects(text: &str, ids: &HashSet<String>) -> Result<String> {
     let edits: Vec<(Range<usize>, String)> =
         doc.root_element().children().filter(|n| n.attribute("ObjectID").is_some_and(|id| ids.contains(id))).map(|n| (n.range(), String::new())).collect();
     apply(text, 0, edits)
+}
+
+/// Premiere writes a binary value once and refers to it by its `BinaryHash` elsewhere (titles with
+/// the same text and formatting share one). A value FilmCraft rewrote may have been the one
+/// holding the data the others refer to: its data goes back into the first element still
+/// referring to it.
+fn restore_payloads(out: &str, original: &str) -> Result<String> {
+    let doc = crate::xml::parse(out).map_err(|e| err(format!("the written project does not parse: {e}")))?;
+    let (mut held, mut referring): (HashSet<&str>, Vec<Node>) = (HashSet::new(), Vec::new());
+    for n in doc.root_element().descendants().filter(Node::is_element) {
+        let Some(h) = n.attribute("BinaryHash") else { continue };
+        if n.text().is_some_and(|t| !t.trim().is_empty()) {
+            held.insert(h);
+        } else {
+            referring.push(n);
+        }
+    }
+    let orphans: Vec<Node> = referring.into_iter().filter(|n| n.attribute("BinaryHash").is_some_and(|h| !held.contains(h))).collect();
+    if orphans.is_empty() {
+        return Ok(out.to_string());
+    }
+    let odoc = crate::xml::parse(original).map_err(|e| err(format!("the original project does not parse: {e}")))?;
+    let data = crate::prproj::payloads(odoc.root_element());
+    let mut done = HashSet::new();
+    let mut edits = Vec::new();
+    for n in orphans {
+        let Some(h) = n.attribute("BinaryHash") else { continue };
+        if !done.insert(h) {
+            continue;
+        }
+        if let Some(content) = data.get(h) {
+            edits.push(insert_at_end(out, n, content.trim()));
+        }
+    }
+    apply(out, 0, edits)
 }
 
 /// The edit that puts `xml` just before `parent`'s closing tag (opening a self-closed one).
@@ -907,24 +944,57 @@ impl<'a, 'i> Writer<'a, 'i> {
         }
     }
 
-    /// Whether FilmCraft's text layer differs from the Premiere title it was imported from in what
-    /// is not written back (the text and its formatting live in Premiere's `Source Text` value).
-    fn title_edited(&mut self, comp: &prproj_fx::Component<'a, 'i>, e: &filmcraft_project::EffectInstance) -> bool {
-        let source = comp.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim() == "Source Text"));
-        let Some(t) = source.and_then(|p| child(p, "StartKeyframeValue")).and_then(|v| self.binary(v)).and_then(|b| crate::prproj_text::decode(&b)) else {
-            return false;
+    /// A title's text and formatting: FilmCraft's text layer written as the title's `Source Text`
+    /// when it differs from what was imported (on the original, so what FilmCraft does not hold
+    /// stays). Animated text is reported, not written.
+    fn write_title(&mut self, comp: &prproj_fx::Component<'a, 'i>, e: &filmcraft_project::EffectInstance, copies: &HashMap<&'a str, usize>, clip: &str) {
+        let Some(param) = comp.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim() == "Source Text")) else { return };
+        let Some(value) = child(param, "StartKeyframeValue") else { return };
+        let Some(orig) = self.binary(value).and_then(|b| crate::prproj_title::Tree::read(&b)) else { return };
+        // what FilmCraft holds of the original, and whether its layer still says that
+        let def = filmcraft_project::find_effect(filmcraft_project::graphic::TEXT_LAYER);
+        let mut was = match def {
+            Some(d) => d.instance(),
+            None => return,
         };
-        let text = |id: &str| match e.params.get(id).map(|p| &p.value) {
-            Some(filmcraft_project::ParamValue::Text(s)) => Some(s.clone()),
-            _ => None,
+        // only what the title itself sets
+        was.params.clear();
+        crate::prproj_title::to_layer(&orig, &mut was);
+        let same =
+            was.params.iter().all(|(id, p)| e.params.get(id).is_some_and(|q| format!("{:?}", q.value) == format!("{:?}", p.value) && q.keyframes.is_empty()))
+                && was.layer.as_ref().map(|l| &l.runs) == e.layer.as_ref().map(|l| &l.runs).filter(|r| !r.is_empty());
+        if same {
+            return;
+        }
+        if child(param, "Keyframes").is_some() {
+            self.report.warn(format!("title \"{clip}\": its text changes over time in Premiere; FilmCraft's changes to it are not written"));
+            return;
+        }
+        let animated: Vec<&str> =
+            e.params.iter().filter(|(id, p)| !p.keyframes.is_empty() && was.params.contains_key(id.as_str())).map(|(id, _)| id.as_str()).collect();
+        if !animated.is_empty() {
+            self.report.warn(format!("title \"{clip}\": animated text settings ({}) are written with their first value", animated.join(", ")));
+        }
+        // a paragraph box made in FilmCraft needs a height: room for the lines it has
+        let size = e.params.get("size").and_then(|p| p.value.as_f64()).unwrap_or(100.0) as f32;
+        let lines = match e.params.get("text").map(|p| &p.value) {
+            Some(filmcraft_project::ParamValue::Text(t)) => t.lines().count().max(1),
+            _ => 1,
         };
-        let num = |id: &str| e.params.get(id).and_then(|p| p.value.as_f64());
-        let animated = ["text", "size", "fill_color"].iter().any(|id| e.params.get(*id).is_some_and(|p| !p.keyframes.is_empty()));
-        let font = t.font.as_deref().map(crate::prproj_text::font_family_style);
-        animated
-            || text("text").as_deref() != Some(t.text.as_str())
-            || num("size").is_some_and(|v| (v - f64::from(t.size)).abs() > 1e-3)
-            || font.is_some_and(|(f, st)| text("font").as_deref() != Some(f.as_str()) || text("font_style").as_deref() != Some(st.as_str()))
+        let tree = crate::prproj_title::from_layer(e, filmcraft_time::Tick(0), Some(&orig), size * 1.25 * lines as f32 + size * 0.5);
+        if tree.dropped > 0 {
+            self.report.warn(format!("title \"{clip}\": {} setting(s) FilmCraft does not know were not kept", tree.dropped));
+        }
+        let bytes = tree.write();
+        let hash = crate::prproj_title::binary_hash(&bytes);
+        // (the parameter is the object: its copy, if this clip is one)
+        let inst = self.inst_of(param, copies);
+        self.edit(
+            inst,
+            value.range(),
+            format!("<StartKeyframeValue Encoding=\"base64\" BinaryHash=\"{hash}\">{}</StartKeyframeValue>", crate::prproj_text::base64_encode(&bytes)),
+        );
+        self.report.info(format!("title \"{clip}\": text and formatting written"));
     }
 
     /// Edits so far, counting a copied object as one.
@@ -1822,12 +1892,8 @@ impl<'a, 'i> Writer<'a, 'i> {
                     }
                     if def.id == filmcraft_project::graphic::TEXT_LAYER
                         && let Some(e) = found
-                        && self.title_edited(comp, e)
                     {
-                        self.report.warn(format!(
-                            "title \"{}\": changes to its text or formatting are not written to Premiere projects yet; Premiere keeps the original (position, size and opacity are written)",
-                            c.name
-                        ));
+                        self.write_title(comp, e, copies, &c.name);
                     }
                     found
                 }
@@ -1909,20 +1975,23 @@ impl<'a, 'i> Writer<'a, 'i> {
         let mut seen: HashMap<&str, usize> = HashMap::new();
         for e in &c.effects {
             let Some(def) = filmcraft_project::find_effect(&e.effect).filter(|d| !d.intrinsic) else { continue };
-            if def.id == filmcraft_project::graphic::TEXT_LAYER || def.id == filmcraft_project::graphic::SHAPE_LAYER {
+            if def.id == filmcraft_project::graphic::SHAPE_LAYER {
                 let n = seen.entry(e.effect.as_str()).or_insert(0);
                 *n += 1;
                 if *n > have.get(e.effect.as_str()).copied().unwrap_or(0) {
-                    self.report.warn(format!("a text or shape layer added to \"{}\" in FilmCraft is not written to Premiere projects yet", c.name));
+                    self.report.warn(format!("a shape layer added to \"{}\" in FilmCraft is not written to Premiere projects yet", c.name));
                 }
                 continue;
             }
+            let text_layer = def.id == filmcraft_project::graphic::TEXT_LAYER;
             let n = seen.entry(e.effect.as_str()).or_insert(0);
             *n += 1;
             if *n <= have.get(e.effect.as_str()).copied().unwrap_or(0) {
                 continue;
             }
-            let Some(model) = self.model_component(def, kind) else {
+            // a text layer added to a title: a copy of one of its own (else another title's)
+            let own = text_layer.then(|| comps.iter().find(|m| m.match_name == crate::prproj::TEXT_COMPONENT).cloned()).flatten();
+            let Some(model) = own.or_else(|| self.model_component(def, kind)) else {
                 self.missing.insert(crate::prproj_new::Need::Effect(def.id));
                 // a borrowed layout comes on the next pass, which needs a list to add it to
                 borrowing |= self.borrow;
@@ -1956,7 +2025,8 @@ impl<'a, 'i> Writer<'a, 'i> {
                 .filter(|p| e.params.get(p.id).is_some_and(|v| !v.keyframes.is_empty() || v.value != p.default))
                 .map(|p| p.label)
                 .collect();
-            if !lost.is_empty() {
+            // (a text layer's text and formatting live in its Source Text, written below)
+            if !lost.is_empty() && !text_layer {
                 self.report.warn(format!(
                     "\"{}\" on \"{}\": {} not written (Premiere keeps its default{})",
                     def.name,
@@ -1980,6 +2050,10 @@ impl<'a, 'i> Writer<'a, 'i> {
                 let t = prproj_fx::encode(m.node, pr.as_ref(), &fc, &ctx);
                 let pi = self.inst_of(m.node, &model_copies);
                 self.write_param(pi, m.node, &t);
+            }
+            if text_layer {
+                // its text and formatting
+                self.write_title(&model, e, &model_copies, &c.name);
             }
             added_refs.push(self.id_of(ci));
             self.report.info(format!("added \"{}\" to a clip (modelled on another one in the project)", def.name));

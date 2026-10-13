@@ -29,6 +29,7 @@ pub(crate) const MAX_TIME: i64 = 48 * 3600 * TICKS_PER_SECOND;
 const MAX_KEYS: usize = 100_000;
 
 /// One component of a clip's component chain.
+#[derive(Clone)]
 pub(crate) struct Component<'a, 'i> {
     pub node: Node<'a, 'i>,
     pub match_name: &'a str,

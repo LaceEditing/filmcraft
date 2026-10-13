@@ -340,3 +340,29 @@ fn a_clip_starting_before_its_source_still_saves() {
     assert!(!s.is_dirty(), "{r}");
     assert!(std::fs::read_to_string(&src).unwrap().contains(&format!("<Start>{}</Start>", 2 * S)), "the empty head is left out");
 }
+
+/// A title placed by its text's origin (the first line's baseline) is given to the Premiere
+/// writer measured from its top-left corner, as Premiere places text, with its anchor moved so it
+/// stays exactly where it is on screen.
+#[test]
+fn titles_are_measured_from_their_top_left_for_premiere() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let r = s.execute("graphics.newText", json!({"text": "Hello there", "position": [400.0, 300.0], "size": 80})).unwrap();
+    let clip = r["clip"].as_u64().unwrap();
+    let quad = |s: &mut Session| s.execute("graphics.list", json!({"clip": clip})).unwrap()["layers"][0]["quad"].clone();
+    let before = quad(&mut s);
+    let converted = crate::interchange::titles_from_top_left(&s.project).expect("a text layer to convert");
+    s.project = std::sync::Arc::new(converted);
+    let after = quad(&mut s);
+    for i in 0..4 {
+        for k in 0..2 {
+            let (a, b) = (before[i][k].as_f64().unwrap(), after[i][k].as_f64().unwrap());
+            assert!((a - b).abs() < 0.01, "corner {i}: {before} vs {after}");
+        }
+    }
+    let q = s.active_sequence().unwrap();
+    let e = q.all_tracks().flat_map(|t| t.items.iter()).find(|c| c.id.0 == clip).unwrap().effect("graphic_text").unwrap();
+    assert_eq!(e.params["top_left_origin"].value, filmcraft_project::ParamValue::Bool(true));
+    assert!(crate::interchange::titles_from_top_left(&s.project).is_none(), "nothing left to convert");
+}

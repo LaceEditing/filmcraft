@@ -300,3 +300,48 @@ fn layouts_with_settings_filmcraft_lacks_are_not_borrowed() {
     assert!(seq.video_tracks[0].items[0].effect("gaussian_blur").is_none());
     assert!(!String::from_utf8(prproj_graph::decompress(&bytes).unwrap().0).unwrap().contains("Secret Sauce"));
 }
+
+/// A title made in FilmCraft (two text layers) is written into a new project as Premiere writes
+/// one (`GRFV` media, a text layer per FilmCraft layer) and reads back as the same title.
+#[test]
+fn titles_are_written_into_new_projects() {
+    let (mut p, main, _) = project();
+    let graphic = p.add_item("Title", Label::Rose, ItemKind::Graphic { width: 1920, height: 1080, rate: FrameRate::FPS_30 }, None);
+    let layer = |text: &str, size: f64| {
+        let mut e = filmcraft_project::find_effect(filmcraft_project::graphic::TEXT_LAYER).unwrap().instance();
+        e.params.insert("text".into(), Param::new(ParamValue::Text(text.into())));
+        e.params.insert("size".into(), Param::new(ParamValue::Float(size)));
+        e.params.insert("top_left_origin".into(), Param::new(ParamValue::Bool(true)));
+        e
+    };
+    {
+        let q = p.sequence_mut(main).unwrap();
+        let mut c = q.video_tracks[0].items[0].clone();
+        c.id = filmcraft_project::ClipId(77_001);
+        c.item = graphic;
+        c.name = "Title".into();
+        c.link = None;
+        c.start = Tick(40 * S);
+        c.duration = Tick(3 * S);
+        c.source_in = Tick::ZERO;
+        c.speed = 1.0;
+        c.effects = filmcraft_project::effect::intrinsic_video();
+        c.effects.push(layer("Big words", 140.0));
+        c.effects.push(layer("small words", 50.0));
+        q.video_tracks[0].items.push(c);
+    }
+    let (bytes, report) = create(&p, &opts()).unwrap();
+    assert!(!report.mentions("graphics and titles"), "{report}");
+    let (back, _) = read(&bytes);
+    let seq = back.items.values().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
+    let c = seq.video_tracks[0].items.iter().find(|c| c.start == Tick(40 * S)).expect("the title clip");
+    let texts: Vec<String> = c
+        .effects
+        .iter()
+        .filter(|e| e.effect == filmcraft_project::graphic::TEXT_LAYER)
+        .map(|e| format!("{:?}/{:?}", e.params.get("text").map(|p| &p.value), e.params.get("size").map(|p| &p.value)))
+        .collect();
+    assert_eq!(texts.len(), 2, "{texts:?} {report}");
+    assert!(texts.iter().any(|t| t.contains("Big words") && t.contains("140.0")), "{texts:?}");
+    assert!(texts.iter().any(|t| t.contains("small words") && t.contains("50.0")), "{texts:?}");
+}

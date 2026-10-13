@@ -400,12 +400,12 @@ fn effects_choices_and_colours_added_in_filmcraft_are_written() {
 }
 
 #[test]
-fn titles_round_trip_and_text_edits_are_reported() {
+fn titles_round_trip_and_text_edits_are_written() {
     let plain = crate::prproj::tests::doc_with_title();
     let (imp, _) = import(plain.as_bytes(), Some("/edits/show"));
     let (out, report) = export(&imp.project, plain.as_bytes(), &[], None).unwrap();
     assert_eq!(String::from_utf8(out).unwrap(), plain, "unchanged: {report}");
-    // a moved title is written; its new text is reported, not written
+    // a moved title with new text: both are written (Source Text re-encoded on the original)
     let mut p = imp.project;
     let sid = seq_id(&p);
     {
@@ -417,9 +417,24 @@ fn titles_round_trip_and_text_edits_are_reported() {
     let back = read(&out);
     let seq = back.sequences().next().and_then(|i| i.as_sequence()).unwrap();
     assert_eq!(seq.video_tracks[1].items[0].start, Tick(4 * S));
-    assert!(report.to_string().contains("changes to its text or formatting are not written"), "{report}");
+    assert!(report.mentions("text and formatting written"), "{report}");
     let t = seq.video_tracks[1].items[0].effect("graphic_text").unwrap();
-    assert_eq!(t.params.get("text").map(|x| x.value.clone()), Some(ParamValue::Text("50".into())), "Premiere keeps its text");
+    assert_eq!(t.params.get("text").map(|x| x.value.clone()), Some(ParamValue::Text("60".into())), "the new text");
+    for id in ["font", "size", "stroke", "stroke_width", "align", "box_width"] {
+        assert_eq!(
+            format!("{:?}", t.params.get(id).map(|x| &x.value)),
+            format!(
+                "{:?}",
+                read(plain.as_bytes()).sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[1].items[0]
+                    .effect("graphic_text")
+                    .unwrap()
+                    .params
+                    .get(id)
+                    .map(|x| &x.value)
+            ),
+            "{id} kept"
+        );
+    }
 }
 
 /// Masks survive a round trip: untouched they stay byte-identical; Feather / Opacity / Expansion /
@@ -986,4 +1001,114 @@ fn audio_effect_settings_read_and_write_in_their_units() {
     let (again_imp, _) = import(text.as_bytes(), None);
     let (again, _) = export(&again_imp.project, text.as_bytes(), &[], None).unwrap();
     assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
+}
+
+/// A title made in FilmCraft (a graphic with two text layers) is written as Premiere writes one:
+/// `GRFV` media, a clip whose chain holds a text layer per FilmCraft layer, the text and
+/// formatting in `Source Text`; read back, it is the same title. Before, it was left out.
+#[test]
+fn titles_made_in_filmcraft_are_written() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let graphic = p.add_item(
+        "Lower Third",
+        filmcraft_project::Label::Rose,
+        ItemKind::Graphic { width: 1920, height: 1080, rate: filmcraft_time::FrameRate::new(30, 1) },
+        None,
+    );
+    let layer = |text: &str, size: f64, x: f64| {
+        let mut e = filmcraft_project::find_effect(filmcraft_project::graphic::TEXT_LAYER).unwrap().instance();
+        for (id, v) in [
+            ("text", ParamValue::Text(text.into())),
+            ("font", ParamValue::Text("Inter".into())),
+            ("font_style", ParamValue::Text("Bold".into())),
+            ("size", ParamValue::Float(size)),
+            ("fill_color", ParamValue::Color([1.0, 0.8, 0.0, 1.0])),
+            ("stroke", ParamValue::Bool(true)),
+            ("stroke_width", ParamValue::Float(6.0)),
+            ("top_left_origin", ParamValue::Bool(true)),
+            ("position", ParamValue::Vec2(filmcraft_geom::Vec2::new(x, 800.0))),
+        ] {
+            e.params.insert(id.into(), Param::new(v));
+        }
+        e
+    };
+    {
+        let q = p.sequence_mut(sid).unwrap();
+        let mut c = q.video_tracks[0].items[0].clone();
+        c.id = ClipId(90_001);
+        c.origin = None;
+        c.link = None;
+        c.item = graphic;
+        c.name = "Lower Third".into();
+        c.source_in = Tick(0);
+        c.start = Tick(10 * S);
+        c.duration = Tick(2 * S);
+        c.speed = 1.0;
+        c.reverse = false;
+        c.effects = filmcraft_project::effect::intrinsic_video();
+        c.effects.push(layer("Jane Doe", 90.0, 160.0));
+        c.effects.push(layer("Editor", 50.0, 160.0));
+        q.video_tracks[0].items.push(c);
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    assert!(!report.mentions("not written"), "{report}");
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(text.contains(&format!("<FilePath>{}</FilePath>", u32::from_be_bytes(*b"GRFV"))), "Premiere's title media");
+    assert_eq!(text.matches("<MatchName>AE.ADBE Text</MatchName>").count(), 2, "one text layer per FilmCraft layer");
+    let back = read(&out);
+    let q = back.sequences().find_map(|i| i.as_sequence()).unwrap();
+    let c = q.video_tracks[0].items.iter().find(|c| c.start == Tick(10 * S)).expect("the title clip");
+    assert!(matches!(back.item(c.item).unwrap().kind, ItemKind::Graphic { .. }));
+    let layers: Vec<&filmcraft_project::EffectInstance> = c.effects.iter().filter(|e| e.effect == filmcraft_project::graphic::TEXT_LAYER).collect();
+    assert_eq!(layers.len(), 2, "{report}");
+    let get = |e: &filmcraft_project::EffectInstance, id: &str| format!("{:?}", e.params.get(id).map(|p| &p.value));
+    let texts: Vec<String> = layers.iter().map(|e| get(e, "text")).collect();
+    assert!(texts.contains(&get(&layer("Jane Doe", 90.0, 160.0), "text")) && texts.contains(&get(&layer("Editor", 50.0, 160.0), "text")), "{texts:?}");
+    let jane = layers.iter().find(|e| get(e, "text").contains("Jane")).unwrap();
+    for id in ["font", "font_style", "size", "fill_color", "stroke", "stroke_width"] {
+        assert_eq!(get(jane, id), get(&layer("Jane Doe", 90.0, 160.0), id), "{id}");
+    }
+    let ParamValue::Vec2(pos) = jane.params["position"].value else { panic!() };
+    assert!((pos.x - 160.0).abs() < 0.5 && (pos.y - 800.0).abs() < 0.5, "{pos:?}");
+    // saved again unchanged: the same document
+    let (again_imp, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&again_imp.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
+}
+
+/// Premiere writes a binary value once and refers to it by hash elsewhere (titles sharing their
+/// text). Editing the title that holds the value keeps it for the others: saving used to fail
+/// with an unresolved BinaryHash.
+#[test]
+fn editing_the_title_holding_shared_data_keeps_it_for_the_others() {
+    // the title holds the value; the Blob only refers to it
+    let base = crate::prproj::tests::doc_with_title();
+    let data = {
+        let i = base.find("<Data Encoding=\"base64\" BinaryHash=\"tt-1\">").unwrap();
+        let j = base[i..].find("</Data>").unwrap();
+        base[i + "<Data Encoding=\"base64\" BinaryHash=\"tt-1\">".len()..i + j].to_string()
+    };
+    let plain =
+        base.replace(&format!("<Data Encoding=\"base64\" BinaryHash=\"tt-1\">{data}</Data>"), "<Data Encoding=\"base64\" BinaryHash=\"tt-1\"/>").replace(
+            "<StartKeyframeValue Encoding=\"base64\" BinaryHash=\"tt-1\"/>",
+            &format!("<StartKeyframeValue Encoding=\"base64\" BinaryHash=\"tt-1\">{data}</StartKeyframeValue>"),
+        );
+    assert_eq!(plain.matches(&data).count(), 1, "the fixture changed");
+    let (imp, _) = import(plain.as_bytes(), Some("/edits/show"));
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    p.sequence_mut(sid).unwrap().video_tracks[1].items[0]
+        .effect_mut("graphic_text")
+        .unwrap()
+        .params
+        .insert("text".into(), Param::new(ParamValue::Text("60".into())));
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(text.contains(&format!("<Data Encoding=\"base64\" BinaryHash=\"tt-1\">{data}</Data>")), "the shared value moved to the Blob: {report}");
+    let back = read(&out);
+    let t = back.sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[1].items[0].effect("graphic_text").unwrap().clone();
+    assert_eq!(t.params["text"].value, ParamValue::Text("60".into()));
 }
