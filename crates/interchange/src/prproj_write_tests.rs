@@ -691,7 +691,8 @@ fn new_sequences_synthetic_items_and_bins_are_built() {
         let mut a = c.clone();
         a.id = ClipId(70_002);
         a.item = adj;
-        a.source_in = Tick(0);
+        // dragged left of where it was made: endless media, written from 0 at the same place
+        a.source_in = Tick(-10 * S);
         a.effects = filmcraft_project::effect::intrinsic_video();
         q.video_tracks[1].items.push(a);
         let mut m = c;
@@ -728,6 +729,7 @@ fn new_sequences_synthetic_items_and_bins_are_built() {
     assert_eq!(v1, ["interview.mov", "Orange"], "{report}");
     assert_eq!(q.video_tracks[0].items[0].effect("motion").unwrap().params["scale"].value, ParamValue::Float(130.0));
     assert!(matches!(back.item(q.video_tracks[1].items[0].item).unwrap().kind, ItemKind::AdjustmentLayer { .. }));
+    assert_eq!((q.video_tracks[1].items[0].start, q.video_tracks[1].items[0].source_in), (Tick(0), Tick(0)));
     let orange = back.item(q.video_tracks[0].items[1].item).unwrap();
     let ItemKind::Media(m) = &orange.kind else { panic!("{orange:?}") };
     let filmcraft_project::MediaRef::Generator(filmcraft_media::generators::Generator::ColorMatte { color }) = &m.media else { panic!("{m:?}") };
@@ -783,4 +785,27 @@ fn layout_kit_layouts_are_models_and_unwritten_settings_are_reported() {
 #[test]
 fn the_shared_test_document_is_current() {
     assert_eq!(crate::prproj::test_document(), doc());
+}
+
+/// A clip that starts before its source (an In point below 0, as a nested sequence or a media
+/// clip got in one user's project) is saved instead of failing the whole save: the empty part is
+/// left out, so what is seen stays at the same sequence time.
+#[test]
+fn a_clip_starting_before_its_source_is_saved() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        // the first clip: 0–5 s of the sequence, its source from -3 s
+        let a = &mut p.sequence_mut(sid).unwrap().video_tracks[0].items[0];
+        assert_eq!((a.start, a.duration), (Tick(0), Tick(5 * S)));
+        a.source_in = Tick(-3 * S);
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).expect("saved");
+    assert!(report.mentions("started before its source"), "{report}");
+    let back = read(&out);
+    let a = &back.sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[0].items[0];
+    // the source's 0 s was at sequence 3 s, and still is
+    assert_eq!((a.start, a.duration, a.source_in), (Tick(3 * S), Tick(2 * S), Tick(0)), "{report}");
 }

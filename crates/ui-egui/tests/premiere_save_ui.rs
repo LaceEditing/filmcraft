@@ -217,3 +217,56 @@ fn ctrl_s_shows_what_the_premiere_project_could_not_hold() {
     assert_eq!(d.harness.state().dialog, None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A Save that fails says so in a dialog (`saveFailed.*`); from the close prompt, the prompt
+/// stays open with the reason (closing would lose the work) instead of vanishing.
+#[cfg(unix)]
+#[test]
+fn a_failed_save_says_so_and_the_close_prompt_stays() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fc-prproj-fail-ui-{}", std::process::id()));
+    let proj = dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let src = proj.join("show.prproj");
+    std::fs::write(&src, prproj()).unwrap();
+    let mut s = Session::default();
+    s.prefs_path = Some(dir.join("preferences.json"));
+    s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
+    let (tx, rx) = channel();
+    let app = FilmcraftApp::new(s).with_control(rx);
+    let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).build_eframe(move |_cc| app);
+    let mut d = Driver { harness, tx };
+    d.frames(4);
+    d.ok("engine.execute", json!({"command": "playhead.set", "params": {"seconds": 4.0}}));
+    d.ok("engine.execute", json!({"command": "sequence.addEditAllTracks", "params": {}}));
+    // the project's folder can't be written: the save fails
+    std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o555)).unwrap();
+    d.ok("ui.key", json!({"key": "Cmd+S"}));
+    d.frames(3);
+    assert_eq!(d.harness.state().dialog, Some(filmcraft_ui_egui::Dialog::SaveFailed));
+    d.ok("ui.click", json!({"id": "saveFailed.ok"}));
+    d.frames(3);
+    assert_eq!(d.harness.state().dialog, None);
+    assert!(d.harness.state().session.is_dirty(), "still unsaved");
+    // closing: the prompt's Save fails too, and the prompt stays with the reason
+    d.harness.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+    d.frames(2);
+    if let Some(v) = d.harness.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
+        v.events.clear();
+    }
+    d.frames(1);
+    assert_eq!(d.harness.state().dialog, Some(filmcraft_ui_egui::Dialog::CloseConfirm));
+    d.ok("ui.click", json!({"id": "closeConfirm.save"}));
+    d.frames(3);
+    assert_eq!(d.harness.state().dialog, Some(filmcraft_ui_egui::Dialog::CloseConfirm), "the prompt stays");
+    assert!(!d.harness.state().close_confirmed);
+    let els = d.ok("ui.elements", json!({"prefix": "closeConfirm.error"}));
+    assert!(els.as_array().is_some_and(|a| !a.is_empty()), "the reason is shown");
+    // writable again: Save from the prompt goes through and closes
+    std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o755)).unwrap();
+    d.ok("ui.click", json!({"id": "closeConfirm.save"}));
+    d.frames(3);
+    assert!(d.harness.state().close_confirmed, "saved, so the window closes");
+    assert!(!d.harness.state().session.is_dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

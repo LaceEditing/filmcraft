@@ -794,6 +794,7 @@ impl Session {
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
         self.refuse_self_nesting(&p)?;
+        self.note_clips_before_source(label, &p);
         let old = std::mem::replace(&mut self.project, Arc::new(p));
         self.history.undo.push((label.to_string(), old));
         if self.history.undo.len() > self.history.limit {
@@ -820,11 +821,42 @@ impl Session {
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
         self.refuse_self_nesting(&p)?;
+        self.note_clips_before_source(label, &p);
         self.project = Arc::new(p);
         self.state = st;
         self.state.selected_gap = None;
         self.bump();
         Ok(r)
+    }
+
+    /// Clips of media with a start (files, sequences) whose In point is below 0 start before their
+    /// source, which no edit should leave (a Premiere project cannot hold it; saving leaves the
+    /// empty part out). Logged with the edit that did it, to find which one.
+    fn note_clips_before_source(&mut self, label: &str, after: &Project) {
+        fn count(p: &Project) -> usize {
+            p.sequences()
+                .filter_map(|i| i.as_sequence())
+                .flat_map(|q| q.all_tracks())
+                .flat_map(|t| t.items.iter())
+                .filter(|c| c.source_in < Tick::ZERO && c.frame_hold.is_none())
+                .filter(|c| match p.item(c.item).map(|i| &i.kind) {
+                    Some(filmcraft_project::ItemKind::Sequence(_)) => true,
+                    Some(filmcraft_project::ItemKind::Media(m)) => {
+                        matches!(m.media, filmcraft_project::MediaRef::File { .. })
+                            && !matches!(m.info.kind, filmcraft_media::MediaKind::Still | filmcraft_media::MediaKind::Synthetic)
+                    }
+                    _ => false,
+                })
+                .count()
+        }
+        let (before, now) = (count(&self.project), count(after));
+        if now > before {
+            self.log.push(
+                panels::Level::Warning,
+                "edit",
+                format!("\"{label}\" left {} clip(s) starting before their media or nested sequence (please report this)", now - before),
+            );
+        }
     }
 
     /// Edit the active sequence with the edit-algebra context.

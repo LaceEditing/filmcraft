@@ -124,6 +124,8 @@ pub enum Dialog {
     CloseConfirm,
     /// What Save could not write into a Premiere Pro project.
     SaveNotes,
+    /// "The project was not saved" (why).
+    SaveFailed,
 }
 
 #[derive(Default)]
@@ -1363,7 +1365,10 @@ impl FilmcraftApp {
                 }
             }
         }
-        // a Save's notes that arrived while another dialog was up
+        // a Save that failed, or its notes, that arrived while another dialog was up
+        if self.dialog.is_none() && self.file_dialogs.save_failed.is_some() {
+            self.dialog = Some(Dialog::SaveFailed);
+        }
         if self.dialog.is_none() && self.file_dialogs.save_notes.is_some() {
             self.dialog = Some(Dialog::SaveNotes);
         }

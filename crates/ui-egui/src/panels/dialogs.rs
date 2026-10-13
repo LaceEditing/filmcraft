@@ -70,7 +70,13 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             return;
         }
-        Dialog::NewSequence | Dialog::Preferences | Dialog::Recovery | Dialog::RevertConfirm | Dialog::CloseConfirm | Dialog::SaveNotes => {}
+        Dialog::NewSequence
+        | Dialog::Preferences
+        | Dialog::Recovery
+        | Dialog::RevertConfirm
+        | Dialog::CloseConfirm
+        | Dialog::SaveNotes
+        | Dialog::SaveFailed => {}
     }
     if !open {
         app.dialog = None;

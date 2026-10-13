@@ -2,7 +2,8 @@
 //! `panels::settings`).
 //!
 //! Automation ids: `recovery.item.<n>`, `recovery.recover`, `recovery.discard`, `recovery.later`;
-//! `revert.yes`, `revert.no`; `saveNotes.note.<n>`, `saveNotes.ok`.
+//! `revert.yes`, `revert.no`; `saveNotes.note.<n>`, `saveNotes.ok`; `saveFailed.ok`;
+//! `closeConfirm.error`.
 
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, Ui, vec2};
 use serde_json::json;
@@ -18,6 +19,10 @@ pub struct FileDialogState {
     pub save_notes: Option<(String, Vec<String>)>,
     /// The notes last shown, by path: the same ones are not shown again on every Save.
     pub save_notes_seen: std::collections::HashMap<String, Vec<String>>,
+    /// Why the last Save failed (shown until dismissed).
+    pub save_failed: Option<String>,
+    /// The close prompt's last Save failed: why (shown in the prompt, which stays open).
+    pub close_error: Option<String>,
 }
 
 impl FileDialogState {
@@ -131,6 +136,11 @@ pub fn show_close(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             ui.separator();
             ui.add_space(6.0);
             ui.label(RichText::new(format!("Save changes to '{name}' before closing?")).size(13.5).color(t.text));
+            if let Some(e) = app.file_dialogs.close_error.clone() {
+                ui.add_space(8.0);
+                let r = ui.label(RichText::new(format!("The project was not saved: {e}")).size(12.5).color(t.danger));
+                app.auto.add("closeConfirm.error", r.rect, &e);
+            }
             ui.add_space(18.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if button(app, ui, "closeConfirm.save", "Save", true) {
@@ -143,11 +153,17 @@ pub fn show_close(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
                     };
                     match crate::menus::invoke(app, ctx, "file.save", json!({})) {
                         // a save that needed a dialog and was cancelled leaves the project dirty
-                        Ok(_) if !app.session.is_dirty() && !news(app) => close_now = true,
-                        Ok(_) => {}
-                        Err(e) => app.ui.status = e,
+                        Ok(_) if !app.session.is_dirty() && !news(app) => {
+                            close_now = true;
+                            open = false;
+                        }
+                        Ok(_) => open = false,
+                        // not saved: the prompt stays, saying why (closing now would lose the work)
+                        Err(e) => {
+                            app.file_dialogs.save_failed = None;
+                            app.file_dialogs.close_error = Some(e);
+                        }
                     }
-                    open = false;
                 }
                 if button(app, ui, "closeConfirm.dontSave", "Don't Save", false) {
                     close_now = true;
@@ -163,7 +179,46 @@ pub fn show_close(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
         app.close_confirmed = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
-    open && !r.should_close()
+    let open = open && !r.should_close();
+    if !open {
+        app.file_dialogs.close_error = None;
+    }
+    open
+}
+
+/// "The project was not saved": why, and that the changes are still open. Automation id
+/// `saveFailed.ok`.
+pub fn show_save_failed(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
+    let t = app.tokens;
+    let Some(e) = app.file_dialogs.save_failed.clone() else { return false };
+    let mut open = true;
+    let r = egui::Modal::new(egui::Id::new("save-failed-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
+        ui.set_width(560.0);
+        Frame::new().inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 20 }).show(ui, |ui| {
+            ui.label(RichText::new("The project was not saved").size(18.0).strong().color(t.text));
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(RichText::new(&e).size(13.0).color(t.danger));
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Your changes are still open here (and in the recovery journal). To keep them while this is sorted out, save a FilmCraft copy: File \u{25b8} Save a Copy\u{2026}, as .fcproj.")
+                    .size(13.0)
+                    .color(t.text),
+            );
+            ui.add_space(18.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if button(app, ui, "saveFailed.ok", "OK", true) {
+                    open = false;
+                }
+            });
+        });
+    });
+    let open = open && !r.should_close();
+    if !open {
+        app.file_dialogs.save_failed = None;
+    }
+    open
 }
 
 pub fn show_revert(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
@@ -247,6 +302,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context, d: Dialog) -> Option<bo
         Dialog::RevertConfirm => Some(show_revert(app, ctx)),
         Dialog::CloseConfirm => Some(show_close(app, ctx)),
         Dialog::SaveNotes => Some(show_save_notes(app, ctx)),
+        Dialog::SaveFailed => Some(show_save_failed(app, ctx)),
         _ => None,
     }
 }

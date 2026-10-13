@@ -319,3 +319,24 @@ fn effect_layouts_are_learned_from_premiere_projects() {
         assert_eq!(r["projects"], 2, "{r}");
     }
 }
+
+/// A clip that starts before its source (In point below 0; reported by a user on a nested
+/// sequence) does not stop the save, and the edit that made it is logged.
+#[test]
+fn a_clip_starting_before_its_source_still_saves() {
+    let dir = tmp_dir("prproj-negative-in");
+    let src = dir.join("show.prproj");
+    std::fs::write(&src, prproj()).unwrap();
+    let mut s = session(&dir);
+    s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
+    s.edit("Odd Edit", |p, _| {
+        let seq_id = p.sequences().next().map(|i| i.id).unwrap();
+        p.sequence_mut(seq_id).unwrap().video_tracks[0].items[0].source_in = filmcraft_time::Tick(-2 * S);
+        Ok(())
+    })
+    .unwrap();
+    assert!(s.log.entries.iter().any(|e| e.level == crate::panels::Level::Warning && e.message.contains("\"Odd Edit\"")));
+    let r = s.execute("file.save", json!({})).expect("saved");
+    assert!(!s.is_dirty(), "{r}");
+    assert!(std::fs::read_to_string(&src).unwrap().contains(&format!("<Start>{}</Start>", 2 * S)), "the empty head is left out");
+}

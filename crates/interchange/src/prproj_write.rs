@@ -584,6 +584,38 @@ fn asset_model<'a, 'i>(ix: &Index<'a, 'i>, root: Node<'a, 'i>, project: &Project
     best.map(|(_, n)| n)
 }
 
+/// A clip with an In point below 0 as a Premiere clip: media without an end (adjustment layers,
+/// stills, graphics, generated media) shows the same picture throughout, so its In point is 0;
+/// any other clip loses the empty part before its source, as an In-edge trim would take it off
+/// (what is seen stays at the same sequence time). None: nothing of it is after its source.
+fn premiere_timing(project: &Project, c: &TrackItem) -> Option<TrackItem> {
+    let mut out = c.clone();
+    let endless = match project.item(c.item).map(|i| &i.kind) {
+        Some(ItemKind::AdjustmentLayer { .. } | ItemKind::Graphic { .. }) => true,
+        Some(ItemKind::Media(m)) => {
+            matches!(m.media, filmcraft_project::MediaRef::Generator(_))
+                || matches!(m.info.kind, filmcraft_media::MediaKind::Still | filmcraft_media::MediaKind::Synthetic)
+        }
+        _ => false,
+    };
+    if endless || c.frame_hold.is_some() {
+        out.source_in = filmcraft_time::Tick(0);
+        return Some(out);
+    }
+    let speed = c.speed.abs().max(1e-9);
+    let head = ((-c.source_in.0) as f64 / speed).ceil() as i64;
+    if head >= c.duration.0 {
+        return None;
+    }
+    out.duration = filmcraft_time::Tick(c.duration.0 - head);
+    out.source_in = filmcraft_time::Tick(0);
+    if !c.reverse {
+        // the empty part is the head: the clip starts later, its media at 0
+        out.start = filmcraft_time::Tick(c.start.0 + head);
+    }
+    Some(out)
+}
+
 /// What one Premiere bin (or the root) should hold.
 struct BinPlan<'a, 'i> {
     /// The Premiere bin (None: made in FilmCraft).
@@ -1128,7 +1160,27 @@ impl<'a, 'i> Writer<'a, 'i> {
                     .collect();
                 let mut placed: Vec<((i64, usize), String)> = Vec::new();
                 let mut back = Vec::new();
-                for (n, c) in items.into_iter().enumerate() {
+                for (n, c0) in items.into_iter().enumerate() {
+                    // a clip that starts before its source (an In point below 0) as Premiere can
+                    // hold it
+                    let fixed;
+                    let c = if c0.source_in.0 < 0 {
+                        match premiere_timing(project, c0) {
+                            Some(x) => {
+                                if x.start != c0.start || x.duration != c0.duration {
+                                    self.report.info(format!("clip \"{}\" started before its source; the empty part before it was left out", c0.name));
+                                }
+                                fixed = x;
+                                &fixed
+                            }
+                            None => {
+                                self.report.warn(format!("clip \"{}\" lies entirely before its source (nothing to show) and was not written", c0.name));
+                                continue;
+                            }
+                        }
+                    } else {
+                        c0
+                    };
                     let Some(id) = self.clip(project, c, kind, frame)? else { continue };
                     written_ids.insert(c.id, id.clone());
                     let order = original_order.get(id.as_str()).copied().unwrap_or(original_order.len() + n);
@@ -1626,7 +1678,7 @@ impl<'a, 'i> Writer<'a, 'i> {
             return;
         };
         let chain_inst = self.inst_of(chain, copies);
-        let ctx = Ctx { source_in: c.source_in.0, speed: c.speed, frame, src: source_frame(project, c.item).unwrap_or(frame) };
+        let ctx = Ctx { source_in: c.source_in.0.max(0), speed: c.speed, frame, src: source_frame(project, c.item).unwrap_or(frame) };
         let comps = prproj_fx::chain(&self.ix, chain);
         let targets = prproj_fx::targets(&comps);
         // Motion, Opacity or clip volume changed on a clip Premiere saved without one
@@ -2660,7 +2712,16 @@ struct ExportedClip {
 
 impl ExportedClip {
     fn of(c: &TrackItem) -> Self {
-        Self { start: c.start.0, duration: c.duration.0, source_in: c.source_in.0, speed: c.speed, reverse: c.reverse, frame_hold: c.frame_hold.map(|t| t.0) }
+        // as written: Premiere's In points start at 0 (a clip of endless media extended left of
+        // where it was made has a negative one in FilmCraft)
+        Self {
+            start: c.start.0,
+            duration: c.duration.0,
+            source_in: c.source_in.0.max(0),
+            speed: c.speed,
+            reverse: c.reverse,
+            frame_hold: c.frame_hold.map(|t| t.0),
+        }
     }
 }
 

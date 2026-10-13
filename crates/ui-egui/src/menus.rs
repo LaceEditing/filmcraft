@@ -150,6 +150,17 @@ pub fn panel_command_id(p: PanelKind) -> String {
 
 /// Execute a UI or engine command by id.
 pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    let r = invoke_inner(app, ctx, id, params);
+    // a save that failed says so plainly (the project is not saved: closing would lose it)
+    if let Err(e) = &r
+        && matches!(id, "file.save" | "file.saveAs" | "file.saveCopy" | "file.saveAll" | "file.exportPrproj")
+    {
+        app.file_dialogs.save_failed = Some(e.clone());
+    }
+    r
+}
+
+fn invoke_inner(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
     if matches!(id, "app.language.english" | "app.language.japanese" | "app.language.spanish") {
         // Japanese needs the craft-fonts (built with CRAFT_FONTS_DIR) or a font installed on the system
         if id == "app.language.japanese" && !crate::i18n::install_japanese_font(ctx) {
