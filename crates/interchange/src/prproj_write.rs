@@ -441,6 +441,7 @@ fn write(project: &Project, text: &str, sequences: &[ItemId], dest_dir: Option<&
         w.owner_markers(first, false, &m.markers, &format!("\"{}\"", it.name));
     }
     w.bins(project);
+    w.item_labels(project);
     let mut out = w.finish()?;
     if !borrowed.is_empty() {
         out.text = drop_objects(&out.text, borrowed)?;
@@ -1085,6 +1086,68 @@ impl<'a, 'i> Writer<'a, 'i> {
                     None => return,
                 };
                 self.edit(inst, r, format!("{open}{value}</{name}>"));
+            }
+        }
+    }
+
+    /// Give a clip object (`VideoClip` / `AudioClip`) Premiere's label: its name and colour in
+    /// `Clip ▸ Node ▸ Properties`, made when the clip has none.
+    fn set_clip_label(&mut self, inst: usize, clip: Node<'a, 'i>, label: filmcraft_project::Label) {
+        let (name, color) = crate::prproj::label_props(label);
+        let Some(body) = child(clip, "Clip") else { return };
+        match self.ix.at(clip, &["Clip", "Node", "Properties"]) {
+            Some(props) => {
+                self.set_child(inst, props, "asl.clip.label.color", &color.to_string());
+                self.set_child(inst, props, "asl.clip.label.name", &name);
+            }
+            None => {
+                let props = format!("<asl.clip.label.color>{color}</asl.clip.label.color><asl.clip.label.name>{name}</asl.clip.label.name>");
+                match child(body, "Node") {
+                    Some(node) => self.insert(inst, node, &format!("<Properties Version=\"1\">{props}</Properties>")),
+                    None => self.insert_first(inst, body, &format!("<Node Version=\"1\"><Properties Version=\"1\">{props}</Properties></Node>")),
+                }
+            }
+        }
+    }
+
+    /// Insert XML just after `parent`'s opening tag.
+    fn insert_first(&mut self, inst: usize, parent: Node<'a, 'i>, xml: &str) {
+        let r = parent.range();
+        let src = &self.text[r.clone()];
+        let name = parent.tag_name().name();
+        match src.find('>') {
+            Some(p) if src[..p].ends_with('/') => self.edit(inst, r.clone(), format!("{}>{xml}</{name}>", &src[..p - 1])),
+            Some(p) => self.edit(inst, r.start + p + 1..r.start + p + 1, xml.to_string()),
+            None => {}
+        }
+    }
+
+    /// The labels of the project's items (the Project panel's), on their master clips' clips,
+    /// where FilmCraft's differs from Premiere's.
+    fn item_labels(&mut self, project: &Project) {
+        for it in project.items.values() {
+            let (uid, sequence) = match (&it.kind, it.metadata.get(META_SEQUENCE), it.metadata.get(META_MEDIA)) {
+                (ItemKind::Sequence(_), Some(u), _) => (u.clone(), true),
+                (_, _, Some(u)) => match u.split(',').next() {
+                    Some(first) => (first.to_string(), false),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            // unchanged since it came in (an item made in FilmCraft has its label written)
+            let was = it.metadata.get(crate::prproj::META_LABEL).and_then(|n| filmcraft_project::Label::from_name(n));
+            // (one opened before labels were read, from an older FilmCraft save, is not known to
+            // have changed: Premiere's stays)
+            if was == Some(it.label) || (was.is_none() && !self.new_items.contains_key(&it.id)) {
+                continue;
+            }
+            let clips: Vec<Node<'a, 'i>> = self.all_master_clips_of(&uid, sequence).into_iter().flatten().collect();
+            if clips.iter().all(|c| crate::prproj::clip_label(*c) == Some(it.label)) {
+                continue;
+            }
+            for c in clips {
+                let inst = self.here(c);
+                self.set_clip_label(inst, c, it.label);
             }
         }
     }
@@ -1788,6 +1851,16 @@ impl<'a, 'i> Writer<'a, 'i> {
                 self.set_child(inst, ti, "End", &end);
             }
         }
+        // the clip's label (its own; one without takes its item's)
+        if let Some(clip) = self.ix.follow(obj, &["ClipTrackItem", "SubClip"]).and_then(|sub| self.ix.follow(sub, &["Clip"])) {
+            // (without one of its own, opened again it takes its item's: written where that would
+            // change it)
+            let have = crate::prproj::clip_label(clip).or_else(|| project.item(c.item).map(|i| i.label));
+            if have != Some(c.label) {
+                let ci = self.inst_of(clip, copies);
+                self.set_clip_label(ci, clip, c.label);
+            }
+        }
         // Clip ▸ Enable: off is `IsMuted`, which Premiere writes after the clip's transitions
         if let Some(cti) = child(obj, "ClipTrackItem") {
             match (c.enabled, child(cti, "IsMuted")) {
@@ -2179,6 +2252,23 @@ impl<'a, 'i> Writer<'a, 'i> {
             }
         }
         (Vec::new(), None)
+    }
+
+    /// The clips of every master clip of a sequence or media (one per Project panel entry).
+    fn all_master_clips_of(&self, uid: &str, sequence: bool) -> Vec<Vec<Node<'a, 'i>>> {
+        let mut out = Vec::new();
+        for pi in self.root.children().filter(|n| n.has_tag_name("ClipProjectItem")) {
+            let Some(master) = self.ix.follow(pi, &["MasterClip"]) else { continue };
+            let clips = self.ix.list(master, &["Clips"], "Clip");
+            let ours = clips.iter().any(|clip| {
+                let target = if sequence { prproj_graph::clip_sequence(&self.ix, *clip) } else { prproj_graph::clip_media(&self.ix, *clip) };
+                target.and_then(|t| t.attribute("ObjectUID")) == Some(uid)
+            });
+            if ours {
+                out.push(clips);
+            }
+        }
+        out
     }
 
     /// Write the markers of a sequence or media: into its `Markers` object, or a new one when it

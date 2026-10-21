@@ -44,6 +44,9 @@ use crate::{Error, Format, ImportOptions, Imported, Report, Result};
 pub const META_MEDIA: &str = "premiere.media";
 /// Item metadata: the Premiere `Sequence` UID behind a sequence item.
 pub const META_SEQUENCE: &str = "premiere.sequence";
+/// The label an item came in with (Premiere's, or the importer's default for one without):
+/// the writer saves a label only where FilmCraft's differs from it.
+pub const META_LABEL: &str = "premiere.label";
 /// Sequence item metadata: the `.prproj` the sequence was imported from.
 pub const META_SOURCE: &str = "premiere.source";
 /// Sequence item metadata: the fingerprint of that document when it was imported.
@@ -163,6 +166,9 @@ pub(crate) fn import(bytes: &[u8], opts: &ImportOptions, report: &mut Report) ->
         return Err(Error::Empty);
     }
     imp.b.top = top;
+    for it in imp.b.p.items.values_mut() {
+        it.metadata.insert(META_LABEL.to_string(), it.label.name().to_string());
+    }
     Ok(imp.b.finish())
 }
 
@@ -236,22 +242,36 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     fn project_clip(&mut self, item: Node<'a, 'i>, name: &str, bin: Option<BinId>) {
         let Some(master) = self.ix.follow(item, &["MasterClip"]) else { return };
         let markers = self.master_markers(master);
-        for clip in self.ix.list(master, &["Clips"], "Clip") {
+        let clips = self.ix.list(master, &["Clips"], "Clip");
+        // the item's label (the Project panel's): its master clip's
+        let label = clips.iter().find_map(|c| clip_label(*c));
+        for clip in clips {
             if let Some(seq) = prproj_graph::clip_sequence(&self.ix, clip) {
                 if let Some(uid) = seq.attribute("ObjectUID") {
                     if !self.seq_items.contains_key(uid) {
                         self.reserve_sequence(seq, name, bin);
                     }
                     self.seq_markers.entry(uid).or_insert(markers);
+                    if let (Some(l), Some(id)) = (label, self.seq_items.get(uid).copied())
+                        && let Some(it) = self.b.p.item_mut(id)
+                    {
+                        it.label = l;
+                    }
                 }
                 return;
             }
             if let Some(media) = prproj_graph::clip_media(&self.ix, clip) {
                 if let Some(id) = self.media(media, Some(name), bin, Some(master))
-                    && let Some(m) = self.b.p.item_mut(id).and_then(|i| i.as_media_mut())
-                    && m.markers.is_empty()
+                    && let Some(it) = self.b.p.item_mut(id)
                 {
-                    m.markers = markers;
+                    if let Some(l) = label {
+                        it.label = l;
+                    }
+                    if let Some(m) = it.as_media_mut()
+                        && m.markers.is_empty()
+                    {
+                        m.markers = markers;
+                    }
                 }
                 return;
             }
@@ -643,6 +663,10 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         ti.speed = raw_speed.abs().clamp(SPEED_RANGE.0, SPEED_RANGE.1);
         ti.reverse = raw_speed < 0.0;
         ti.origin = item.attribute("ObjectID").map(str::to_string);
+        // the clip's own label (else its item's, as `Builder::clip` gave it)
+        if let Some(l) = clip_label(clip) {
+            ti.label = l;
+        }
         // Clip ▸ Enable off: Premiere saves `IsMuted` on the track item (video and audio alike)
         ti.enabled = path_text(item, &["ClipTrackItem", "IsMuted"]).map(str::trim) != Some("true");
         if kind == TrackKind::Audio {
@@ -903,6 +927,30 @@ pub(crate) fn rate_of(ticks_per_frame: i64) -> Option<FrameRate> {
 }
 
 /// Clip ▸ Audio Gain of a clip (`Gain`, linear) in dB; 0 without one.
+/// Premiere's label of a clip object (`Clip ▸ Node ▸ Properties ▸ asl.clip.label.name`: a
+/// `BE.Prefs.LabelColors.N` index into its sixteen labels, in the order of [`Label::ALL`]).
+pub(crate) fn clip_label(clip: Node<'_, '_>) -> Option<Label> {
+    let name = path_text(clip, &["Clip", "Node", "Properties", "asl.clip.label.name"])?;
+    let n: usize = name.trim().strip_prefix("BE.Prefs.LabelColors.")?.parse().ok()?;
+    Label::ALL.get(n).copied()
+}
+
+/// What Premiere saves for a label: its name (`BE.Prefs.LabelColors.N`) and its colour, packed
+/// red + green·256 + blue·65536 (the default colours seen in projects; FilmCraft's own for the rest).
+pub(crate) fn label_props(label: Label) -> (String, u32) {
+    let n = Label::ALL.iter().position(|l| *l == label).unwrap_or(1);
+    let seen = match n {
+        0 => Some(11_405_886),
+        1 => Some(6_769_408),
+        2 => Some(480_554),
+        3 => Some(8_851_829),
+        5 => Some(19_005),
+        _ => None,
+    };
+    let [r, g, b] = label.rgb();
+    (format!("BE.Prefs.LabelColors.{n}"), seen.unwrap_or(u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16))
+}
+
 pub(crate) fn clip_gain_db(clip: Node<'_, '_>) -> f64 {
     child_text(clip, "Gain")
         .and_then(|g| g.trim().parse::<f64>().ok())

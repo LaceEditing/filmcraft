@@ -1079,6 +1079,40 @@ fn effects_pasted_onto_a_clip_without_an_effect_list_are_written() {
     assert_eq!(a1.effect("bass").map(|e| e.params["boost"].value.clone()), Some(ParamValue::Float(6.0)), "{report}");
 }
 
+/// Label colours: Premiere's (`asl.clip.label.name`, `BE.Prefs.LabelColors.N`) come in on items
+/// and clips, and FilmCraft's changes go back as Premiere saves them — the item's on its master
+/// clip's clips, a clip's on its own clip object. Before, labels were neither read nor written
+/// (a re-labelled clip was blue again after saving).
+#[test]
+fn label_colours_round_trip() {
+    let labelled = doc().replace(
+        r#"<AudioClip ObjectID="16"><Clip><Source ObjectRef="76"/></Clip></AudioClip>"#,
+        r#"<AudioClip ObjectID="16"><Clip><Node Version="1"><Properties Version="1"><asl.clip.label.color>480554</asl.clip.label.color><asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name></Properties></Node><Source ObjectRef="76"/></Clip></AudioClip>"#,
+    );
+    assert_ne!(labelled, doc(), "the fixture changed");
+    let (imp, _) = import(labelled.as_bytes(), None);
+    let mut p = imp.project;
+    let media = p.items.values().find(|i| i.name == "interview.mov").unwrap().id;
+    assert_eq!(p.item(media).unwrap().label, filmcraft_project::Label::Caribbean, "the master clip's label");
+    let sid = seq_id(&p);
+    assert_eq!(p.sequence(sid).unwrap().video_tracks[0].items[0].label, filmcraft_project::Label::Caribbean, "a clip without its own: its item's");
+    // unchanged: the same document
+    let (same, _) = export(&p, labelled.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&same).unwrap().0).unwrap(), labelled);
+    // re-labelled in FilmCraft: the item Mango, the first clip Rose
+    p.item_mut(media).unwrap().label = filmcraft_project::Label::Mango;
+    p.sequence_mut(sid).unwrap().video_tracks[0].items[0].label = filmcraft_project::Label::Rose;
+    let (out, report) = export(&p, labelled.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert_eq!(text.matches("<asl.clip.label.name>BE.Prefs.LabelColors.7</asl.clip.label.name>").count(), 2, "both master clips: {report}");
+    assert!(text.contains("<asl.clip.label.name>BE.Prefs.LabelColors.6</asl.clip.label.name>"), "the clip");
+    let back = read(&out);
+    assert_eq!(back.items.values().find(|i| i.name == "interview.mov").unwrap().label, filmcraft_project::Label::Mango);
+    let q = back.sequences().find_map(|i| i.as_sequence()).unwrap();
+    assert_eq!(q.video_tracks[0].items[0].label, filmcraft_project::Label::Rose);
+    assert_eq!(q.video_tracks[0].items[1].label, filmcraft_project::Label::Caribbean, "the other clip keeps its colour");
+}
+
 /// The Parametric Equalizer's pass filters and shelf slopes (values from an EQ edited in
 /// Premiere: High-Pass on at 197 Hz, 6 dB/Oct saved as 0.1, Low-Pass at its default 24 dB/Oct =
 /// 0.4, Low Shelf Filter Order 1 = the steeper shelf) come in, and edits go back as Premiere saves
