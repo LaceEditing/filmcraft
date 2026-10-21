@@ -426,8 +426,13 @@ fn write(project: &Project, text: &str, sequences: &[ItemId], dest_dir: Option<&
     if first && (!w.needs.is_empty() || (borrow && !w.missing.is_empty())) {
         return Ok(Written::Needs(std::mem::take(&mut w.needs), std::mem::take(&mut w.missing)));
     }
-    if !w.needs.is_empty() {
-        w.report.warn(format!("{} clip(s): a Motion, Opacity or Volume change could not be written", w.needs.len()));
+    let intrinsic = w.needs.values().filter(|n| n.motion || n.opacity || n.volume.is_some()).count();
+    if intrinsic > 0 {
+        w.report.warn(format!("{intrinsic} clip(s): a Motion, Opacity or Volume change could not be written"));
+    }
+    let lists = w.needs.values().filter(|n| n.added && !(n.motion || n.opacity || n.volume.is_some())).count();
+    if lists > 0 {
+        w.report.warn(format!("{lists} clip(s): effects added in FilmCraft could not be written (the clip has no effect list)"));
     }
     // source markers of media Premiere knows
     for it in project.items.values() {
@@ -461,8 +466,11 @@ struct ChainNeed {
     opacity: bool,
     /// Clip volume, of a mono (true) or stereo clip.
     volume: Option<bool>,
-    /// A `Components` list (the chain has none, and FilmCraft added an effect).
+    /// A `Components` list (the chain has none, and FilmCraft added an effect or may borrow one).
     list: bool,
+    /// The list is for effects added in FilmCraft that the project itself has models for (so it
+    /// is needed whether or not a layout is borrowed).
+    added: bool,
     /// Ticks per audio sample (for a volume component).
     sample: i64,
 }
@@ -477,6 +485,7 @@ impl ChainNeed {
         self.opacity |= o.opacity;
         self.volume = self.volume.or(o.volume);
         self.list |= o.list;
+        self.added |= o.added;
         if o.sample > 0 {
             self.sample = o.sample;
         }
@@ -589,8 +598,10 @@ fn seed(text: &str, needs: &BTreeMap<String, ChainNeed>, grafts: &[crate::prproj
             drop("DefaultVol", &mut edits);
             drop("DefaultVolumeComponentID", &mut edits);
         }
-        // a list only to add borrowed effects to: not without any
-        if added.is_empty() && grafts.is_empty() {
+        // a list only to add borrowed effects to: not without any (but always for effects the
+        // project has models for: without it, effects pasted onto a clip Premiere never gave an
+        // effect were dropped)
+        if added.is_empty() && !need.added && grafts.is_empty() {
             continue;
         }
         let items: String = added.iter().enumerate().map(|(i, id)| format!("<Component Index=\"{}\" ObjectRef=\"{id}\" />", refs.len() + i)).collect();
@@ -2103,6 +2114,7 @@ impl<'a, 'i> Writer<'a, 'i> {
         } else if (!added_refs.is_empty() || !front_refs.is_empty() || borrowing) && self.ix.at(chain, &["ComponentChain", "Components"]).is_none() {
             // the chain has no list to add them to yet
             need.list = true;
+            need.added |= !added_refs.is_empty() || !front_refs.is_empty();
         }
         if need.any()
             && let Some(key) = chain.attribute("ObjectID")

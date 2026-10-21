@@ -1045,6 +1045,40 @@ fn title_vector_motion_round_trips() {
     assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text, "unchanged: the same document");
 }
 
+/// An effect pasted in FilmCraft onto a clip Premiere never gave an effect (its chain has no
+/// `Components` list) is written, modelled on the same effect elsewhere in the project: before,
+/// the list was only made when a layout was borrowed from another project, so the effect was
+/// dropped and the save reported "a Motion, Opacity or Volume change could not be written"
+/// (The Quarry: effects pasted onto five Audio 1 clips).
+#[test]
+fn effects_pasted_onto_a_clip_without_an_effect_list_are_written() {
+    let model = "<AudioFilterComponent ObjectID=\"900\"><AudioComponent><Component><Params><Param Index=\"0\" ObjectRef=\"901\"/><Param Index=\"1\" ObjectRef=\"902\"/></Params></Component></AudioComponent><FilterMatchName>Internal Bass</FilterMatchName></AudioFilterComponent>\n  \
+         <AudioComponentParam ObjectID=\"901\" ClassID=\"32657501-3aa4-445f-a49b-d09ecb9fa1ae\"><Name>Bypass</Name></AudioComponentParam>\n  \
+         <AudioComponentParam ObjectID=\"902\" ClassID=\"a714635e-a628-4b27-9d59-77eba47dbc1a\"><StartKeyframe>-91445760000000000,0.5,0,0,0,0,0,0</StartKeyframe><Name>Boost</Name></AudioComponentParam>\n";
+    let text = doc()
+        .replace(
+            r#"<AudioComponentChain ObjectID="73"><ComponentChain><Components><Component Index="0" ObjectRef="74"/></Components></ComponentChain></AudioComponentChain>"#,
+            r#"<AudioComponentChain ObjectID="73"><DefaultVol>true</DefaultVol><DefaultVolumeComponentID>1</DefaultVolumeComponentID><ComponentChain Version="3"></ComponentChain></AudioComponentChain>"#,
+        )
+        .replace("</PremiereData>", &format!("  {model}</PremiereData>"));
+    assert!(text.contains("<DefaultVol>true</DefaultVol>"), "the fixture changed");
+    let (imp, _) = import(text.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let a1 = &mut p.sequence_mut(sid).unwrap().audio_tracks[0].items[0];
+        assert!(a1.effect("bass").is_none());
+        let mut bass = filmcraft_project::find_effect("bass").unwrap().instance();
+        bass.params.insert("boost".into(), Param::new(ParamValue::Float(6.0)));
+        a1.effects.push(bass);
+    }
+    let (out, report) = export(&p, text.as_bytes(), &[], None).unwrap();
+    assert!(!report.mentions("could not be written"), "{report}");
+    let back = read(&out);
+    let a1 = &back.sequences().find_map(|i| i.as_sequence()).unwrap().audio_tracks[0].items[0];
+    assert_eq!(a1.effect("bass").map(|e| e.params["boost"].value.clone()), Some(ParamValue::Float(6.0)), "{report}");
+}
+
 /// The Parametric Equalizer's pass filters and shelf slopes (values from an EQ edited in
 /// Premiere: High-Pass on at 197 Hz, 6 dB/Oct saved as 0.1, Low-Pass at its default 24 dB/Oct =
 /// 0.4, Low Shelf Filter Order 1 = the steeper shelf) come in, and edits go back as Premiere saves
