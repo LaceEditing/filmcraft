@@ -158,3 +158,28 @@ fn effects_copy_paste_remove_and_reorder() {
     assert!(s.execute("effects.remove", json!({"clip": a.0, "indices": [idx(&ia, "motion")]})).is_err());
     assert!(s.execute("effects.remove", json!({"clip": a.0, "indices": [9999]})).is_err());
 }
+
+/// A drag in the value graph moves a keyframe in time and value with one `effects.setKeyframe`
+/// (`newTime`), one undo step per gesture; it never lands on another keyframe.
+#[test]
+fn set_keyframe_moves_it_in_time_too() {
+    let (mut s, clips) = demo();
+    let c = clips[0];
+    let k = keyed(&mut s, c);
+    let m = motion(&item(&s, c));
+    let undo = s.history.undo.len();
+    s.merge_scope = Some("press-1".into());
+    let mid = Tick((k[0].0 + k[1].0) / 2);
+    s.execute("effects.setKeyframe", json!({"clip": c.0, "effect": m, "param": "scale", "mediaTime": k[1].0, "newTime": mid.0, "value": 140.0})).unwrap();
+    let later = Tick(mid.0 + 1000);
+    s.execute("effects.setKeyframe", json!({"clip": c.0, "effect": m, "param": "scale", "mediaTime": mid.0, "newTime": later.0, "value": 130.0})).unwrap();
+    s.merge_scope = None;
+    let times: Vec<Tick> = item(&s, c).effects[m].params["scale"].keyframes.iter().map(|k| k.time).collect();
+    assert_eq!(times, vec![k[0], later, k[2]]);
+    assert_eq!(item(&s, c).effects[m].params["scale"].keyframes[1].value, ParamValue::Float(130.0));
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step for the gesture");
+    // onto another keyframe: refused, nothing lost
+    let r = s.execute("effects.setKeyframe", json!({"clip": c.0, "effect": m, "param": "scale", "mediaTime": later.0, "newTime": k[0].0}));
+    assert!(r.is_err());
+    assert_eq!(item(&s, c).effects[m].params["scale"].keyframes.len(), 3);
+}

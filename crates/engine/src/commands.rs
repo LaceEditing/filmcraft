@@ -2472,7 +2472,7 @@ fn build() -> Vec<CommandSpec> {
             "Edit Keyframe",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"value":any?,"inInfluence":0..1?,"outInfluence":0..1?}"#,
+            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"value":any?,"inInfluence":0..1?,"outInfluence":0..1?,"newTime":ticks?}"#,
             has_seq,
             |s, p| keyframe_op(s, p, "set")
         ),
@@ -2694,7 +2694,19 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
                 }
             }
             "set" => {
-                let at = mtime.ok_or_else(|| bad("keyframe", "need `mediaTime`"))?;
+                let mut at = mtime.ok_or_else(|| bad("keyframe", "need `mediaTime`"))?;
+                // moved in time too (a drag in the value graph), never onto another keyframe
+                if let Some(nt) = p.get("newTime").and_then(Value::as_i64).map(Tick).filter(|nt| *nt != at) {
+                    if prm.keyframes.iter().any(|k| k.time == nt) {
+                        return Err(bad("keyframe", "another keyframe is at that time"));
+                    }
+                    let i = prm.keyframes.iter().position(|k| k.time == at).ok_or_else(|| bad("keyframe", "no keyframe at that time"))?;
+                    let mut k = prm.keyframes.remove(i);
+                    k.time = nt;
+                    let to = prm.keyframes.partition_point(|x| x.time < nt);
+                    prm.keyframes.insert(to, k);
+                    at = nt;
+                }
                 let k = prm.keyframes.iter_mut().find(|k| k.time == at).ok_or_else(|| bad("keyframe", "no keyframe at that time"))?;
                 if let Some(v) = p.get("value") {
                     k.value = json_to_param(&k.value, v).ok_or_else(|| bad("keyframe", "value has the wrong type"))?;

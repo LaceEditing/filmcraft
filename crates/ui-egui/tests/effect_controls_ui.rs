@@ -28,7 +28,8 @@ impl Driver {
         s.execute("file.openDemoProject", json!({})).unwrap();
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(s).with_control(rx);
-        let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).build_eframe(move |_cc| app);
+        // (frames 1/60 s apart, so two clicks can be a double-click)
+        let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_step_dt(1.0 / 60.0).with_max_steps(10_000).build_eframe(move |_cc| app);
         let mut d = Driver { harness, tx };
         d.frames(6);
         d
@@ -351,5 +352,177 @@ fn effects_reorder_copy_paste_and_delete() {
     d.ok("ui.key", json!({"key": "Delete"}));
     d.frames(2);
     assert_eq!(d.app().session.active_sequence().unwrap().video_tracks[0].items[0].effects.len(), n);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+impl Driver {
+    fn center(&mut self, id: &str) -> egui::Pos2 {
+        let v = self.ok("ui.elements", json!({"prefix": id}));
+        let e = v.as_array().unwrap().iter().find(|e| e["id"] == json!(id)).unwrap_or_else(|| panic!("no element {id}")).clone();
+        let r = &e["rect"];
+        let f = |i: usize| r[i].as_f64().unwrap() as f32;
+        egui::pos2(f(0) + f(2) / 2.0, f(1) + f(3) / 2.0)
+    }
+    fn press(&mut self, p: egui::Pos2) {
+        self.harness.input_mut().events.push(egui::Event::PointerMoved(p));
+        self.frames(1);
+        self.harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        self.frames(1);
+    }
+    /// Move the held pointer from `from` by `by` in `steps`.
+    fn move_by(&mut self, from: egui::Pos2, by: egui::Vec2, steps: usize) -> egui::Pos2 {
+        let mut p = from;
+        for _ in 0..steps {
+            p += by / steps as f32;
+            self.harness.input_mut().events.push(egui::Event::PointerMoved(p));
+            self.frames(2);
+        }
+        p
+    }
+    fn release(&mut self, p: egui::Pos2) {
+        self.harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        self.frames(3);
+    }
+    fn undo_len(&mut self) -> usize {
+        self.app().session.history.undo.len()
+    }
+    fn motion(&mut self, param: &str) -> filmcraft_project::ParamValue {
+        let ph = self.app().session.playhead();
+        let it = self.app().session.active_sequence().unwrap().video_tracks[0].items[0].clone();
+        it.effect("motion").unwrap().param(param).unwrap().value_at(it.source_time_at(ph))
+    }
+}
+
+/// The value graph: a keyframe dragged up raises its value while the drag goes (the picture
+/// follows), sideways moves it in time but never past its neighbours, and each drag is one undo
+/// step. Before, the value changed only on release.
+#[test]
+fn graph_keyframes_drag_live_in_time_and_value() {
+    let dir = data_dir("graph-live");
+    let (mut d, _) = Driver::with_clip(&dir);
+    let k = d.three_scale_keys();
+    d.ok("ui.click", json!({"id": "effectControls.motion.scale.graphs"}));
+    d.frames(3);
+    let id = format!("effectControls.scale.graph.keyframe.{}", k[1]);
+    let undo = d.undo_len();
+    let p = d.center(&id);
+    d.press(p);
+    let p = d.move_by(p, egui::vec2(0.0, -40.0), 8);
+    let it = d.app().session.active_sequence().unwrap().video_tracks[0].items[0].clone();
+    let live = it.effect("motion").unwrap().params["scale"].keyframes[1].value.as_f64().unwrap();
+    assert!(live > 150.0, "raised while dragging: {live}");
+    assert_eq!(d.scale_keys(), k, "straight up: the same time");
+    d.release(p);
+    assert_eq!(d.undo_len(), undo + 1, "one undo step");
+    // sideways, far past the third keyframe: it stops a frame short of it
+    let p = d.center(&id);
+    d.press(p);
+    let p = d.move_by(p, egui::vec2(600.0, 0.0), 10);
+    d.release(p);
+    let after = d.scale_keys();
+    assert_eq!(after.len(), 3, "none replaced: {after:?}");
+    assert!(after[1] > k[1] && after[1] < k[2], "moved right, short of its neighbour: {after:?} from {k:?}");
+    assert_eq!(d.undo_len(), undo + 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The lane: a keyframe dragged moves live and stops short of the next one; the zoom bar's end
+/// zooms in (keyframes spread out), a double-click on it shows the whole clip again, Alt + wheel
+/// zooms about the pointer, and the divider between the properties and the lane drags.
+#[test]
+fn lane_drags_live_and_zooms() {
+    let dir = data_dir("lane-zoom");
+    let (mut d, _) = Driver::with_clip(&dir);
+    let k = d.three_scale_keys();
+    let p = d.center(&Driver::key_id(k[0]));
+    d.ok("ui.click", json!({"id": Driver::key_id(k[0])}));
+    d.frames(2);
+    d.press(p);
+    let q = d.move_by(p, egui::vec2(400.0, 0.0), 10);
+    let mid = d.scale_keys();
+    assert!(mid[0] > k[0], "moving while dragged: {mid:?}");
+    d.release(q);
+    let after = d.scale_keys();
+    assert_eq!(after.len(), 3, "{after:?}");
+    assert!(after[0] < after[1] && after[1] == k[1], "stopped short of the second keyframe: {after:?}");
+    // Alt + wheel between two keyframes zooms in about the pointer: they spread out
+    let gap = |d: &mut Driver, a: i64, b: i64| d.center(&Driver::key_id(b)).x - d.center(&Driver::key_id(a)).x;
+    let before = gap(&mut d, after[1], after[2]);
+    let (a, b) = (d.center(&Driver::key_id(after[1])), d.center(&Driver::key_id(after[2])));
+    let lane = d.center("effectControls.laneBody");
+    d.ok("ui.scroll", json!({"x": (a.x + b.x) / 2.0, "y": lane.y, "dy": 200.0, "modifiers": {"alt": true}}));
+    d.frames(3);
+    assert!(d.app().ui.ec_view.is_some(), "Alt + wheel zooms");
+    let zoomed = gap(&mut d, after[1], after[2]);
+    assert!(zoomed > before * 1.5, "spread out: {before} → {zoomed}");
+    d.ok("ui.click", json!({"id": "effectControls.zoomBar", "count": 2}));
+    d.frames(2);
+    assert!(d.app().ui.ec_view.is_none(), "a double-click on the zoom bar shows the whole clip");
+    // the bar's end zooms too
+    let end = d.center("effectControls.zoomBar.end");
+    let bar = d.center("effectControls.zoomBar.start");
+    d.ok("ui.drag", json!({"from": {"x": end.x, "y": end.y}, "to": {"x": bar.x + (end.x - bar.x) * 0.5, "y": end.y}, "steps": 10}));
+    d.frames(3);
+    assert!(d.app().ui.ec_view.is_some(), "zoomed with the bar");
+    // the divider
+    let split = d.app().ui.ec_split;
+    let dv = d.center("effectControls.divider");
+    d.ok("ui.drag", json!({"from": {"x": dv.x, "y": dv.y}, "to": {"x": dv.x - 80.0, "y": dv.y}, "steps": 6}));
+    d.frames(2);
+    assert!(d.app().ui.ec_split < split, "the divider moved left");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Program monitor: the selected clip shows its box; dragging inside it moves the clip as the
+/// pointer goes, a corner handle scales it, just outside a corner rotates it, the anchor point's
+/// crosshair moves the anchor (the picture stays put); each drag is one undo step.
+#[test]
+fn program_monitor_moves_scales_and_rotates_the_selected_clip() {
+    let dir = data_dir("motion-overlay");
+    let (mut d, _) = Driver::with_clip(&dir);
+    d.exec("playhead.set", json!({"seconds": 1.0}));
+    d.frames(4);
+    let pos = |v: filmcraft_project::ParamValue| v.as_vec2().unwrap();
+    let p0 = pos(d.motion("position"));
+    let undo = d.undo_len();
+    let c = d.center("program.motion.box");
+    d.press(c);
+    let c2 = d.move_by(c, egui::vec2(40.0, 20.0), 8);
+    let live = pos(d.motion("position"));
+    assert!(live.x > p0.x + 10.0 && live.y > p0.y + 5.0, "moving while dragged: {p0:?} → {live:?}");
+    d.release(c2);
+    assert_eq!(d.undo_len(), undo + 1, "one undo step");
+    // a corner dragged in: smaller
+    let h = d.center("program.motion.handle.2");
+    d.press(h);
+    let h2 = d.move_by(h, egui::vec2(-60.0, -40.0), 6);
+    d.release(h2);
+    let sc = d.motion("scale").as_f64().unwrap();
+    assert!(sc < 95.0 && sc > 20.0, "scaled down: {sc}");
+    // just outside a corner: rotated
+    let r = d.center("program.motion.rotate.1");
+    d.press(r);
+    let r2 = d.move_by(r, egui::vec2(30.0, 60.0), 6);
+    d.release(r2);
+    assert!(d.motion("rotation").as_f64().unwrap().abs() > 5.0, "rotated");
+    // the anchor point: anchor and position move together
+    let (a0, q0) = (pos(d.motion("anchor")), pos(d.motion("position")));
+    let a = d.center("program.motion.anchor");
+    d.press(a);
+    let a2 = d.move_by(a, egui::vec2(-30.0, 0.0), 5);
+    d.release(a2);
+    let (a1, q1) = (pos(d.motion("anchor")), pos(d.motion("position")));
+    assert!((a1 - a0).length() > 5.0 && (q1 - q0).length() > 5.0, "anchor {a0:?}→{a1:?}, position {q0:?}→{q1:?}");
+    assert_eq!(d.undo_len(), undo + 4);
     let _ = std::fs::remove_dir_all(&dir);
 }

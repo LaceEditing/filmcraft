@@ -391,6 +391,17 @@ pub struct UiState {
     /// keyframe lane). Delete deletes them, a drag moves them together, Copy / Paste copies them.
     #[serde(default)]
     pub kf_selected: Vec<KfSel>,
+    /// Effect Controls: where the property list ends and the keyframe area begins (fraction of the
+    /// panel's width; the divider between them drags).
+    #[serde(default = "default_ec_split")]
+    pub ec_split: f32,
+    /// Effect Controls: the part of the clip the keyframe area shows (zoomed in with its zoom bar
+    /// or Ctrl/Alt + wheel); None shows the whole clip.
+    #[serde(default)]
+    pub ec_view: Option<EcView>,
+    /// Effect Controls: height of a property's value graph (its bottom edge drags).
+    #[serde(default = "default_ec_graph_h")]
+    pub ec_graph_h: f32,
     pub show_menu_bar: bool,
     pub dark: bool,
     /// Lumetri scopes visible in the Program monitor area.
@@ -787,6 +798,22 @@ impl Default for DeleteTracksDraft {
     }
 }
 
+/// The time range the Effect Controls keyframe area shows for a clip (timeline ticks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EcView {
+    pub clip: u64,
+    pub start: i64,
+    pub end: i64,
+}
+
+fn default_ec_split() -> f32 {
+    0.5
+}
+
+fn default_ec_graph_h() -> f32 {
+    150.0
+}
+
 /// A keyframe selected in Effect Controls: its clip, effect index, parameter (and mask) and the
 /// media time it is stored at.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -859,6 +886,9 @@ impl Default for UiState {
             collapsed_fx: vec![],
             fx_selected: vec![],
             kf_selected: vec![],
+            ec_split: default_ec_split(),
+            ec_view: None,
+            ec_graph_h: default_ec_graph_h(),
             show_menu_bar: true,
             dark: true,
             show_scopes: false,

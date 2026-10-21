@@ -257,6 +257,11 @@ fn end_edit(app: &mut FilmcraftApp, ui: &egui::Ui) {
     ui.memory_mut(|m| m.surrender_focus(egui::Id::new(TEXT_EDIT_ID)));
 }
 
+/// Whether a title layer is under `p` on the Program monitor picture `pic`.
+pub fn layer_at(app: &FilmcraftApp, pic: Rect, frame: (u32, u32), p: Pos2) -> bool {
+    visible_layers(app, pic, frame).iter().any(|v| v.hit(p))
+}
+
 /// Draw the overlay and handle graphics tools on the Program monitor picture `pic`.
 pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32, u32)) {
     let t = app.tokens;
@@ -345,8 +350,9 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
     let editing = app.ui.gfx_edit.clone();
     let edit_view = editing.as_ref().and_then(|e| views.iter().find(|v| v.clip.0 == e.clip && v.layer == e.layer));
 
-    // ---- presses
-    if graphics_tool && resp.drag_started() {
+    // ---- presses (not one a clip's Motion box took: `motion_overlay`)
+    let motion = crate::panels::motion_overlay::claimed(ui);
+    if graphics_tool && resp.drag_started() && !motion {
         // where the button went down (a drag starts only after the pointer has moved a little)
         let p = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).unwrap_or(pic.center());
         let shift = ui.input(|i| i.modifiers.shift);
@@ -529,7 +535,7 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
         }
     }
     // ---- clicks
-    if graphics_tool && resp.clicked() && drag.is_none_or(|d| !matches!(d.kind, DragKind::TextSelect)) {
+    if graphics_tool && resp.clicked() && !motion && drag.is_none_or(|d| !matches!(d.kind, DragKind::TextSelect)) {
         let p = resp.interact_pointer_pos().unwrap_or(pic.center());
         let in_edit = edit_view.is_some_and(|v| v.hit(p));
         match tool {
