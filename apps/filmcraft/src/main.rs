@@ -160,6 +160,7 @@ fn main() -> eframe::Result {
                 }
             }
             let mut app = FilmcraftApp::new(session);
+            listen_for_file_drops(&mut app, cc);
             // the font pickers list the system's fonts: find them while the window opens
             filmcraft_ui_egui::panels::font_picker::scan_in_background();
             if recover == Some(false) {
@@ -287,6 +288,35 @@ fn agent_event_loop(agent: bool) -> Option<eframe::EventLoopBuilderHook> {
     let _ = agent;
     None
 }
+
+/// Files dragged in from file managers on Wayland, where winit does not report them (X11,
+/// Windows and macOS come through egui): `filmcraft_platform::file_drop` listens on the window's
+/// own connection and hands them to the app.
+#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+fn listen_for_file_drops(app: &mut FilmcraftApp, cc: &eframe::CreationContext<'_>) {
+    use filmcraft_platform::file_drop::{DropEvent, listen};
+    use filmcraft_ui_egui::FileDrag;
+    use raw_window_handle::HasDisplayHandle;
+    let Ok(handle) = cc.display_handle() else { return };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctx = cc.egui_ctx.clone();
+    let on_event = Box::new(move |e: DropEvent| {
+        let d = match e {
+            DropEvent::Hover { x, y } => FileDrag::Hover(egui::pos2(x, y)),
+            DropEvent::Leave => FileDrag::Leave,
+            DropEvent::Drop { paths, x, y } => FileDrag::Drop(paths, egui::pos2(x, y)),
+        };
+        if tx.send(d).is_ok() {
+            ctx.request_repaint();
+        }
+    });
+    if let Some(listener) = listen(handle.as_raw(), on_event) {
+        app.set_file_drags(rx, Box::new(listener));
+    }
+}
+
+#[cfg(not(all(target_os = "linux", not(target_arch = "wasm32"))))]
+fn listen_for_file_drops(_: &mut FilmcraftApp, _: &eframe::CreationContext<'_>) {}
 
 #[cfg(test)]
 mod tests {

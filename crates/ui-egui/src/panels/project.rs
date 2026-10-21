@@ -270,6 +270,34 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let v = view_of(app, inst);
     body(app, ui, rect, &v, &mut actions);
     run(app, ui.ctx(), actions);
+    file_drop_target(app, ui, rect, v.bin);
+}
+
+/// Files dragged in from a file manager: the panel lights up as the place to drop them, and
+/// takes a drop on it into the bin it shows (folders become bins; see `file.import`).
+fn file_drop_target(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, bin: BinId) {
+    let root = app.session.project.root.id;
+    let target = (bin != root).then_some(bin.0);
+    if let Some(at) = app.file_hover {
+        let t = app.tokens;
+        let over = rect.contains(at);
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 4.0, t.accent.gamma_multiply(if over { 0.16 } else { 0.07 }));
+        p.rect_stroke(rect.shrink(1.0), 4.0, Stroke::new(if over { 2.5 } else { 1.5 }, t.accent), egui::StrokeKind::Inside);
+        let name = app.session.project.root.find_bin(bin).map(|b| b.name.clone()).filter(|_| target.is_some());
+        let text = match name {
+            Some(n) => format!("Drop to import into \"{n}\""),
+            None => "Drop to import".to_string(),
+        };
+        p.text(rect.center(), Align2::CENTER_CENTER, text, Tokens::ui(15.0), t.text);
+        ui.ctx().request_repaint();
+    }
+    app.auto.add("project.dropTarget", rect, "Drop files to import");
+    if app.pending_drop.as_ref().is_some_and(|(_, at)| rect.contains(*at))
+        && let Some((paths, _)) = app.pending_drop.take()
+    {
+        app.import_dropped(paths, target);
+    }
 }
 
 fn tab_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, strip: Rect, docked: &[usize]) {

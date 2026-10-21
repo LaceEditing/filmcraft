@@ -41,6 +41,11 @@ filmcraft-time = { workspace = true }
 filmcraft-export = { workspace = true }
 filmcraft-h264enc = { workspace = true }
 libloading = { workspace = true }
+# files dropped from other applications on Wayland (winit reports them on X11 only)
+raw-window-handle = "0.6"
+rustix = { version = "1", features = ["event"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
 
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }

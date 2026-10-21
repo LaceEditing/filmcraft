@@ -93,3 +93,46 @@ fn project_is_named_after_its_file() {
     assert_eq!(s.project.name, "Apollo 11 - Tranquility");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A folder dropped (or chosen) for import becomes a bin of its media, its sub-folders bins
+/// inside it, as in Premiere; hidden files and what is not media (a project file, notes, a
+/// `.pek` waveform cache) are left out and counted. Before, a folder was an error.
+#[test]
+fn importing_a_folder_makes_bins_of_its_media() {
+    let d = temp_dir("folder-import");
+    let shoot = d.join("Shoot");
+    std::fs::create_dir_all(shoot.join("Audio")).unwrap();
+    let wav = filmcraft_media::wav::write_wav16(&[0.0; 4800], 2, 48_000);
+    std::fs::write(shoot.join("b.wav"), &wav).unwrap();
+    std::fs::write(shoot.join("a.wav"), &wav).unwrap();
+    std::fs::write(shoot.join("Audio").join("voice.wav"), &wav).unwrap();
+    std::fs::write(shoot.join("notes.md"), "notes").unwrap();
+    std::fs::write(shoot.join("a.wav 48000.pek"), "x").unwrap();
+    std::fs::write(shoot.join(".hidden.wav"), &wav).unwrap();
+    let mut s = demo();
+    let r = s.execute("file.import", json!({"paths": [shoot.to_string_lossy()]})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 3, "{r}");
+    assert_eq!(r["bins"].as_array().unwrap().len(), 2, "{r}");
+    assert!(r["errors"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().starts_with("2 file(s)")), "{r}");
+    let bin = s.project.root.children.iter().find_map(|c| match c {
+        filmcraft_project::BinEntry::Bin(b) if b.name == "Shoot" => Some(b.clone()),
+        _ => None,
+    });
+    let bin = bin.expect("a bin named after the folder");
+    let names = |b: &filmcraft_project::Bin, s: &Session| -> Vec<String> {
+        b.children
+            .iter()
+            .filter_map(|c| match c {
+                filmcraft_project::BinEntry::Item(i) => s.project.item(*i).map(|it| it.name.clone()),
+                filmcraft_project::BinEntry::Bin(sub) => Some(format!("[{}]", sub.name)),
+            })
+            .collect()
+    };
+    assert_eq!(names(&bin, &s), ["[Audio]", "a.wav", "b.wav"]);
+    // into a bin of the user's choice (the Project panel's)
+    let target = s.execute("file.newBin", json!({"name": "Drops"})).unwrap()["bin"].as_u64().unwrap();
+    let r = s.execute("file.import", json!({"paths": [shoot.join("a.wav").to_string_lossy()], "bin": target})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 1);
+    let drops = s.project.root.find_bin(filmcraft_project::BinId(target)).unwrap().clone();
+    assert_eq!(names(&drops, &s), ["a.wav"]);
+}

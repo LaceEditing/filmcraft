@@ -22,6 +22,8 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+pub mod file_drop;
 pub mod hybrid;
 #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
 mod nvidia;

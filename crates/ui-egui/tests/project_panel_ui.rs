@@ -595,3 +595,69 @@ fn media_browser_drag_imports_into_the_project_panel() {
     assert_eq!(d.app().session.project.items.len(), n0 + 1, "kept after a drop on the Timeline");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Files dragged in from a file manager (on Wayland through `filmcraft_platform::file_drop`, fed
+/// to the app as here): while they hover, the Project panel lights up as the drop target; dropped
+/// on it they are imported into the bin it shows (a folder as a bin); dropped elsewhere, into the
+/// project's root. Before, a drag from Dolphin on KDE Wayland did nothing.
+#[test]
+fn files_dropped_from_a_file_manager_are_imported() {
+    let dir = std::env::temp_dir().join(format!("fc-drop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Folder")).unwrap();
+    let wav = filmcraft_media::wav::write_wav16(&[0.0; 4800], 2, 48_000);
+    for p in ["one.wav", "two.wav", "Folder/three.wav"] {
+        std::fs::write(dir.join(p), &wav).unwrap();
+    }
+    let path = |p: &str| dir.join(p).to_string_lossy().to_string();
+    let mut session = Session::default();
+    session.execute("file.openDemoProject", json!({})).expect("demo project");
+    let (ftx, frx) = channel();
+    let (tx, rx) = channel();
+    let mut app = FilmcraftApp::new(session).with_control(rx);
+    app.set_file_drags(frx, Box::new(()));
+    let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).build_eframe(move |_cc| app);
+    let mut d = Driver { harness, tx, snapshots: None };
+    d.frames(4);
+    d.ok("ui.panel.show", json!({"panel": "Project"}));
+    d.frames(3);
+    let items = |d: &mut Driver| d.exec("project.inspect", json!({})).to_string();
+    let r = d.rect("project.dropTarget");
+    let inside = egui::pos2(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+    // hovering: the drop target is shown
+    ftx.send(filmcraft_ui_egui::FileDrag::Hover(inside)).unwrap();
+    d.frames(2);
+    assert_eq!(d.harness.state().file_hover, Some(inside));
+    // dropped on the Project panel, inside a bin it shows
+    let bin = d.exec("file.newBin", json!({"name": "Dropped Here"}))["bin"].as_u64().unwrap();
+    d.harness.state_mut().ui.project_panel.bin = Some(bin);
+    d.frames(2);
+    ftx.send(filmcraft_ui_egui::FileDrag::Drop(vec![path("one.wav"), path("Folder")], inside)).unwrap();
+    d.frames(3);
+    assert_eq!(d.harness.state().file_hover, None, "the highlight goes with the drop");
+    let st = d.harness.state();
+    let b = st.session.project.root.find_bin(filmcraft_project::BinId(bin)).unwrap().clone();
+    let names: Vec<String> = b
+        .children
+        .iter()
+        .map(|c| match c {
+            BinEntry::Item(i) => st.session.project.item(*i).map(|it| it.name.clone()).unwrap_or_default(),
+            BinEntry::Bin(sub) => format!("[{}]", sub.name),
+        })
+        .collect();
+    assert_eq!(names, ["[Folder]", "one.wav"], "{}", items(&mut d));
+    // dropped outside it (the timeline): into the root, the next frame
+    ftx.send(filmcraft_ui_egui::FileDrag::Hover(egui::pos2(1500.0, 900.0))).unwrap();
+    ftx.send(filmcraft_ui_egui::FileDrag::Drop(vec![path("two.wav")], egui::pos2(1500.0, 900.0))).unwrap();
+    d.frames(3);
+    let st = d.harness.state();
+    assert!(
+        st.session.project.root.children.iter().any(|c| matches!(c, BinEntry::Item(i) if st.session.project.item(*i).is_some_and(|it| it.name == "two.wav"))),
+        "into the root"
+    );
+    // a drag that leaves
+    ftx.send(filmcraft_ui_egui::FileDrag::Hover(inside)).unwrap();
+    ftx.send(filmcraft_ui_egui::FileDrag::Leave).unwrap();
+    d.frames(2);
+    assert_eq!(d.harness.state().file_hover, None);
+}

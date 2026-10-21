@@ -36,6 +36,15 @@ use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
 pub use control::ControlRequest;
+
+/// A drag of files from another application, as the platform reports it (positions in the
+/// window's logical pixels).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileDrag {
+    Hover(egui::Pos2),
+    Leave,
+    Drop(Vec<String>, egui::Pos2),
+}
 use dock::PanelKind;
 use frames::{FrameKey, FrameServer, Target};
 use state::UiState;
@@ -251,6 +260,16 @@ pub struct FilmcraftApp {
     pub tl: panels::timeline::TlState,
     /// Commands from outside the UI (native menu bar), invoked on the UI thread.
     pub command_inbox: Option<Receiver<String>>,
+    /// Files dragged in from other applications where the toolkit does not report them
+    /// (Wayland; see [`FilmcraftApp::listen_for_file_drops`]).
+    pub file_drags: Option<Receiver<FileDrag>>,
+    /// What keeps that listener running (dropped on exit, before the window).
+    file_drop_listener: Option<Box<dyn std::any::Any>>,
+    /// Where files from another application are being dragged over the window (points).
+    pub file_hover: Option<egui::Pos2>,
+    /// Files dropped this frame, for the panel under them to take (the Project panel imports
+    /// them into the bin it shows); next frame, ones no panel took go to the project's root.
+    pub pending_drop: Option<(Vec<String>, egui::Pos2)>,
     /// GPU compositor (when running on wgpu): device state + compositor + the egui texture it feeds.
     pub gpu: Option<GpuState>,
     /// Preview render job being watched (job id, where to start playing when it completes).
@@ -458,6 +477,10 @@ impl FilmcraftApp {
             toast: None,
             tl: Default::default(),
             command_inbox: None,
+            file_drags: None,
+            file_drop_listener: None,
+            file_hover: None,
+            pending_drop: None,
             gpu: None,
             watched_render: None,
             applied_prefs: None,
@@ -470,6 +493,14 @@ impl FilmcraftApp {
         let (dock, floating) = (app.ui.dock.clone(), app.ui.floating.clone());
         app.docking.set_persisted(&dock, &floating);
         app
+    }
+
+    /// Take files dragged in from other applications from `rx` (the desktop app feeds it on
+    /// Wayland, where winit does not report them; X11, Windows and macOS come through egui, see
+    /// [`Self::handle_drops`]). `keep` keeps the feeding listener alive until exit.
+    pub fn set_file_drags(&mut self, rx: Receiver<FileDrag>, keep: Box<dyn std::any::Any>) {
+        self.file_drags = Some(rx);
+        self.file_drop_listener = Some(keep);
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
@@ -1125,18 +1156,62 @@ impl FilmcraftApp {
         }
     }
 
-    /// Import dropped files.
+    /// Files dragged in from other applications: where they hover, and the ones dropped (handed
+    /// to the panel under them for a frame; see [`Self::pending_drop`]).
     fn handle_drops(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        let mut paths = Vec::new();
-        for f in dropped {
-            let p = f.path();
-            if p.exists() {
-                paths.push(p.to_string_lossy().to_string());
-            }
+        // dropped last frame where no panel took them: into the project's root
+        if let Some((paths, _)) = self.pending_drop.take() {
+            self.import_dropped(paths, None);
         }
+        // the toolkit's own (X11, Windows, macOS)
+        let (hovered, dropped, pointer) = ctx.input(|i| (!i.raw.hovered_files.is_empty(), i.raw.dropped_files.clone(), i.pointer.latest_pos()));
+        let at = pointer.unwrap_or_default();
+        if hovered {
+            self.file_hover = Some(at);
+        }
+        let paths: Vec<String> = dropped.iter().map(|f| f.path()).filter(|p| p.exists()).map(|p| p.to_string_lossy().to_string()).collect();
         if !paths.is_empty() {
-            let _ = self.session.execute("file.import", json!({"paths": paths}));
+            self.file_hover = None;
+            self.pending_drop = Some((paths, at));
+        } else if !hovered && self.file_drags.is_none() {
+            self.file_hover = None;
+        }
+        // Wayland's, in logical pixels
+        let zoom = ctx.zoom_factor().max(0.1);
+        if let Some(rx) = self.file_drags.take() {
+            while let Ok(d) = rx.try_recv() {
+                match d {
+                    FileDrag::Hover(p) => self.file_hover = Some((p.to_vec2() / zoom).to_pos2()),
+                    FileDrag::Leave => self.file_hover = None,
+                    FileDrag::Drop(paths, p) => {
+                        self.file_hover = None;
+                        if !paths.is_empty() {
+                            self.pending_drop = Some((paths, (p.to_vec2() / zoom).to_pos2()));
+                        }
+                    }
+                }
+            }
+            self.file_drags = Some(rx);
+        }
+        if self.pending_drop.is_some() {
+            // next frame imports what no panel took
+            ctx.request_repaint();
+        }
+    }
+
+    /// Import files dropped from another application (folders become bins) into `bin`.
+    pub fn import_dropped(&mut self, paths: Vec<String>, bin: Option<u64>) {
+        let mut p = json!({"paths": paths});
+        if let Some(b) = bin {
+            p["bin"] = json!(b);
+        }
+        match self.session.execute("file.import", p) {
+            Ok(v) => {
+                let n = v.get("items").and_then(Value::as_array).map_or(0, Vec::len);
+                let errors: Vec<&str> = v.get("errors").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                self.ui.status = if errors.is_empty() { format!("Imported {n} item(s)") } else { errors.join("; ") };
+            }
+            Err(e) => self.ui.status = e.to_string(),
         }
     }
 
@@ -1755,6 +1830,8 @@ impl eframe::App for FilmcraftApp {
     }
 
     fn on_exit(&mut self) {
+        // the drop listener uses the window's connection: it stops before the window goes
+        self.file_drop_listener = None;
         self.persist_layout(true);
         // Flush the recovery journal and stop the auto-save worker; a session with nothing unsaved
         // removes its journal, one with unsaved changes keeps it for the next launch.

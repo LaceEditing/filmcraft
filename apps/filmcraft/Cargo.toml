@@ -19,6 +19,8 @@ whisper = ["filmcraft-engine/whisper", "filmcraft-engine/speech-download"]
 filmcraft-engine = { workspace = true }
 filmcraft-ui-egui = { workspace = true }
 filmcraft-platform = { workspace = true }
+# the window's display connection, for file drops on Wayland (filmcraft_platform::file_drop)
+raw-window-handle = "0.6"
 filmcraft-gpu = { workspace = true, features = ["headless"] }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11"] }

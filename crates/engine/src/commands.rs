@@ -491,6 +491,50 @@ pub fn import_image_sequence(s: &mut Session, path: &str, bin: Option<filmcraft_
 }
 
 /// Settings ▸ Media ▸ Import image sequences: a single numbered still with later frames beside it.
+/// Folders inside folders that import walks into, and files it takes from them at most.
+const FOLDER_DEPTH: usize = 8;
+const FOLDER_FILES: usize = 10_000;
+
+/// Import a folder as Premiere does: a bin named after it (in `parent`) holding its media files
+/// and, as bins of their own, its sub-folders. Files are queued in `targets` with their bin;
+/// hidden files and what is not media (project files, documents, `.pek` caches…) are counted in
+/// `skipped`.
+fn import_folder(
+    s: &mut Session,
+    dir: &std::path::Path,
+    parent: Option<filmcraft_project::BinId>,
+    depth: usize,
+    targets: &mut Vec<(String, Option<filmcraft_project::BinId>)>,
+    bins: &mut Vec<filmcraft_project::BinId>,
+    skipped: &mut usize,
+) -> Result<()> {
+    if depth > FOLDER_DEPTH {
+        return Ok(());
+    }
+    let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Folder".into());
+    let mut entries: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+        Err(e) => return Err(EngineError::Other(format!("{}: {e}", dir.display()))),
+    };
+    entries.sort();
+    let bin = s.edit("New Bin", |pr, _| Ok(pr.add_bin(&name, parent)))?;
+    bins.push(bin);
+    for e in entries {
+        let hidden = e.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if hidden {
+            continue;
+        }
+        if e.is_dir() {
+            import_folder(s, &e, Some(bin), depth + 1, targets, bins, skipped)?;
+        } else if filmcraft_media::is_importable(&e) && targets.len() < FOLDER_FILES {
+            targets.push((e.to_string_lossy().to_string(), Some(bin)));
+        } else {
+            *skipped += 1;
+        }
+    }
+    Ok(())
+}
+
 fn detect_image_sequence(s: &Session, path: &str) -> bool {
     filmcraft_media::sequence::Numbered::parse(path).is_some() && crate::media_pool::image_sequence_frames(path, &*s.services).is_ok_and(|f| f.len() > 1)
 }
@@ -883,7 +927,21 @@ fn build() -> Vec<CommandSpec> {
             // Settings ▸ Media ▸ Import image sequences on, a single numbered still is detected.
             let as_sequence = p.get("imageSequence").and_then(Value::as_bool).unwrap_or(false);
             let detect = !as_sequence && s.prefs.media.import_image_sequences && paths.len() == 1;
+            // a folder becomes a bin of its media (sub-folders, bins inside it), as in Premiere
+            let mut skipped = 0usize;
+            let mut bins = Vec::new();
+            let mut targets: Vec<(String, Option<filmcraft_project::BinId>)> = Vec::new();
             for path in paths {
+                if std::path::Path::new(&path).is_dir() {
+                    import_folder(s, std::path::Path::new(&path), bin, 0, &mut targets, &mut bins, &mut skipped)?;
+                } else {
+                    targets.push((path, bin));
+                }
+            }
+            if skipped > 0 {
+                errors.push(format!("{skipped} file(s) in the folders are not media FilmCraft imports and were left out"));
+            }
+            for (path, bin) in targets {
                 if as_sequence || (detect && detect_image_sequence(s, &path)) {
                     match import_image_sequence(s, &path, bin) {
                         Ok((id, frames, missing)) => {
@@ -926,7 +984,7 @@ fn build() -> Vec<CommandSpec> {
                     Err(e) => errors.push(format!("{path}: {e}")),
                 }
             }
-            if ids.is_empty() && sequences.is_empty() && reports.is_empty() && !errors.is_empty() {
+            if ids.is_empty() && sequences.is_empty() && reports.is_empty() && bins.is_empty() && !errors.is_empty() {
                 return Err(EngineError::Other(errors.join("; ")));
             }
             // Project Settings ▸ Ingest: copy / transcode / create proxies
@@ -963,6 +1021,9 @@ fn build() -> Vec<CommandSpec> {
             };
             if !image_sequences.is_empty() {
                 out["imageSequences"] = json!(image_sequences);
+            }
+            if !bins.is_empty() {
+                out["bins"] = json!(bins.iter().map(|b: &filmcraft_project::BinId| b.0).collect::<Vec<_>>());
             }
             Ok(out)
         }),
