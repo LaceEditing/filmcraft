@@ -69,19 +69,6 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
                 d.set_param("mix", f(e, "mix", t));
             },
         },
-        "parametric_eq" => Mapping {
-            dsp: "simple_eq",
-            preroll: |_, _| 0.05,
-            apply: |d, e, t| {
-                d.set_param("low_freq", f(e, "low_freq", t));
-                d.set_param("low", f(e, "low_gain", t));
-                d.set_param("mid_freq", f(e, "mid_freq", t));
-                d.set_param("mid", f(e, "mid_gain", t));
-                d.set_param("mid_q", f(e, "mid_q", t));
-                d.set_param("high_freq", f(e, "high_freq", t));
-                d.set_param("high", f(e, "high_gain", t));
-            },
-        },
         // Single-band filters via band 1 of the parametric EQ (types: see FILTER_TYPE_NAMES).
         "highpass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| band(d, 4.0, f(e, "cutoff", t), 0.707) },
         "lowpass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| band(d, 3.0, f(e, "cutoff", t), 0.707) },
@@ -476,5 +463,25 @@ mod tests {
         assert!((fx.transfer_db(0, 0.0).unwrap() + 10.0).abs() < 1e-3, "−20 dB threshold, 2:1");
         assert_eq!(latency("fft_filter", 48000), 2048);
         assert_eq!(latency("amplify", 48000), 0);
+    }
+
+    /// Every band of the Parametric Equalizer plays and draws, with its switch: before, it ran
+    /// as a three-band EQ (low shelf, band 3, high shelf), so bands 1, 2, 4, 5, the pass
+    /// filters, the band switches and the master gain did nothing to the sound or the curve.
+    #[test]
+    fn parametric_eq_plays_all_nine_bands() {
+        use filmcraft_project::ParamValue;
+        let def = filmcraft_project::find_effect("parametric_eq").unwrap();
+        let mut inst = def.instance();
+        inst.param_mut("b1_gain").unwrap().value = ParamValue::Float(9.0);
+        let fx = configured(&inst, Tick::ZERO, 48000).unwrap();
+        assert!((fx.response_db(50.0).unwrap() - 9.0).abs() < 0.5, "band 1 at its 50 Hz: {}", fx.response_db(50.0).unwrap());
+        inst.param_mut("b1_on").unwrap().value = ParamValue::Bool(false);
+        inst.param_mut("hp_on").unwrap().value = ParamValue::Bool(true);
+        inst.param_mut("hp_freq").unwrap().value = ParamValue::Float(200.0);
+        inst.param_mut("master_gain").unwrap().value = ParamValue::Float(-6.0);
+        let fx = configured(&inst, Tick::ZERO, 48000).unwrap();
+        assert!(fx.response_db(50.0).unwrap() < -40.0, "band 1 off, 24 dB/Oct high-pass at 200 Hz");
+        assert!((fx.response_db(2000.0).unwrap() + 6.0).abs() < 0.2, "master gain");
     }
 }

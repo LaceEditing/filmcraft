@@ -994,6 +994,15 @@ impl<'a, 'i> Writer<'a, 'i> {
             value.range(),
             format!("<StartKeyframeValue Encoding=\"base64\" BinaryHash=\"{hash}\">{}</StartKeyframeValue>", crate::prproj_text::base64_encode(&bytes)),
         );
+        // Premiere names a text layer by its text (Effect Controls' "Text (…)")
+        let text = match e.params.get("text").map(|p| &p.value) {
+            Some(filmcraft_project::ParamValue::Text(t)) => t.replace('\n', "\r"),
+            _ => String::new(),
+        };
+        if let Some(body) = child(comp.node, "Component") {
+            let ci = self.inst_of(comp.node, copies);
+            self.set_child(ci, body, "InstanceName", &text);
+        }
         self.report.info(format!("title \"{clip}\": text and formatting written"));
     }
 
@@ -1973,8 +1982,10 @@ impl<'a, 'i> Writer<'a, 'i> {
         let mut added_refs: Vec<String> = Vec::new();
         let mut borrowing = false;
         let mut seen: HashMap<&str, usize> = HashMap::new();
+        // (a title's Vector Motion goes first in its chain, as Premiere has it)
+        let mut front_refs: Vec<String> = Vec::new();
         for e in &c.effects {
-            let Some(def) = filmcraft_project::find_effect(&e.effect).filter(|d| !d.intrinsic) else { continue };
+            let Some(def) = filmcraft_project::find_effect(&e.effect).filter(|d| !d.intrinsic || crate::prproj_new::written_vector_motion(e)) else { continue };
             if def.id == filmcraft_project::graphic::SHAPE_LAYER {
                 let n = seen.entry(e.effect.as_str()).or_insert(0);
                 *n += 1;
@@ -2055,14 +2066,22 @@ impl<'a, 'i> Writer<'a, 'i> {
                 // its text and formatting
                 self.write_title(&model, e, &model_copies, &c.name);
             }
-            added_refs.push(self.id_of(ci));
+            if def.id == filmcraft_project::graphic::VECTOR_MOTION {
+                front_refs.push(self.id_of(ci));
+            } else {
+                added_refs.push(self.id_of(ci));
+            }
             self.report.info(format!("added \"{}\" to a clip (modelled on another one in the project)", def.name));
         }
-        if (keep_refs.iter().any(|k| !k) || !added_refs.is_empty())
+        if (keep_refs.iter().any(|k| !k) || !added_refs.is_empty() || !front_refs.is_empty())
             && let Some(list) = self.ix.at(chain, &["ComponentChain", "Components"])
         {
             let mut refs = String::new();
             let mut i = 0;
+            for id in &front_refs {
+                refs.push_str(&format!("<Component Index=\"{i}\" ObjectRef=\"{id}\" />"));
+                i += 1;
+            }
             for (r, keep) in list.children().filter(|n| n.has_tag_name("Component")).zip(keep_refs.iter().copied().chain(std::iter::repeat(true))) {
                 if !keep {
                     continue;
@@ -2081,7 +2100,7 @@ impl<'a, 'i> Writer<'a, 'i> {
                 i += 1;
             }
             self.set_list(chain_inst, list, &refs);
-        } else if (!added_refs.is_empty() || borrowing) && self.ix.at(chain, &["ComponentChain", "Components"]).is_none() {
+        } else if (!added_refs.is_empty() || !front_refs.is_empty() || borrowing) && self.ix.at(chain, &["ComponentChain", "Components"]).is_none() {
             // the chain has no list to add them to yet
             need.list = true;
         }

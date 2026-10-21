@@ -1003,6 +1003,105 @@ fn audio_effect_settings_read_and_write_in_their_units() {
     assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
 }
 
+/// A title's Vector Motion (Premiere's `AE.ADBE Graphic Group`: Scale 598 and a keyframed
+/// Position on RahulRai2's "FFF" title) comes in as FilmCraft's Vector Motion — before, it was
+/// left out, so the giant letters rendered small and new projects lost them — and an edit to it is
+/// written back.
+#[test]
+fn title_vector_motion_round_trips() {
+    let comps = "<VideoFilterComponent ObjectID=\"930\"><Component><Params><Param Index=\"0\" ObjectRef=\"931\"/><Param Index=\"1\" ObjectRef=\"932\"/><Param Index=\"2\" ObjectRef=\"933\"/><Param Index=\"3\" ObjectRef=\"934\"/><Param Index=\"4\" ObjectRef=\"935\"/><Param Index=\"5\" ObjectRef=\"936\"/></Params><ID>3</ID><DisplayName>Vector Motion</DisplayName><Intrinsic>true</Intrinsic></Component><MatchName>AE.ADBE Graphic Group</MatchName><VideoFilterType>2</VideoFilterType></VideoFilterComponent>\n  \
+         <PointComponentParam ObjectID=\"931\"><Name>Position</Name><IsTimeVarying>true</IsTimeVarying><StartKeyframe>-91445760000000000,3.9:0.8,0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe><Keyframes>2540160000000,3.9:0.8,0,0,0,0,0,0,5,4,0,0,0,0;3048192000000,-1.9:0.8,0,0,0,0,0,0,5,4,0,0,0,0;</Keyframes></PointComponentParam>\n  \
+         <VideoComponentParam ObjectID=\"932\"><Name>Scale</Name><StartKeyframe>-91445760000000000,598.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>\n  \
+         <VideoComponentParam ObjectID=\"933\"><Name>Scale Width</Name><StartKeyframe>-91445760000000000,100.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>\n  \
+         <VideoComponentParam ObjectID=\"934\"><Name> </Name><StartKeyframe>-91445760000000000,true,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>\n  \
+         <VideoComponentParam ObjectID=\"935\"><Name>Rotation</Name><StartKeyframe>-91445760000000000,0.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>\n  \
+         <PointComponentParam ObjectID=\"936\"><Name>Anchor Point</Name><StartKeyframe>-91445760000000000,0.5:0.5,0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe></PointComponentParam>\n";
+    let text = doc()
+        .replace("<Component Index=\"1\" ObjectRef=\"48\"/>", "<Component Index=\"1\" ObjectRef=\"48\"/><Component Index=\"2\" ObjectRef=\"930\"/>")
+        .replace("</PremiereData>", &format!("  {comps}</PremiereData>"));
+    assert!(text.contains("ObjectRef=\"930\""), "the fixture changed");
+    let (imp, report) = import(text.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let clip = &p.sequence(sid).unwrap().video_tracks[0].items[0];
+    let vm = clip.effect("vector_motion").unwrap_or_else(|| panic!("Vector Motion read: {report}"));
+    assert_eq!(vm.params["scale"].value, ParamValue::Float(598.0));
+    assert_eq!(vm.params["position"].keyframes.len(), 2, "its Position keyframes");
+    let ParamValue::Vec2(at) = &vm.params["position"].keyframes[0].value else { panic!() };
+    assert!((at.x - 3.9 * 2560.0).abs() < 1e-6, "in the source's pixels: {at:?}");
+    // the title's layers move with it
+    let g = filmcraft_project::graphic::group_transform(std::slice::from_ref(vm), filmcraft_time::Tick(0), (2560, 1440)).expect("not at its defaults");
+    let corner = g.apply(filmcraft_geom::Vec2::new(1280.0 + 10.0, 720.0));
+    assert!((corner.x - (3.9 * 2560.0 + 59.8)).abs() < 1e-6, "scaled ×5.98 about its centre: {corner:?}");
+    {
+        let c = &mut p.sequence_mut(sid).unwrap().video_tracks[0].items[0];
+        c.effect_mut("vector_motion").unwrap().params.insert("scale".into(), Param::new(ParamValue::Float(300.0)));
+    }
+    let (out, report) = export(&p, text.as_bytes(), &[], None).unwrap();
+    let written = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(written.contains("<Name>Scale</Name><StartKeyframe>-91445760000000000,300"), "Scale written: {report}");
+    let (again_imp, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&again_imp.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text, "unchanged: the same document");
+}
+
+/// The Parametric Equalizer's pass filters and shelf slopes (values from an EQ edited in
+/// Premiere: High-Pass on at 197 Hz, 6 dB/Oct saved as 0.1, Low-Pass at its default 24 dB/Oct =
+/// 0.4, Low Shelf Filter Order 1 = the steeper shelf) come in, and edits go back as Premiere saves
+/// them. Before, FilmCraft left the pass filters and slopes at its own defaults.
+#[test]
+fn parametric_eq_pass_filters_and_slopes_round_trip() {
+    let param = |id: u32, name: &str, v: Option<&str>| {
+        let value = v.map_or(String::new(), |v| format!("<StartKeyframe>-91445760000000000,{v},0,0,0,0,0,0</StartKeyframe>"));
+        format!("<AudioComponentParam ObjectID=\"{id}\" ClassID=\"a714635e-a628-4b27-9d59-77eba47dbc1a\">{value}<Name>{name}</Name></AudioComponentParam>\n  ")
+    };
+    let params = [
+        (921, "High-Pass Filter Enable", None),
+        (922, "High-Pass Cutoff Frequency", Some("0.007378276903")),
+        (923, "High-Pass Slope", Some("0.10000000149")),
+        (924, "Low-Pass Slope", Some("0.40000000596")),
+        (925, "Low Shelf Filter Order", Some("1.")),
+    ];
+    let refs: String = params.iter().enumerate().map(|(i, (id, ..))| format!("<Param Index=\"{}\" ObjectRef=\"{id}\"/>", i + 1)).collect();
+    let mut comps = format!(
+        "<AudioFilterComponent ObjectID=\"920\"><AudioComponent><Component><Params><Param Index=\"0\" ObjectRef=\"901\"/>{refs}</Params></Component></AudioComponent><FilterMatchName>8edcd326-33de-4a4d-985b-f1bf48ed1427</FilterMatchName></AudioFilterComponent>\n  \
+         <AudioComponentParam ObjectID=\"901\" ClassID=\"32657501-3aa4-445f-a49b-d09ecb9fa1ae\"><Name>Bypass</Name></AudioComponentParam>\n  "
+    );
+    for (id, name, v) in params {
+        comps.push_str(&param(id, name, v));
+    }
+    let text = doc()
+        .replace(
+            "<Components><Component Index=\"0\" ObjectRef=\"74\"/></Components>",
+            "<Components><Component Index=\"0\" ObjectRef=\"74\"/><Component Index=\"1\" ObjectRef=\"920\"/></Components>",
+        )
+        .replace("</PremiereData>", &format!("  {comps}</PremiereData>"));
+    assert!(text.contains("ObjectRef=\"920\""), "the fixture changed");
+    let (imp, report) = import(text.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let eq = p.sequence(sid).unwrap().audio_tracks[0].items[0].effect("parametric_eq").expect("Parametric Equalizer").clone();
+    assert_eq!(eq.params["hp_on"].value, ParamValue::Bool(true), "no value: on ({report})");
+    let ParamValue::Float(hz) = eq.params["hp_freq"].value else { panic!() };
+    assert!((hz - 196.93).abs() < 0.01, "{hz}");
+    assert_eq!(eq.params["hp_slope"].value, ParamValue::Choice(0), "6 dB/Oct");
+    assert_eq!(eq.params["lp_slope"].value, ParamValue::Choice(3), "24 dB/Oct");
+    assert_eq!(eq.params["low_steep"].value, ParamValue::Bool(true));
+    {
+        let a1 = &mut p.sequence_mut(sid).unwrap().audio_tracks[0].items[0];
+        a1.effect_mut("parametric_eq").unwrap().params.insert("lp_slope".into(), Param::new(ParamValue::Choice(6)));
+    }
+    let (out, report) = export(&p, text.as_bytes(), &[], None).unwrap();
+    let written = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(written.contains("-91445760000000000,0.8,"), "48 dB/Oct is 0.8: {report}");
+    let back = read(&out);
+    let a1 = &back.sequences().find_map(|i| i.as_sequence()).unwrap().audio_tracks[0].items[0];
+    assert_eq!(a1.effect("parametric_eq").unwrap().params["lp_slope"].value, ParamValue::Choice(6));
+    let (again_imp, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&again_imp.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text, "unchanged: the same document");
+}
+
 /// A title made in FilmCraft (a graphic with two text layers) is written as Premiere writes one:
 /// `GRFV` media, a clip whose chain holds a text layer per FilmCraft layer, the text and
 /// formatting in `Source Text`; read back, it is the same title. Before, it was left out.
@@ -1058,6 +1157,9 @@ fn titles_made_in_filmcraft_are_written() {
     let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
     assert!(text.contains(&format!("<FilePath>{}</FilePath>", u32::from_be_bytes(*b"GRFV"))), "Premiere's title media");
     assert_eq!(text.matches("<MatchName>AE.ADBE Text</MatchName>").count(), 2, "one text layer per FilmCraft layer");
+    // each named by its own text, as Premiere names them in Effect Controls (they were all
+    // "Text (Base)", the name of the layer they were copied from)
+    assert!(text.contains("<InstanceName>Jane Doe</InstanceName>") && text.contains("<InstanceName>Editor</InstanceName>"), "layer names");
     let back = read(&out);
     let q = back.sequences().find_map(|i| i.as_sequence()).unwrap();
     let c = q.video_tracks[0].items.iter().find(|c| c.start == Tick(10 * S)).expect("the title clip");

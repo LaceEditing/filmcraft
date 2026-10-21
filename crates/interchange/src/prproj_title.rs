@@ -601,14 +601,21 @@ pub(crate) fn to_layer(tree: &Tree, e: &mut EffectInstance) -> Unread {
     unread.kerning |= runs.iter().filter_map(|r| tab(r, 1)).any(|st| f32_of(st, 7).is_some());
     // paragraph
     set("align", ParamValue::Choice(align_in(u32_of(doc, 4).unwrap_or(0))));
-    if let (Some(w), Some(_)) = (f32_of(doc, 2).filter(|w| *w > 0.0), f32_of(doc, 3)) {
+    if let (Some(w), Some(h)) = (f32_of(doc, 2).filter(|w| *w > 0.0), f32_of(doc, 3)) {
         set("box_width", ParamValue::Float(f64::from(w)));
+        set("box_height", ParamValue::Float(f64::from(h.max(0.0))));
+        // vertical paragraph alignment (observed: 1 = centre; absent = top)
+        set("valign", ParamValue::Choice(u32_of(doc, 5).filter(|v| *v <= 2).unwrap_or(0)));
     }
     if let Some(v) = f32_of(doc, 6) {
         set("leading", ParamValue::Float(f64::from(v)));
     }
     set("vertical", ParamValue::Bool(flag(doc, 9)));
-    set("top_left_origin", ParamValue::Bool(true));
+    // Premiere places paragraph text by its box's top-left corner and point text by its first
+    // baseline (Position at the alignment point; measured in Premiere 26.5: "Base" at 960,540
+    // sits on y = 540)
+    let paragraph = f32_of(doc, 2).is_some_and(|w| w > 0.0) && f32_of(doc, 3).is_some();
+    set("top_left_origin", ParamValue::Bool(paragraph));
     // shadow and background, with Premiere's values for what is not stored
     if flag(doc, 11) {
         set("shadow", ParamValue::Bool(true));
@@ -830,13 +837,15 @@ pub(crate) fn from_layer(e: &EffectInstance, t: filmcraft_time::Tick, base: Opti
     dput(4, align_out(choice_of("align")).map(Fv::U32));
     match f64_of("box_width").filter(|w| *w > 0.0) {
         Some(w) => {
-            let h = f32_of_doc(base, 3).unwrap_or(box_height.max(1.0));
+            let h = f64_of("box_height").filter(|h| *h > 0.0).or_else(|| f32_of_doc(base, 3)).unwrap_or(box_height.max(1.0));
             dput(2, Some(Fv::F32(w)));
             dput(3, Some(Fv::F32(h)));
+            dput(5, Some(choice_of("valign")).filter(|v| (1..=2).contains(v)).map(Fv::U32));
         }
         None => {
             dput(2, None);
             dput(3, None);
+            dput(5, None);
         }
     }
     dput(6, nz(f64_of("leading")));

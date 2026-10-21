@@ -334,7 +334,7 @@ fn needs(project: &Project) -> BTreeSet<Need> {
             }
             for c in &t.items {
                 for e in &c.effects {
-                    if let Some(d) = filmcraft_project::effect::find_effect(&e.effect).filter(|d| !d.intrinsic) {
+                    if let Some(d) = filmcraft_project::effect::find_effect(&e.effect).filter(|d| !d.intrinsic || written_vector_motion(e)) {
                         out.insert(Need::Effect(d.id));
                     }
                 }
@@ -342,6 +342,15 @@ fn needs(project: &Project) -> BTreeSet<Need> {
         }
     }
     out
+}
+
+/// Whether `e` is a title's Vector Motion that moves it (written as a component; one at its
+/// defaults is left out, as Premiere leaves it implicit).
+pub(crate) fn written_vector_motion(e: &filmcraft_project::EffectInstance) -> bool {
+    e.effect == filmcraft_project::graphic::VECTOR_MOTION
+        && e.def().is_some_and(|d| {
+            d.params.iter().any(|pd| e.params.get(pd.id).is_some_and(|p| !p.keyframes.is_empty() || format!("{:?}", p.value) != format!("{:?}", pd.default)))
+        })
 }
 
 /// One object of a borrowed layout: its XML and where its id, references and missing binary

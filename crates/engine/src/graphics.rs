@@ -191,6 +191,8 @@ fn param_id(k: &str) -> &str {
         "fauxBold" => "faux_bold",
         "fauxItalic" => "faux_italic",
         "boxWidth" => "box_width",
+        "boxHeight" => "box_height",
+        "verticalAlign" | "verticalAlignment" => "valign",
         "anchorPoint" => "anchor",
         "cornerRadius" => "corner_radius",
         other => other,

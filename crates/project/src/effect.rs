@@ -280,6 +280,27 @@ fn build_effects() -> Vec<EffectDef> {
             float32: true,
             yuv: true,
         },
+        // a title's own transform, applied to all its layers before they are drawn (Premiere's
+        // Vector Motion, `AE.ADBE Graphic Group`): Position and Anchor Point in the graphic's
+        // pixels (unset: its centre)
+        EffectDef {
+            id: crate::graphic::VECTOR_MOTION,
+            name: "Vector Motion",
+            kind: EffectKind::Video,
+            category: &[],
+            params: vec![
+                pt("position", "Position", f64::NAN, f64::NAN),
+                fs("scale", "Scale", 100.0, (0.0, 10000.0), (0.0, 100.0), "", 1),
+                fs("scale_width", "Scale Width", 100.0, (0.0, 10000.0), (0.0, 100.0), "", 1),
+                b("uniform_scale", "Uniform Scale", true),
+                ang("rotation", "Rotation", 0.0),
+                pt("anchor", "Anchor Point", f64::NAN, f64::NAN),
+            ],
+            intrinsic: true,
+            accelerated: true,
+            float32: true,
+            yuv: false,
+        },
         EffectDef {
             id: "opacity",
             name: "Opacity",

@@ -175,10 +175,18 @@ fn graphic_eq_bands_hit_their_gain() {
 #[test]
 fn parametric_eq_full_sections() {
     // 24 dB/oct Butterworth high-pass: −3 dB at the corner, ≈ −48 dB two octaves down.
-    let hp = fx("parametric_eq_full", &[("hp_on", 1.0), ("hp_freq", 200.0), ("hp_slope", 1.0)]);
+    let hp = fx("parametric_eq_full", &[("hp_on", 1.0), ("hp_freq", 200.0), ("hp_slope", 3.0)]);
     assert!((hp.response_db(200.0).unwrap() + 3.01).abs() < 0.05, "corner {}", hp.response_db(200.0).unwrap());
     assert!(hp.response_db(50.0).unwrap() < -45.0);
-    let mut e = fx("parametric_eq_full", &[("hp_on", 1.0), ("hp_freq", 200.0), ("hp_slope", 1.0), ("mid_gain", 9.0), ("master_gain", -3.0)]);
+    // odd orders (6, 18, 30 dB/oct) are Butterworth too: −3 dB at the corner, n·6 dB/oct below
+    for (slope, order) in [(0.0, 1.0), (2.0, 3.0), (4.0, 5.0)] {
+        let lp = fx("parametric_eq_full", &[("lp_on", 1.0), ("lp_freq", 1000.0), ("lp_slope", slope)]);
+        assert!((lp.response_db(1000.0).unwrap() + 3.01).abs() < 0.05, "{order}: corner {}", lp.response_db(1000.0).unwrap());
+        let drop = lp.response_db(2000.0).unwrap() - lp.response_db(4000.0).unwrap();
+        assert!((drop - 6.0 * order).abs() < 1.5, "{order}: {drop} dB per octave");
+    }
+    let mut e =
+        fx("parametric_eq_full", &[("hp_on", 1.0), ("hp_freq", 200.0), ("hp_slope", 3.0), ("mid_freq", 1000.0), ("mid_gain", 9.0), ("master_gain", -3.0)]);
     assert!((e.response_db(1000.0).unwrap() - 6.0).abs() < 0.05);
     for f in [50.0, 200.0, 1000.0, 5000.0] {
         let want = e.response_db(f).unwrap();

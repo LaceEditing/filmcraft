@@ -483,6 +483,10 @@ pub struct UiState {
     /// Open Clip / Track Fx Editor windows (graphical audio-effect editors).
     #[serde(default)]
     pub audio_fx_editors: Vec<crate::panels::audio_fx_editor::FxTarget>,
+    /// The effect each Fx Editor window was opened on (by window key): a window whose target
+    /// now holds another effect (another project opened, effects reordered) closes.
+    #[serde(default)]
+    pub audio_fx_editor_effects: std::collections::HashMap<String, String>,
     /// Synchronize / Merge Clips / Create Multi-Camera Source Sequence dialog (open when Some).
     #[serde(default)]
     pub sync_dialog: Option<SyncDraft>,
@@ -887,6 +891,7 @@ impl Default for UiState {
             mask_pen: None,
             save_preset: None,
             audio_fx_editors: Vec::new(),
+            audio_fx_editor_effects: Default::default(),
             sync_dialog: None,
             multicam_record: true,
             edit_cameras: None,

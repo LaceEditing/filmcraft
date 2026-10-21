@@ -87,6 +87,10 @@ impl Component<'_, '_> {
         }
         match self.match_name {
             "AE.ADBE Motion" => return Target::Motion,
+            // a title's Vector Motion
+            "AE.ADBE Graphic Group" => {
+                return filmcraft_project::find_effect(filmcraft_project::graphic::VECTOR_MOTION).map_or(Target::Unsupported, Target::Effect);
+            }
             "AE.ADBE Opacity" => return Target::Opacity,
             m if m.starts_with("Internal Volume") => return Target::Volume,
             m if m.starts_with("Internal") => return Target::Ignore,
@@ -257,7 +261,25 @@ pub(crate) const AUDIO_PARAMS: &[(&str, &str, &str, Conv)] = &[
     ("parametric_eq", "EQ Band 5 Center Frequency", "b5_freq", Conv::Lin(20.0, 24000.0)),
     ("parametric_eq", "EQ Band 5 Gain", "b5_gain", Conv::Lin(-48.0, 48.0)),
     ("parametric_eq", "EQ Band 5 Q", "b5_q", Conv::Lin(0.0, 10000.0)),
+    ("parametric_eq", "Low Shelf Filter Order", "low_steep", Conv::Flag(1)),
+    ("parametric_eq", "High Shelf Filter Order", "high_steep", Conv::Flag(1)),
+    ("parametric_eq", "High-Pass Filter Enable", "hp_on", Conv::Flag(1)),
+    ("parametric_eq", "High-Pass Cutoff Frequency", "hp_freq", Conv::Lin(20.0, 24000.0)),
+    ("parametric_eq", "High-Pass Slope", "hp_slope", Conv::Slope),
+    ("parametric_eq", "Low-Pass Filter Enable", "lp_on", Conv::Flag(1)),
+    ("parametric_eq", "Low-Pass Cutoff Frequency", "lp_freq", Conv::Lin(20.0, 24000.0)),
+    ("parametric_eq", "Low-Pass Slope", "lp_slope", Conv::Slope),
 ];
+
+/// The Parametric Equalizer's pass-filter slopes in dB/Oct, in the order of FilmCraft's choice
+/// (Premiere saves a slope as dB/Oct ÷ 60: 0.4 is its default 24 dB/Oct).
+const SLOPE_DB: [f64; 7] = [6.0, 12.0, 18.0, 24.0, 30.0, 36.0, 48.0];
+
+/// Index of the [`SLOPE_DB`] entry nearest a saved slope.
+fn nearest_slope(saved: f64) -> usize {
+    let db = saved * 60.0;
+    SLOPE_DB.iter().enumerate().min_by(|a, b| (a.1 - db).abs().total_cmp(&(b.1 - db).abs())).map_or(3, |(i, _)| i)
+}
 
 /// Class of an audio effect's numeric settings; one at 1.0 is saved without a value.
 const AUDIO_PARAM_CLASS: &str = "a714635e";
@@ -318,6 +340,8 @@ pub(crate) enum Conv {
     /// An audio effect's gain on the clip volume's scale ([`Conv::Db`]: 0 dB at 0.1778…, +15 dB
     /// at 1).
     FxDb,
+    /// A pass-filter slope saved as dB/Oct ÷ 60 ↔ the index of the nearest [`SLOPE_DB`].
+    Slope,
 }
 
 /// Match name of Premiere's current Gaussian Blur (the one that is not "Legacy").
@@ -361,6 +385,21 @@ pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Ma
                 .copied()
                 .find(|p| child_text(*p, "Name").is_none_or(|n| n.trim().is_empty()) && start_value(*p).is_some_and(|v| v == "true" || v == "false"));
             add(uniform, "motion", "uniform_scale", Conv::Bool);
+        }
+        Target::Effect(def) if def.id == filmcraft_project::graphic::VECTOR_MOTION => {
+            // as Motion's, in the title's own pixels (0.5:0.5 is its centre)
+            let id = def.id;
+            add(named("Position"), id, "position", Conv::SourcePoint);
+            add(named("Scale"), id, "scale", Conv::Float);
+            add(named("Scale Width"), id, "scale_width", Conv::Float);
+            add(named("Rotation"), id, "rotation", Conv::Float);
+            add(named("Anchor Point"), id, "anchor", Conv::SourcePoint);
+            let uniform = c
+                .params
+                .iter()
+                .copied()
+                .find(|p| child_text(*p, "Name").is_none_or(|n| n.trim().is_empty()) && start_value(*p).is_some_and(|v| v == "true" || v == "false"));
+            add(uniform, id, "uniform_scale", Conv::Bool);
         }
         Target::Opacity => add(named("Opacity"), "opacity", "opacity", Conv::Float),
         Target::Volume => add(named("Level"), "volume", "level", Conv::Db),
@@ -516,6 +555,8 @@ fn parse_val(s: &str, conv: Conv) -> Option<Val> {
         Conv::Float | Conv::Db | Conv::FxDb | Conv::Scale(_) | Conv::Lin(..) | Conv::Sq(..) | Conv::Ratio => {
             s.parse::<f64>().ok().filter(|v| v.is_finite()).map(Val::F)
         }
+        // on its step (0.40000000596 is 24 dB/Oct), so an unchanged slope compares equal
+        Conv::Slope => s.parse::<f64>().ok().filter(|v| v.is_finite()).map(|n| Val::F(SLOPE_DB[nearest_slope(n)] / 60.0)),
         Conv::Bool => match s {
             "true" | "1" => Some(Val::B(true)),
             "false" | "0" => Some(Val::B(false)),
@@ -580,7 +621,7 @@ pub(crate) fn decode(p: Node<'_, '_>, conv: Conv) -> Option<Canon> {
     keys.dedup_by_key(|k| k.t);
     // an audio effect setting at 1 (the top of its 0…1 range) is saved with no value at all
     let audio_top = || {
-        (matches!(conv, Conv::Lin(..) | Conv::Sq(..) | Conv::Ratio | Conv::FxDb | Conv::Flag(_))
+        (matches!(conv, Conv::Lin(..) | Conv::Sq(..) | Conv::Ratio | Conv::FxDb | Conv::Flag(_) | Conv::Slope)
             && p.attribute("ClassID").is_some_and(|c| c.starts_with(AUDIO_PARAM_CLASS)))
         .then_some(Val::F(1.0))
     };
@@ -616,6 +657,7 @@ fn to_value(v: &Val, conv: Conv, ctx: &Ctx) -> ParamValue {
         (Val::F(n), Conv::Lin(lo, hi)) => ParamValue::Float(lo + (hi - lo) * n.clamp(0.0, 1.0)),
         (Val::F(n), Conv::Sq(lo, hi)) => ParamValue::Float(lo + (hi - lo) * n.clamp(0.0, 1.0).powi(2)),
         (Val::F(n), Conv::Ratio) => ParamValue::Float(12.0 * (0.5 + 1.5 * n.clamp(0.0, 1.0)).log2()),
+        (Val::F(n), Conv::Slope) => ParamValue::Choice(nearest_slope(*n) as u32),
         (Val::F(x), _) => ParamValue::Float(*x),
         (Val::B(b), _) => ParamValue::Bool(*b),
         (Val::P(x, y), Conv::FramePoint) => ParamValue::Vec2(Vec2::new(x * ctx.frame.0, y * ctx.frame.1)),
@@ -634,6 +676,7 @@ fn from_value(v: &ParamValue, conv: Conv, ctx: &Ctx) -> Option<Val> {
         (ParamValue::Float(x), Conv::Sq(lo, hi)) if hi != lo => Val::F(((x - lo) / (hi - lo)).clamp(0.0, 1.0).sqrt()),
         (ParamValue::Float(semis), Conv::Ratio) => Val::F(((2f64.powf(semis.clamp(-12.0, 12.0) / 12.0) - 0.5) / 1.5).clamp(0.0, 1.0)),
         (ParamValue::Choice(n), Conv::Choice(len)) if (*n as usize) < len => Val::F(*n as f64),
+        (ParamValue::Choice(n), Conv::Slope) => Val::F(SLOPE_DB.get(*n as usize)? / 60.0),
         (ParamValue::Color(c), Conv::Color) => Val::C(pack_color(*c)),
         (ParamValue::Bool(b), Conv::Bool) => Val::B(*b),
         (ParamValue::Bool(b), Conv::Flag(on)) => Val::F(if *b { on as f64 } else { 0.0 }),

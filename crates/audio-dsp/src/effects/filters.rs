@@ -208,61 +208,76 @@ impl<const N: usize> AudioEffect for GraphicEq<N> {
 
 // ----------------------------------------------------------------------- parametric EQ
 
-/// Pass-filter slopes.
-pub const SLOPES: &[&str] = &["12 dB/oct", "24 dB/oct", "36 dB/oct", "48 dB/oct"];
+/// Pass-filter slopes (Premiere's: 6 to 48 dB/Oct; it saves them as dB/Oct ÷ 60).
+pub const SLOPES: &[&str] = &["6 dB/Oct", "12 dB/Oct", "18 dB/Oct", "24 dB/Oct", "30 dB/Oct", "36 dB/Oct", "48 dB/Oct"];
+/// Butterworth order of each [`SLOPES`] entry.
+pub const SLOPE_ORDERS: [usize; 7] = [1, 2, 3, 4, 5, 6, 8];
+/// [`SLOPES`] entry selected by default (24 dB/Oct).
+pub const DEFAULT_SLOPE: usize = 3;
 
 macro_rules! peq_band {
-    ($p:literal, $name:literal, $f:expr, $q:expr) => {
+    ($p:literal, $name:literal, $f:expr) => {
         [
             ParamSpec::toggle(concat!($p, "_on"), concat!($name, " On"), true),
-            ParamSpec::log(concat!($p, "_freq"), concat!($name, " Frequency"), 20.0, 20000.0, $f, Unit::Hertz),
-            ParamSpec::new(concat!($p, "_gain"), concat!($name, " Gain"), -30.0, 30.0, 0.0, Unit::Decibels),
-            ParamSpec::log(concat!($p, "_q"), concat!($name, " Q"), 0.1, 30.0, $q, Unit::Q),
+            ParamSpec::log(concat!($p, "_freq"), concat!($name, " Frequency"), 20.0, 24000.0, $f, Unit::Hertz),
+            ParamSpec::new(concat!($p, "_gain"), concat!($name, " Gain"), -48.0, 48.0, 0.0, Unit::Decibels),
+            ParamSpec::log(concat!($p, "_q"), concat!($name, " Q"), 0.1, 100.0, 2.0, Unit::Q),
+        ]
+    };
+}
+macro_rules! peq_shelf {
+    ($p:literal, $name:literal, $f:expr) => {
+        [
+            ParamSpec::toggle(concat!($p, "_on"), concat!($name, " On"), true),
+            ParamSpec::log(concat!($p, "_freq"), concat!($name, " Frequency"), 20.0, 24000.0, $f, Unit::Hertz),
+            ParamSpec::new(concat!($p, "_gain"), concat!($name, " Gain"), -48.0, 48.0, 0.0, Unit::Decibels),
+            ParamSpec::toggle(concat!($p, "_steep"), concat!($name, " Steep"), false),
         ]
     };
 }
 
 /// The bands of the full parametric equaliser between its pass filters, in signal order:
-/// (parameter prefix, filter type).
+/// (parameter prefix, filter type; shelves take their gentle or steep form from `<p>_steep`).
 pub const PEQ_BANDS: [(&str, FilterType); 7] = [
-    ("low", FilterType::LowShelf),
+    ("low", FilterType::GentleLowShelf),
     ("b1", FilterType::Peaking),
     ("b2", FilterType::Peaking),
     ("mid", FilterType::Peaking),
     ("b4", FilterType::Peaking),
     ("b5", FilterType::Peaking),
-    ("high", FilterType::HighShelf),
+    ("high", FilterType::GentleHighShelf),
 ];
 
 const PEQ_BAND_IDS: [[&str; 4]; 7] = [
-    ["low_on", "low_freq", "low_gain", "low_q"],
+    ["low_on", "low_freq", "low_gain", "low_steep"],
     ["b1_on", "b1_freq", "b1_gain", "b1_q"],
     ["b2_on", "b2_freq", "b2_gain", "b2_q"],
     ["mid_on", "mid_freq", "mid_gain", "mid_q"],
     ["b4_on", "b4_freq", "b4_gain", "b4_q"],
     ["b5_on", "b5_freq", "b5_gain", "b5_q"],
-    ["high_on", "high_freq", "high_gain", "high_q"],
+    ["high_on", "high_freq", "high_gain", "high_steep"],
 ];
 
 const PEQ_HEAD: [ParamSpec; 4] = [
-    ParamSpec::new("master_gain", "Master Gain", -30.0, 30.0, 0.0, Unit::Decibels),
+    ParamSpec::new("master_gain", "Master Gain", -96.0, 48.0, 0.0, Unit::Decibels),
     ParamSpec::toggle("hp_on", "High Pass On", false),
-    ParamSpec::log("hp_freq", "High Pass Frequency", 10.0, 20000.0, 30.0, Unit::Hertz),
-    ParamSpec::choice("hp_slope", "High Pass Slope", SLOPES, 0),
+    ParamSpec::log("hp_freq", "High Pass Frequency", 20.0, 24000.0, 20.0, Unit::Hertz),
+    ParamSpec::choice("hp_slope", "High Pass Slope", SLOPES, DEFAULT_SLOPE),
 ];
 const PEQ_TAIL: [ParamSpec; 3] = [
     ParamSpec::toggle("lp_on", "Low Pass On", false),
-    ParamSpec::log("lp_freq", "Low Pass Frequency", 20.0, 22000.0, 18000.0, Unit::Hertz),
-    ParamSpec::choice("lp_slope", "Low Pass Slope", SLOPES, 0),
+    ParamSpec::log("lp_freq", "Low Pass Frequency", 20.0, 24000.0, 20000.0, Unit::Hertz),
+    ParamSpec::choice("lp_slope", "Low Pass Slope", SLOPES, DEFAULT_SLOPE),
 ];
+// Premiere's defaults: L 40 Hz, bands at 50 / 200 / 800 / 3200 / 12800 Hz with Q 2, H 18 kHz
 const PEQ_MID: [ParamSpec; 28] = flatten([
-    peq_band!("low", "Low Shelf", 100.0, 0.707),
-    peq_band!("b1", "Band 1", 200.0, 1.0),
-    peq_band!("b2", "Band 2", 500.0, 1.0),
-    peq_band!("mid", "Band 3", 1000.0, 1.0),
-    peq_band!("b4", "Band 4", 2000.0, 1.0),
-    peq_band!("b5", "Band 5", 5000.0, 1.0),
-    peq_band!("high", "High Shelf", 8000.0, 0.707),
+    peq_shelf!("low", "Low Shelf", 40.0),
+    peq_band!("b1", "Band 1", 50.0),
+    peq_band!("b2", "Band 2", 200.0),
+    peq_band!("mid", "Band 3", 800.0),
+    peq_band!("b4", "Band 4", 3200.0),
+    peq_band!("b5", "Band 5", 12800.0),
+    peq_shelf!("high", "High Shelf", 18000.0),
 ]);
 const PEQ_HEAD_MID: [ParamSpec; 32] = join(PEQ_HEAD, PEQ_MID);
 const PEQ_PARAMS: [ParamSpec; 35] = join(PEQ_HEAD_MID, PEQ_TAIL);
@@ -273,8 +288,28 @@ pub fn butterworth_q(m: usize, k: usize) -> f32 {
     (1.0 / (2.0 * (std::f64::consts::PI * (2 * k + 1) as f64 / (2 * n) as f64).cos())) as f32
 }
 
-/// Premiere-style parametric equaliser: master gain, high-pass (12–48 dB/oct), low shelf,
-/// five peaking bands, high shelf and low-pass (12–48 dB/oct), all RBJ biquads.
+/// The four sections of a Butterworth pass filter of `order` (1…8): (in use, first-order
+/// section, Q). An odd order is its pairs plus one first-order section.
+pub fn butterworth_sections(order: usize) -> [(bool, bool, f32); 4] {
+    let order = order.clamp(1, 8);
+    let mut out = [(false, false, std::f32::consts::FRAC_1_SQRT_2); 4];
+    let pairs = order / 2;
+    for (k, s) in out.iter_mut().enumerate().take(pairs) {
+        let q =
+            if order.is_multiple_of(2) { butterworth_q(pairs, k) } else { (1.0 / (2.0 * (std::f64::consts::PI * (k + 1) as f64 / order as f64).cos())) as f32 };
+        *s = (true, false, q);
+    }
+    if !order.is_multiple_of(2)
+        && let Some(s) = out.get_mut(pairs)
+    {
+        *s = (true, true, std::f32::consts::FRAC_1_SQRT_2);
+    }
+    out
+}
+
+/// Premiere-style parametric equaliser: master gain, high-pass (6–48 dB/oct), low shelf,
+/// five peaking bands, high shelf and low-pass (6–48 dB/oct). The shelves have Premiere's
+/// shape (gentle first-order, or steep second-order) rather than the RBJ cookbook's.
 pub struct FullParametricEq {
     pv: ParamValues,
     bank: BandBank,
@@ -298,21 +333,24 @@ impl FullParametricEq {
 
     fn apply_params(&mut self, snap: bool) {
         let p = &self.pv;
-        let pass = |on: bool, slope: usize, slot: usize| -> (bool, f32) {
-            let m = slope + 1;
-            if on && slot < m { (true, butterworth_q(m, slot)) } else { (false, std::f32::consts::FRAC_1_SQRT_2) }
-        };
-        let (hp_on, hp_f, hp_s) = (p.on("hp_on"), p.v("hp_freq"), p.idx("hp_slope"));
-        let (lp_on, lp_f, lp_s) = (p.on("lp_on"), p.v("lp_freq"), p.idx("lp_slope"));
+        let order = |id: &str| SLOPE_ORDERS.get(p.idx(id)).copied().unwrap_or(4);
+        let (hp_on, hp_f, hp) = (p.on("hp_on"), p.v("hp_freq"), butterworth_sections(order("hp_slope")));
+        let (lp_on, lp_f, lp) = (p.on("lp_on"), p.v("lp_freq"), butterworth_sections(order("lp_slope")));
         let mut bands = [(false, FilterType::Peaking, 1000.0, 0.0, 1.0); 7];
         for (i, ids) in PEQ_BAND_IDS.iter().enumerate() {
-            bands[i] = (p.on(ids[0]), PEQ_BANDS[i].1, p.v(ids[1]), p.v(ids[2]), p.v(ids[3]));
+            let kind = match PEQ_BANDS[i].1 {
+                FilterType::GentleLowShelf if p.on(ids[3]) => FilterType::SteepLowShelf,
+                FilterType::GentleHighShelf if p.on(ids[3]) => FilterType::SteepHighShelf,
+                k => k,
+            };
+            let q = if kind == FilterType::Peaking { p.v(ids[3]) } else { 1.0 };
+            bands[i] = (p.on(ids[0]), kind, p.v(ids[1]), p.v(ids[2]), q);
         }
         for slot in 0..4 {
-            let (on, q) = pass(hp_on, hp_s, slot);
-            self.bank.set_band(slot, on, FilterType::HighPass, hp_f, 0.0, q, snap);
-            let (on, q) = pass(lp_on, lp_s, slot);
-            self.bank.set_band(11 + slot, on, FilterType::LowPass, lp_f, 0.0, q, snap);
+            let (on, first, q) = hp[slot];
+            self.bank.set_band(slot, hp_on && on, if first { FilterType::HighPass1 } else { FilterType::HighPass }, hp_f, 0.0, q, snap);
+            let (on, first, q) = lp[slot];
+            self.bank.set_band(11 + slot, lp_on && on, if first { FilterType::LowPass1 } else { FilterType::LowPass }, lp_f, 0.0, q, snap);
         }
         for (i, (on, kind, f, g, q)) in bands.into_iter().enumerate() {
             self.bank.set_band(4 + i, on, kind, f, g, q, snap);

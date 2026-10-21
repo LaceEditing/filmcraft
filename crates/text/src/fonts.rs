@@ -433,7 +433,11 @@ pub fn postscript_name(family: &str, style: &str) -> Option<String> {
         return None;
     }
     let f = face(r.face);
-    (!f.info.postscript.is_empty() && f.info.family.eq_ignore_ascii_case(family)).then(|| f.info.postscript.clone())
+    // only that very face: the nearest one of another style (FatFrank Heavy resolved to the
+    // installed FatFrank Free) has another name, which a computer with the real face lacks
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    let same_style = squash(&f.info.style) == squash(style) || (style.is_empty() && squash(&f.info.style) == "regular");
+    (!f.info.postscript.is_empty() && f.info.family.eq_ignore_ascii_case(family) && same_style).then(|| f.info.postscript.clone())
 }
 
 /// The family and style of an installed face by its PostScript name (`ArialMT` → `Arial`,
@@ -491,6 +495,17 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title's font is saved by the PostScript name of that very face: Inter Bold has its own,
+    /// a style the family lacks has none (it was the nearest face's — a Premiere title in
+    /// FatFrank Heavy came back as `FatFrank-Free`, which the Premiere computer does not have).
+    #[test]
+    fn postscript_names_are_of_that_very_face() {
+        assert_eq!(postscript_name("Inter", "Bold").as_deref(), Some("Inter-Bold"));
+        assert_eq!(postscript_name("Inter", "Regular").as_deref(), Some("Inter-Regular"));
+        assert_eq!(postscript_name("Noto Serif", "Heavy"), None, "only Regular is installed");
+        assert_eq!(postscript_name("No Such Family", "Regular"), None);
+    }
 
     #[test]
     fn bundled_families_and_resolution() {

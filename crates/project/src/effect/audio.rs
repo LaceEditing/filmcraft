@@ -56,24 +56,35 @@ fn geq(labels: &[&'static str]) -> Vec<ParamDef> {
     v
 }
 
-const SLOPES: &[&str] = &["12 dB/oct", "24 dB/oct", "36 dB/oct", "48 dB/oct"];
+/// Premiere's pass-filter slopes (`filmcraft_audio_dsp`'s `SLOPES`; 24 dB/Oct by default).
+const SLOPES: &[&str] = &["6 dB/Oct", "12 dB/Oct", "18 dB/Oct", "24 dB/Oct", "30 dB/Oct", "36 dB/Oct", "48 dB/Oct"];
 
-fn peq_band(p: [&'static str; 4], name: &'static str, freq: f64, q: f64) -> Vec<ParamDef> {
-    group(name, vec![b(p[0], "On", true), hz(p[1], "Frequency", freq, 20.0, 20000.0), db(p[2], "Gain", 0.0, -30.0, 30.0), num(p[3], "Q", q, 0.1, 30.0, "", 2)])
+fn peq_band(p: [&'static str; 4], name: &'static str, freq: f64) -> Vec<ParamDef> {
+    group(
+        name,
+        vec![b(p[0], "On", true), hz(p[1], "Frequency", freq, 20.0, 24000.0), db(p[2], "Gain", 0.0, -48.0, 48.0), num(p[3], "Q", 2.0, 0.1, 100.0, "", 1)],
+    )
 }
 
+/// A shelf: Premiere's has no Q, but a gentle (first-order) or steep (second-order) slope.
+fn peq_shelf(p: [&'static str; 4], name: &'static str, freq: f64) -> Vec<ParamDef> {
+    group(name, vec![b(p[0], "On", true), hz(p[1], "Frequency", freq, 20.0, 24000.0), db(p[2], "Gain", 0.0, -48.0, 48.0), b(p[3], "Steep", false)])
+}
+
+/// Premiere's Parametric Equalizer (its ranges and defaults: L 40 Hz, bands at 50 / 200 / 800 /
+/// 3200 / 12800 Hz with Q 2, H 18 kHz, pass filters at 20 Hz / 20 kHz and 24 dB/Oct, off).
 fn parametric_eq() -> Vec<ParamDef> {
-    let mut v = vec![db("master_gain", "Master Gain", 0.0, -30.0, 30.0)];
-    v.extend(group("High Pass", vec![b("hp_on", "On", false), hz("hp_freq", "Frequency", 30.0, 10.0, 20000.0), ch("hp_slope", "Slope", SLOPES, 0)]));
+    let mut v = vec![fs("master_gain", "Master Gain", 0.0, (-96.0, 48.0), (-80.0, 40.0), "dB", 1)];
+    v.extend(group("High Pass", vec![b("hp_on", "On", false), hz("hp_freq", "Frequency", 20.0, 20.0, 24000.0), ch("hp_slope", "Slope", SLOPES, 3)]));
     // Low shelf / band 3 / high shelf keep the ids of the earlier three-band version.
-    v.extend(peq_band(["low_on", "low_freq", "low_gain", "low_q"], "Low Shelf", 100.0, 0.71));
-    v.extend(peq_band(["b1_on", "b1_freq", "b1_gain", "b1_q"], "Band 1", 200.0, 1.0));
-    v.extend(peq_band(["b2_on", "b2_freq", "b2_gain", "b2_q"], "Band 2", 500.0, 1.0));
-    v.extend(peq_band(["mid_on", "mid_freq", "mid_gain", "mid_q"], "Band 3", 1000.0, 1.0));
-    v.extend(peq_band(["b4_on", "b4_freq", "b4_gain", "b4_q"], "Band 4", 2000.0, 1.0));
-    v.extend(peq_band(["b5_on", "b5_freq", "b5_gain", "b5_q"], "Band 5", 5000.0, 1.0));
-    v.extend(peq_band(["high_on", "high_freq", "high_gain", "high_q"], "High Shelf", 8000.0, 0.71));
-    v.extend(group("Low Pass", vec![b("lp_on", "On", false), hz("lp_freq", "Frequency", 18000.0, 20.0, 22000.0), ch("lp_slope", "Slope", SLOPES, 0)]));
+    v.extend(peq_shelf(["low_on", "low_freq", "low_gain", "low_steep"], "Low Shelf", 40.0));
+    v.extend(peq_band(["b1_on", "b1_freq", "b1_gain", "b1_q"], "Band 1", 50.0));
+    v.extend(peq_band(["b2_on", "b2_freq", "b2_gain", "b2_q"], "Band 2", 200.0));
+    v.extend(peq_band(["mid_on", "mid_freq", "mid_gain", "mid_q"], "Band 3", 800.0));
+    v.extend(peq_band(["b4_on", "b4_freq", "b4_gain", "b4_q"], "Band 4", 3200.0));
+    v.extend(peq_band(["b5_on", "b5_freq", "b5_gain", "b5_q"], "Band 5", 12800.0));
+    v.extend(peq_shelf(["high_on", "high_freq", "high_gain", "high_steep"], "High Shelf", 18000.0));
+    v.extend(group("Low Pass", vec![b("lp_on", "On", false), hz("lp_freq", "Frequency", 20000.0, 20.0, 24000.0), ch("lp_slope", "Slope", SLOPES, 3)]));
     v
 }
 
@@ -664,7 +675,7 @@ mod tests {
     #[test]
     fn parametric_eq_keeps_the_three_band_ids() {
         let d = find_effect("parametric_eq").unwrap();
-        for id in ["low_freq", "low_gain", "mid_freq", "mid_gain", "mid_q", "high_freq", "high_gain"] {
+        for id in ["low_freq", "low_gain", "low_steep", "mid_freq", "mid_gain", "mid_q", "high_freq", "high_gain", "hp_slope", "lp_slope"] {
             assert!(d.param(id).is_some(), "{id}");
         }
     }

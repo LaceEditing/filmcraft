@@ -18,6 +18,18 @@ pub enum FilterType {
     /// `f/Q` however deep the cut (`gain_db` ≤ 0), unlike the RBJ peaking filter whose cut
     /// widens with depth. Used by the Notch Filter.
     Cut,
+    /// First-order (6 dB/oct) Butterworth low-pass: −3 dB at `freq`.
+    LowPass1,
+    /// First-order (6 dB/oct) Butterworth high-pass: −3 dB at `freq`.
+    HighPass1,
+    /// Premiere's Parametric Equalizer shelves (measured): the corner `freq` is the shelf's
+    /// pole, its zero sits `gain` away (first order: `A·freq`, second order: `√A·freq`), so the
+    /// curve passes ~3 dB inside the full gain at `freq` and a cut mirrors a boost in dB.
+    /// `q` is unused.
+    GentleLowShelf,
+    GentleHighShelf,
+    SteepLowShelf,
+    SteepHighShelf,
 }
 
 impl FilterType {
@@ -47,6 +59,32 @@ impl Coeffs {
         Coeffs { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 }
     }
 
+    /// Bilinear transform (pre-warped to `w0`) of an analog section normalised to ω0 = 1:
+    /// `(n0·s² + n1·s + n2) / (d0·s² + d1·s + d2)` (n0 = d0 = 0 for a first-order one).
+    fn analog(w0: f64, n: [f64; 3], d: [f64; 3]) -> Coeffs {
+        let k = (w0 / 2.0).tan().max(1e-9);
+        let k2 = k * k;
+        let z = |c: [f64; 3]| [c[0] + c[1] * k + c[2] * k2, 2.0 * (c[2] * k2 - c[0]), c[0] - c[1] * k + c[2] * k2];
+        let (b, a) = (z(n), z(d));
+        if a[0].abs() < 1e-300 {
+            return Coeffs::IDENTITY;
+        }
+        Self::norm(b[0], b[1], b[2], a[0], a[1], a[2])
+    }
+
+    /// One of Premiere's shelves: a boost's (numerator, denominator); a cut swaps them.
+    fn shelf(w0: f64, gain_db: f64, low: bool, steep: bool) -> Coeffs {
+        let a = 10f64.powf(gain_db.abs() / 20.0);
+        let r = a.sqrt();
+        let (n, d) = match (low, steep) {
+            (true, false) => ([0.0, 1.0, a], [0.0, 1.0, 1.0]),
+            (false, false) => ([0.0, a, 1.0], [0.0, 1.0, 1.0]),
+            (true, true) => ([1.0, std::f64::consts::SQRT_2 * r, a], [1.0, std::f64::consts::SQRT_2, 1.0]),
+            (false, true) => ([a, std::f64::consts::SQRT_2 * r, 1.0], [1.0, std::f64::consts::SQRT_2, 1.0]),
+        };
+        if gain_db < 0.0 { Self::analog(w0, d, n) } else { Self::analog(w0, n, d) }
+    }
+
     /// RBJ cookbook design. `freq` in Hz (clamped below Nyquist), `q` > 0, `gain_db` used by
     /// peaking and shelving types (shelves use `q` as the shelf "Q", S=1 ≙ Q=1/√2).
     pub fn design(kind: FilterType, sample_rate: f64, freq: f64, q: f64, gain_db: f64) -> Coeffs {
@@ -66,6 +104,12 @@ impl Coeffs {
                 let g = 10f64.powf(gain_db / 20.0);
                 Self::norm(1.0 + g * alpha, -2.0 * cs, 1.0 - g * alpha, 1.0 + alpha, -2.0 * cs, 1.0 - alpha)
             }
+            FilterType::LowPass1 => Self::analog(w0, [0.0, 0.0, 1.0], [0.0, 1.0, 1.0]),
+            FilterType::HighPass1 => Self::analog(w0, [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]),
+            FilterType::GentleLowShelf => Self::shelf(w0, gain_db, true, false),
+            FilterType::GentleHighShelf => Self::shelf(w0, gain_db, false, false),
+            FilterType::SteepLowShelf => Self::shelf(w0, gain_db, true, true),
+            FilterType::SteepHighShelf => Self::shelf(w0, gain_db, false, true),
             FilterType::Peaking => Self::norm(1.0 + alpha * a, -2.0 * cs, 1.0 - alpha * a, 1.0 + alpha / a, -2.0 * cs, 1.0 - alpha / a),
             FilterType::LowShelf => {
                 let k = 2.0 * a.sqrt() * alpha;
@@ -186,6 +230,40 @@ mod tests {
         assert!(c.magnitude(60.0, SR) < 1e-6);
         assert!(c.magnitude_db(1000.0, SR).abs() < 0.01);
         assert!(measured_db(&c, 60.0) < -40.0);
+    }
+
+    #[test]
+    fn premiere_shelves_match_the_measured_curves() {
+        // Premiere, Low Shelf 99 Hz +12.1 dB, gentle: ≈ +12 at 20 Hz, +9.3 at 100, +2 at 400,
+        // ≈ 0 at 1 kHz (read off its editor's graph, ±1 dB)
+        let ls = Coeffs::design(FilterType::GentleLowShelf, SR, 99.0, 1.0, 12.1);
+        for (f, want) in [(20.0, 12.0), (100.0, 9.3), (400.0, 2.0), (1000.0, 0.3)] {
+            assert!((ls.magnitude_db(f, SR) - want).abs() < 1.0, "{f} Hz: {}", ls.magnitude_db(f, SR));
+        }
+        // steeper: flat to ~50 Hz, ≈ +2 at 200, 0 by 300
+        let st = Coeffs::design(FilterType::SteepLowShelf, SR, 99.0, 1.0, 12.1);
+        for (f, want) in [(40.0, 11.8), (99.0, 9.3), (200.0, 2.5), (400.0, 0.3)] {
+            assert!((st.magnitude_db(f, SR) - want).abs() < 1.0, "{f} Hz: {}", st.magnitude_db(f, SR));
+        }
+        // High Shelf 5010 Hz −12.1 dB: ≈ −9.3 at 5 kHz, the full cut by 20 kHz; a cut mirrors a boost
+        let hs = Coeffs::design(FilterType::GentleHighShelf, SR, 5010.0, 1.0, -12.1);
+        assert!((hs.magnitude_db(5000.0, SR) + 9.3).abs() < 1.0);
+        assert!(hs.magnitude_db(20000.0, SR) < -11.0);
+        let hb = Coeffs::design(FilterType::GentleHighShelf, SR, 5010.0, 1.0, 12.1);
+        assert!((hb.magnitude_db(3000.0, SR) + hs.magnitude_db(3000.0, SR)).abs() < 1e-6);
+        assert!(Coeffs::design(FilterType::SteepHighShelf, SR, 5010.0, 1.0, 0.0).magnitude_db(5000.0, SR).abs() < 1e-9);
+    }
+
+    #[test]
+    fn first_order_passes_fall_6_db_per_octave() {
+        // Premiere's HP at 197 Hz, 6 dB/Oct: −3 dB at the point, ≈ −20 dB at 20 Hz
+        let hp = Coeffs::design(FilterType::HighPass1, SR, 197.0, 1.0, 0.0);
+        assert!((hp.magnitude_db(197.0, SR) + 3.0103).abs() < 0.01);
+        assert!((hp.magnitude_db(20.0, SR) + 19.9).abs() < 0.5);
+        let lp = Coeffs::design(FilterType::LowPass1, SR, 1000.0, 1.0, 0.0);
+        assert!((lp.magnitude_db(1000.0, SR) + 3.0103).abs() < 0.01);
+        assert!(lp.magnitude_db(8000.0, SR) < -18.0 && lp.magnitude_db(8000.0, SR) > -19.5);
+        assert!((measured_db(&lp, 1000.0) + 3.0103).abs() < 0.05);
     }
 
     #[test]

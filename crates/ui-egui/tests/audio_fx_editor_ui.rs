@@ -167,12 +167,27 @@ fn parametric_eq_editor_from_effect_controls() {
     d.click("effectControls.effect.parametric_eq.edit");
     d.frames(3);
     let ids = d.ids("fxEditor.parametric_eq.");
-    for id in ["plot", "node.hp", "node.low", "node.mid", "node.lp", "toggle.hp_on", "param.master_gain", "close"] {
+    for id in [
+        "plot",
+        "node.low",
+        "node.b1",
+        "node.mid",
+        "node.high",
+        "toggle.hp_on",
+        "toggle.low_steep",
+        "value.mid_q",
+        "choice.hp_slope",
+        "range.30",
+        "param.master_gain",
+        "close",
+    ] {
         assert!(ids.iter().any(|i| *i == format!("fxEditor.parametric_eq.{id}")), "{id} missing from {ids:?}");
     }
-    // band toggle by id
+    // the pass filters are off, so they have no point (as in Premiere); switched on, they do
+    assert!(!ids.iter().any(|i| i == "fxEditor.parametric_eq.node.hp"));
     d.click("fxEditor.parametric_eq.toggle.hp_on");
     assert!(truthy(&d.clip_param(clip, "parametric_eq", "hp_on")));
+    assert!(d.element("fxEditor.parametric_eq.node.hp").is_some(), "HP point shown once on");
     // dragging band 3 up boosts it — one undo step for the whole drag (frequency and gain are
     // committed on release, in the same gesture)
     let undo0 = d.undo_len();
@@ -187,6 +202,95 @@ fn parametric_eq_editor_from_effect_controls() {
     d.snapshot("fx-editor-parametric-eq");
     d.click("fxEditor.parametric_eq.close");
     assert!(d.ids("fxEditor.parametric_eq.").is_empty(), "window closed");
+}
+
+/// The graph behaves like Premiere's: a point grabbed off-centre stays under the cursor (no
+/// jump), every band moves (bands 1, 2, 4, 5 too), points stop at the graph's edges (±48 dB at
+/// Range 96, ±15 at Range 30), HP / LP move only sideways, a band switched off loses its point,
+/// and the shelves' slope switches.
+#[test]
+fn parametric_eq_graph_follows_the_pointer() {
+    let mut d = Driver::demo();
+    let clip = d.audio_clip_with("parametric_eq");
+    d.click("effectControls.effect.parametric_eq.edit");
+    d.frames(3);
+    let centre = |r: [f32; 4]| egui::pos2(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+    // grabbed 4 px right of and 3 px below its centre, band 1 moves exactly as far as the pointer
+    let before = centre(d.element("fxEditor.parametric_eq.node.b1").unwrap());
+    let mut p = before + egui::vec2(4.0, 3.0);
+    d.harness.input_mut().events.push(egui::Event::PointerMoved(p));
+    d.frames(1);
+    d.harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
+    d.frames(1);
+    for _ in 0..5 {
+        p += egui::vec2(10.0, -8.0);
+        d.harness.input_mut().events.push(egui::Event::PointerMoved(p));
+        // the move's frame and the repaint the editor asks for while dragging
+        d.frames(2);
+    }
+    let during = centre(d.element("fxEditor.parametric_eq.node.b1").unwrap());
+    assert!((during - (before + egui::vec2(50.0, -40.0))).length() < 1.0, "point follows the pointer live: {before:?} → {during:?}");
+    d.harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    });
+    d.frames(3);
+    let after = centre(d.element("fxEditor.parametric_eq.node.b1").unwrap());
+    assert!((after - during).length() < 1.0, "no jump on release: {during:?} → {after:?}");
+    assert!(num(&d.clip_param(clip, "parametric_eq", "b1_gain")) > 3.0, "band 1 is boosted");
+    assert!(num(&d.clip_param(clip, "parametric_eq", "b1_freq")) > 50.0, "and moved up in frequency");
+    // past the top-right corner: held at 24 kHz / +48 dB
+    d.drag("fxEditor.parametric_eq.node.b5", 900.0, -900.0, 8);
+    assert_eq!(num(&d.clip_param(clip, "parametric_eq", "b5_gain")), 48.0);
+    assert_eq!(num(&d.clip_param(clip, "parametric_eq", "b5_freq")), 24000.0);
+    // Range 30 dB: ±15
+    d.click("fxEditor.parametric_eq.range.30");
+    d.drag("fxEditor.parametric_eq.node.b4", 0.0, 900.0, 8);
+    assert_eq!(num(&d.clip_param(clip, "parametric_eq", "b4_gain")), -15.0);
+    // a pass filter moves sideways only
+    d.click("fxEditor.parametric_eq.toggle.lp_on");
+    d.drag("fxEditor.parametric_eq.node.lp", -120.0, 80.0, 6);
+    let lp = num(&d.clip_param(clip, "parametric_eq", "lp_freq"));
+    assert!(lp < 15000.0, "LP moved down: {lp}");
+    let r = d.element("fxEditor.parametric_eq.node.lp").unwrap();
+    let zero = d.element("fxEditor.parametric_eq.node.mid").unwrap();
+    assert!((centre(r).y - centre(zero).y).abs() < 1.0, "LP stays on the 0 dB line");
+    // band 2 off: no point
+    d.click("fxEditor.parametric_eq.toggle.b2_on");
+    assert!(!truthy(&d.clip_param(clip, "parametric_eq", "b2_on")));
+    assert!(d.element("fxEditor.parametric_eq.node.b2").is_none(), "an off band has no point");
+    // the low shelf's slope switch
+    d.click("fxEditor.parametric_eq.toggle.low_steep");
+    assert!(truthy(&d.clip_param(clip, "parametric_eq", "low_steep")));
+    d.snapshot("fx-editor-parametric-eq-edited");
+}
+
+/// A window belongs to the effect it was opened on: when its slot comes to hold another effect
+/// (the EQ removed and a Bass put in its place, or another project opened), it closes instead
+/// of showing the other effect.
+#[test]
+fn fx_editor_closes_when_its_effect_is_replaced() {
+    let mut d = Driver::demo();
+    let clip = d.audio_clip_with("parametric_eq");
+    d.click("effectControls.effect.parametric_eq.edit");
+    d.frames(3);
+    assert!(!d.ids("fxEditor.parametric_eq.").is_empty());
+    let seq = d.exec("sequence.inspect", json!({}));
+    let items = seq["audio"][0]["items"].as_array().unwrap().clone();
+    let it = items.iter().find(|i| i["clip"] == clip).unwrap();
+    let index = it["effects"].as_array().unwrap().iter().position(|e| e["effect"] == "parametric_eq").unwrap();
+    d.exec("effects.remove", json!({"clip": clip, "index": index}));
+    d.exec("effects.apply", json!({"clips": [clip], "effect": "bass"}));
+    d.frames(3);
+    assert!(d.ids("fxEditor.").iter().all(|i| !i.starts_with("fxEditor.bass.")), "no Bass editor took the EQ's window");
+    assert!(d.ids("fxEditor.parametric_eq.").is_empty(), "the EQ's window closed");
 }
 
 #[test]
@@ -309,33 +413,45 @@ impl Driver {
     }
 }
 
-/// Premiere's Audio Track Mixer racks: an effect dragged to another slot of its track moves
-/// there, onto another track it moves to that track, with Alt it is copied.
+/// Premiere's Audio Track Mixer racks (measured in Premiere 26.5): an effect dragged to another
+/// slot of its track moves there, onto another track it is copied with its settings; Ctrl swaps
+/// the two (copy within the track, move to another); Alt and Shift change nothing. A drop on a
+/// filled slot inserts there. Before, every drag moved and only Alt copied, which KDE takes for
+/// moving the window.
 #[test]
 fn mixer_effects_drag_between_slots_and_tracks() {
     let mut d = Driver::demo();
     for fx in ["amplify", "bass", "treble"] {
         d.exec("mixer.addInsert", json!({"strip": "A1", "effect": fx}));
     }
+    d.exec("mixer.setInsert", json!({"strip": "A1", "slot": 1, "params": {"boost": 7.5}}));
     d.mixer_racks();
     // reorder: Amplify onto the third slot
     d.drag_to("mixer.A1.fx.0", "mixer.A1.fx.2", json!({}));
     assert_eq!(d.rack("A1"), ["bass", "treble", "amplify"]);
-    // move: Treble onto Audio 2's first slot
-    d.drag_to("mixer.A1.fx.1", "mixer.A2.fx.0", json!({}));
-    assert_eq!(d.rack("A1"), ["bass", "amplify"]);
-    assert_eq!(d.rack("A2"), ["treble"]);
-    // Alt-drag: a copy of Bass onto Audio 2's second slot, the original stays
-    d.drag_to("mixer.A1.fx.0", "mixer.A2.fx.1", json!({"alt": true}));
-    assert_eq!(d.rack("A1"), ["bass", "amplify"]);
-    assert_eq!(d.rack("A2"), ["treble", "bass"]);
+    // onto another track: a copy, with its settings; the original stays
+    d.drag_to("mixer.A1.fx.0", "mixer.A2.fx.0", json!({}));
+    assert_eq!(d.rack("A1"), ["bass", "treble", "amplify"]);
+    assert_eq!(d.rack("A2"), ["bass"]);
+    assert_eq!(num(&d.insert("A2", 0)["params"]["boost"]), 7.5, "the copy keeps the setting");
+    // Alt and Shift change nothing
+    d.drag_to("mixer.A1.fx.1", "mixer.A2.fx.1", json!({"alt": true}));
+    assert_eq!(d.rack("A1"), ["bass", "treble", "amplify"]);
+    assert_eq!(d.rack("A2"), ["bass", "treble"]);
+    // Ctrl onto another track moves
+    d.drag_to("mixer.A1.fx.2", "mixer.A2.fx.0", json!({"command": true}));
+    assert_eq!(d.rack("A1"), ["bass", "treble"]);
+    assert_eq!(d.rack("A2"), ["amplify", "bass", "treble"], "inserted at the slot it was dropped on");
+    // Ctrl within the track copies
+    d.drag_to("mixer.A1.fx.0", "mixer.A1.fx.2", json!({"command": true}));
+    assert_eq!(d.rack("A1"), ["bass", "treble", "bass"]);
     // dropping an effect on a send slot or outside the rack does nothing
     d.drag_to("mixer.A1.fx.0", "mixer.A1.send.0", json!({}));
     d.drag_to("mixer.A1.fx.0", "mixer.A1.fader", json!({}));
-    assert_eq!(d.rack("A1"), ["bass", "amplify"]);
+    assert_eq!(d.rack("A1"), ["bass", "treble", "bass"]);
     // each drag is one undo step
     d.exec("edit.undo", json!({}));
-    assert_eq!(d.rack("A2"), ["treble"]);
+    assert_eq!(d.rack("A1"), ["bass", "treble"]);
 }
 
 /// The slot menus and the knob under the rack: the arrow replaces or empties a filled slot, the

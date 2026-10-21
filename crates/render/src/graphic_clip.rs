@@ -28,12 +28,17 @@ pub fn xform(a: &Affine) -> Xform {
     [a.a as f32, a.b as f32, a.c as f32, a.d as f32, a.e as f32, a.f as f32]
 }
 
-/// Layer pixels → graphic canvas pixels (position / anchor / scale / rotation).
+/// Layer pixels → graphic canvas pixels (position / anchor / scale / rotation, then the title's
+/// Vector Motion).
 pub fn layer_matrix(spec: &LayerSpec) -> Affine {
     let t = &spec.transform;
     let m = Affine::motion(t.position, t.scale, t.rotation, t.anchor);
     let (ox, oy) = layer_origin(spec);
-    if ox == 0.0 && oy == 0.0 { m } else { m.then_apply(&Affine::translate(-ox as f64, -oy as f64)) }
+    let m = if ox == 0.0 && oy == 0.0 { m } else { m.then_apply(&Affine::translate(-ox as f64, -oy as f64)) };
+    match &spec.group {
+        Some(g) => g.then_apply(&m),
+        None => m,
+    }
 }
 
 /// Where a layer's origin is in its layout coordinates: (0, 0), or for text whose origin is the
@@ -42,9 +47,23 @@ pub fn layer_origin(spec: &LayerSpec) -> (f32, f32) {
     match &spec.content {
         LayerContent::Text(t) if t.top_left_origin => {
             let b = text_layout(t).bounds;
-            (b[0], b[1])
+            (b[0], b[1] - valign_shift(t, b[3] - b[1]))
         }
         _ => (0.0, 0.0),
+    }
+}
+
+/// How far paragraph text moves down in its box for its vertical alignment (Premiere's centre /
+/// bottom): the box's spare height, halved for centre. Point text and top alignment: 0.
+pub fn valign_shift(t: &TextProps, text_height: f32) -> f32 {
+    if t.box_width <= 0.0 || t.box_height <= 0.0 || t.vertical {
+        return 0.0;
+    }
+    let spare = t.box_height - text_height;
+    match t.valign {
+        1 => spare / 2.0,
+        2 => spare,
+        _ => 0.0,
     }
 }
 
@@ -449,7 +468,16 @@ pub fn apply_pins(specs: &mut [LayerSpec], canvas: (u32, u32)) {
 pub fn graphic_specs(effects: &[EffectInstance], t: Tick, canvas: (u32, u32)) -> Vec<LayerSpec> {
     let mut v: Vec<LayerSpec> = effects.iter().filter(|e| filmcraft_project::graphic::is_layer(e)).filter_map(|e| eval_layer(e, t, canvas)).collect();
     apply_pins(&mut v, canvas);
+    set_group(&mut v, effects, t, canvas);
     v
+}
+
+/// Give every layer the title's Vector Motion at time `t`.
+fn set_group(specs: &mut [LayerSpec], effects: &[EffectInstance], t: Tick, canvas: (u32, u32)) {
+    let g = filmcraft_project::graphic::group_transform(effects, t, canvas);
+    for s in specs.iter_mut() {
+        s.group = g;
+    }
 }
 
 /// The media time at which a graphic clip's layers are read at media time `mt` (Responsive Design
@@ -501,6 +529,7 @@ pub fn item_layer_specs(item: &TrackItem, mt: Tick, canvas: (u32, u32)) -> Vec<(
     if let Some(meta) = item.graphic.as_deref() {
         apply_roll(meta, &mut specs, u, d, canvas);
     }
+    set_group(&mut specs, &item.effects, t, canvas);
     idx.into_iter().zip(specs).collect()
 }
 

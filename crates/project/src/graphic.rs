@@ -21,11 +21,33 @@ pub const TEXT_LAYER: &str = "graphic_text";
 pub const SHAPE_LAYER: &str = "graphic_shape";
 
 pub const ALIGN_OPTS: &[&str] = &["Left", "Center", "Right", "Justify"];
+/// Where paragraph text sits in its box (Premiere's vertical paragraph alignment).
+pub const VALIGN_OPTS: &[&str] = &["Top", "Center", "Bottom"];
 pub const CAPS_OPTS: &[&str] = &["Normal", "All Caps", "Small Caps"];
 pub const STROKE_OPTS: &[&str] = &["Outer", "Center", "Inner"];
 pub const SHAPE_OPTS: &[&str] = &["Rectangle", "Ellipse", "Polygon", "Path"];
 
 /// Whether an effect instance is a graphic layer.
+/// A title's Vector Motion (Premiere's transform of all its layers together).
+pub const VECTOR_MOTION: &str = "vector_motion";
+
+/// The transform a title's Vector Motion applies to all its layers at clip time `t` (graphic
+/// pixels → graphic pixels), when it has one that is switched on and not at its defaults.
+pub fn group_transform(effects: &[EffectInstance], t: Tick, canvas: (u32, u32)) -> Option<filmcraft_geom::Affine> {
+    let e = effects.iter().find(|e| e.effect == VECTOR_MOTION && e.enabled)?;
+    let centre = Vec2::new(canvas.0 as f64 / 2.0, canvas.1 as f64 / 2.0);
+    let point = |id: &str| {
+        let v = vv(e, id, t);
+        if v.x.is_nan() || v.y.is_nan() { centre } else { v }
+    };
+    let (pos, anchor) = (point("position"), point("anchor"));
+    let s = ff(e, "scale", t) as f64 / 100.0;
+    let sx = if bb(e, "uniform_scale", t) { s } else { ff(e, "scale_width", t) as f64 / 100.0 };
+    let rot = ff(e, "rotation", t) as f64;
+    let identity = (pos - anchor).length() < 1e-9 && (s - 1.0).abs() < 1e-9 && (sx - 1.0).abs() < 1e-9 && rot.abs() < 1e-9;
+    (!identity).then(|| filmcraft_geom::Affine::motion(pos, Vec2::new(sx, s), rot, anchor))
+}
+
 pub fn is_layer_id(id: &str) -> bool {
     id == TEXT_LAYER || id == SHAPE_LAYER
 }
@@ -125,6 +147,8 @@ pub(crate) fn layer_defs() -> Vec<EffectDef> {
                 chc("caps", "Capitalisation", CAPS_OPTS, 0, X),
                 bo("underline", "Underline", false, X),
                 fl("box_width", "Text Box Width", 0.0, (0.0, 100_000.0), (0.0, 3840.0), "", X),
+                fl("box_height", "Text Box Height", 0.0, (0.0, 100_000.0), (0.0, 2160.0), "", X),
+                chc("valign", "Vertical Alignment", VALIGN_OPTS, 0, X),
                 bo("vertical", "Vertical Text", false, X),
                 bo("top_left_origin", "Origin at Top Left", false, X),
             ],
@@ -195,6 +219,10 @@ pub struct TextProps {
     pub underline: bool,
     /// Area-text width (0 = point text).
     pub box_width: f32,
+    /// Area-text box height (0 = as tall as the text): with `valign`, where the text sits in it.
+    pub box_height: f32,
+    /// [`VALIGN_OPTS`]: 0 top, 1 centre, 2 bottom of the box.
+    pub valign: u32,
     /// Vertical text (characters stacked top to bottom; columns right to left).
     pub vertical: bool,
     /// The layer's origin (where Position puts it, what Anchor Point is measured from) is the
@@ -234,6 +262,8 @@ pub struct LayerSpec {
     pub content: LayerContent,
     pub appearance: Appearance,
     pub transform: LayerTransform,
+    /// The title's Vector Motion ([`group_transform`]), applied after the layer's own transform.
+    pub group: Option<filmcraft_geom::Affine>,
 }
 
 fn val(e: &EffectInstance, id: &str, t: Tick) -> ParamValue {
@@ -291,6 +321,8 @@ pub fn eval_layer(e: &EffectInstance, t: Tick, frame: (u32, u32)) -> Option<Laye
                 caps: ch(e, "caps", t),
                 underline: bb(e, "underline", t),
                 box_width: ff(e, "box_width", t).max(0.0),
+                box_height: ff(e, "box_height", t).max(0.0),
+                valign: ch(e, "valign", t),
                 vertical: bb(e, "vertical", t),
                 top_left_origin: bb(e, "top_left_origin", t),
             }
@@ -344,6 +376,7 @@ pub fn eval_layer(e: &EffectInstance, t: Tick, frame: (u32, u32)) -> Option<Laye
             rotation: ff(e, "rotation", t) as f64,
             opacity: (ff(e, "opacity", t) / 100.0).clamp(0.0, 1.0),
         },
+        group: None,
     })
 }
 

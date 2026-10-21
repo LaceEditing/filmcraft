@@ -13,7 +13,9 @@ pub(crate) fn escape(s: &str) -> String {
             '>' => o.push_str("&gt;"),
             '"' => o.push_str("&quot;"),
             '\'' => o.push_str("&apos;"),
-            c if (c as u32) < 0x20 && !matches!(c, '\n' | '\r' | '\t') => {}
+            // a raw CR would be read back as a line feed (XML end-of-line handling)
+            '\r' => o.push_str("&#13;"),
+            c if (c as u32) < 0x20 && !matches!(c, '\n' | '\t') => {}
             c => o.push(c),
         }
     }

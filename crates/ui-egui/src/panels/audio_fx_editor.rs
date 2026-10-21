@@ -13,8 +13,12 @@
 //!   mix for track effects (`LiveMix::take_fx_meters`).
 //! - **Hard Limiter**: Peak / True Peak, scaled sliders for Maximum Amplitude, Input Boost,
 //!   Look-Ahead and Release Time, Link Channels.
-//! - **Parametric / Graphic Equalizer, Multiband Compressor**: their response or band graphs
-//!   (computed by the real DSP: `render::audio_fx::configured` → `response_db` / `transfer_db`).
+//! - **Parametric Equalizer**: Premiere's graph (a point per band that is on, dragged where
+//!   grabbed, held at the edges; Range 30 / 96 dB) over its Frequency / Gain / Q / Band table.
+//! - **Graphic Equalizer, Multiband Compressor**: their band graphs.
+//!
+//! Every curve comes from the real DSP (`render::audio_fx::configured` → `response_db` /
+//! `transfer_db`), so it shows what playback does.
 //! - **Any other audio effect**: scaled sliders for a few parameters, or sections of knobs for
 //!   many (one per parameter group), checkboxes for switches and radio buttons for choices.
 //!
@@ -25,7 +29,8 @@
 //! Automation ids (`<fx>` = effect id): `fxEditor.<fx>.param.<param>` (knobs, sliders, EQ bands),
 //! `…value.<param>` (their numbers), `…toggle.<param>` (checkboxes), `…choice.<param>.<i>`
 //! (radio buttons) or `…choice.<param>` (menus), `…meter.<gate|comp|exp|lim>`, the EQ graph's
-//! `…plot` and `…node.<band>` (hp, low, b1, b2, mid, b4, b5, high, lp), the multiband
+//! `…plot`, `…node.<band>` (hp, low, b1, b2, mid, b4, b5, high, lp; only bands that are on),
+//! `…toggle.<band>_on` (Band buttons), `…toggle.low_steep` / `high_steep`, `…range.30|96`, the multiband
 //! `…xo1…3` and `…curve.<band>`, `…reset`, the frame's `…bypass`, `…presets`,
 //! `…presets.<name>`, `…presets.save`, `…presets.name`, `…presets.delete` and `…close`.
 
@@ -74,6 +79,9 @@ pub fn has_editor(effect: &str) -> bool {
 
 /// Open (or raise) the editor for a target.
 pub fn open(app: &mut FilmcraftApp, target: FxTarget) {
+    if let Some(res) = resolve(app, &target) {
+        app.ui.audio_fx_editor_effects.insert(key(&target), res.inst.effect);
+    }
     if !app.ui.audio_fx_editors.contains(&target) {
         app.ui.audio_fx_editors.push(target);
     }
@@ -525,6 +533,11 @@ fn same_settings(inst: &EffectInstance, mt: Tick, values: &EffectInstance) -> bo
 
 /// Show every open editor window.
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    // while a knob, slider or point is dragged, one more frame shows where the last pointer move
+    // put it (egui draws only on input, so the window was left a move behind when the mouse stopped)
+    if !app.ui.audio_fx_editors.is_empty() && ctx.dragged_id().is_some() {
+        ctx.request_repaint();
+    }
     let meters = live_meters(app, ctx);
     let targets = app.ui.audio_fx_editors.clone();
     let mut close = Vec::new();
@@ -533,7 +546,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             close.push(target);
             continue;
         };
-        if !has_editor(&res.inst.effect) {
+        // the window belongs to the effect it was opened on, not to its slot
+        let opened_on = app.ui.audio_fx_editor_effects.entry(key(&target)).or_insert_with(|| res.inst.effect.clone());
+        if !has_editor(&res.inst.effect) || *opened_on != res.inst.effect {
             close.push(target);
             continue;
         }
@@ -630,6 +645,8 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         }
     }
     app.ui.audio_fx_editors.retain(|t| !close.contains(t));
+    let open: std::collections::HashSet<String> = app.ui.audio_fx_editors.iter().map(key).collect();
+    app.ui.audio_fx_editor_effects.retain(|k, _| open.contains(k));
 }
 
 /// Width of an editor's body.
@@ -637,7 +654,7 @@ fn body_width(fx: &str) -> f32 {
     match fx {
         "dynamics_rack" => 690.0,
         "hard_limiter" => 600.0,
-        "parametric_eq" => 650.0,
+        "parametric_eq" => 760.0,
         "multiband_compressor" => 640.0,
         _ => 560.0,
     }
@@ -1007,7 +1024,7 @@ fn generic(ui: &mut egui::Ui, ed: &mut Ed) {
 // ------------------------------------------------------------------------------- plotting
 
 const F_MIN: f64 = 20.0;
-const F_MAX: f64 = 20000.0;
+const F_MAX: f64 = 24000.0;
 
 fn fx_of(x: f32, r: Rect) -> f64 {
     let u = ((x - r.min.x) / r.width()).clamp(0.0, 1.0) as f64;
@@ -1058,76 +1075,324 @@ fn response_plot(ui: &mut egui::Ui, ed: &mut Ed, size: egui::Vec2, range: f64) -
 }
 
 // ------------------------------------------------------------------------- parametric EQ
+//
+// Premiere's layout (measured in Premiere 26.5): a log-frequency graph (20 Hz – 24 kHz, bold lines
+// at 100 Hz / 1 kHz / 10 kHz) over ±48 dB (Range 96 dB) or ±15 dB (Range 30 dB), a square point
+// per band that is on (HP / LP only when on, and only horizontally), then a table: Frequency,
+// Gain (the pass filters' slope menus), Q / Width (the shelves' slope switch) and the Band
+// buttons. A point stays under the cursor where it was grabbed, the curve and the numbers follow
+// live, and the point stops at the graph's edges. Q changes in its number only (scrub or type);
+// the master Gain is not part of the curve.
 
-/// (node label, parameter prefix, has gain)
-const PEQ_NODES: [(&str, &str, bool); 9] = [
-    ("HP", "hp", false),
-    ("L", "low", true),
-    ("1", "b1", true),
-    ("2", "b2", true),
-    ("3", "mid", true),
-    ("4", "b4", true),
-    ("5", "b5", true),
-    ("H", "high", true),
-    ("LP", "lp", false),
+/// (node label, parameter prefix, kind)
+const PEQ_NODES: [(&str, &str, PeqKind); 9] = [
+    ("HP", "hp", PeqKind::Pass),
+    ("L", "low", PeqKind::Shelf),
+    ("1", "b1", PeqKind::Band),
+    ("2", "b2", PeqKind::Band),
+    ("3", "mid", PeqKind::Band),
+    ("4", "b4", PeqKind::Band),
+    ("5", "b5", PeqKind::Band),
+    ("H", "high", PeqKind::Shelf),
+    ("LP", "lp", PeqKind::Pass),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeqKind {
+    Pass,
+    Shelf,
+    Band,
+}
+
+const PEQ_BLUE: Color32 = Color32::from_rgb(0x55, 0x6e, 0xff);
+const PEQ_LABEL_W: f32 = 92.0;
+
+/// The graph's half height in dB for Range 96 dB (default) or 30 dB.
+fn peq_half_range(range_30: bool) -> f64 {
+    if range_30 { 15.0 } else { 48.0 }
+}
+
+/// Where a dragged point goes: the pointer less the grab offset, held inside the graph.
+fn peq_drag_target(pointer: Pos2, grab: egui::Vec2, r: Rect, half: f64) -> (f64, f64) {
+    let p = pointer - grab;
+    let f = fx_of(p.x, r);
+    let db = db_of(p.y.clamp(r.min.y, r.max.y), r, half).clamp(-half, half);
+    (f, db)
+}
+
 fn parametric(ui: &mut egui::Ui, ed: &mut Ed) {
-    let range = 30.0;
-    let (r, _) = response_plot(ui, ed, vec2(622.0, 260.0), range);
-    for (label, pre, gain) in PEQ_NODES {
-        let (on_id, f_id, g_id, q_id) = (format!("{pre}_on"), format!("{pre}_freq"), format!("{pre}_gain"), format!("{pre}_q"));
-        let f = ed.v(&f_id);
-        let g = if gain { ed.v(&g_id) } else { 0.0 };
-        let c = pos2(x_of(f, r), y_of(g, r, range));
+    let k = key(ed.target);
+    let range_id = egui::Id::new(("peq-range30", &k));
+    let sel_id = egui::Id::new(("peq-selected", &k));
+    let grab_id = egui::Id::new(("peq-grab", &k));
+    let range_30: bool = ui.ctx().data(|d| d.get_temp(range_id)).unwrap_or(false);
+    let mut selected: Option<String> = ui.ctx().data(|d| d.get_temp(sel_id));
+    let mut grab: egui::Vec2 = ui.ctx().data(|d| d.get_temp(grab_id)).unwrap_or_default();
+    let half = peq_half_range(range_30);
+
+    let (r, plot_resp) = ui.allocate_exact_size(vec2(body_width(ed.fx) - 28.0, 300.0), Sense::click());
+    ed.auto(format!("fxEditor.{}.plot", ed.fx), r, "Response");
+    if plot_resp.clicked() || plot_resp.double_clicked() {
+        selected = None;
+    }
+    // 1. the points take the pointer first, so the curve below shows this frame's values
+    let mut dragging: Option<(Pos2, &str)> = None;
+    for (_, pre, kind) in PEQ_NODES {
+        let on_id = format!("{pre}_on");
+        if !ed.on(&on_id) {
+            continue;
+        }
+        let (f_id, g_id) = (format!("{pre}_freq"), format!("{pre}_gain"));
+        let g = if kind == PeqKind::Pass { 0.0 } else { ed.v(&g_id) };
+        let c = pos2(x_of(ed.v(&f_id), r), y_of(g, r, half));
         let nr = Rect::from_center_size(c, vec2(16.0, 16.0));
-        let id = egui::Id::new(("peq-node", ed.target.clone(), pre));
-        let resp = ui.interact(nr, id, Sense::click_and_drag());
-        let on = ed.on(&on_id);
-        let col = if on { Color32::from_rgb(0xe8, 0xe8, 0xe8) } else { Color32::from_gray(0x70) };
-        ui.painter().circle_filled(c, 8.0, Color32::from_gray(0x16));
-        ui.painter().circle_stroke(c, 8.0, Stroke::new(1.5, col));
-        ui.painter().text(c, Align2::CENTER_CENTER, label, Tokens::ui(8.5), col);
-        ed.auto(format!("fxEditor.{}.node.{pre}", ed.fx), nr, label);
+        let resp = ui.interact(nr, egui::Id::new(("peq-node", ed.target.clone(), pre)), Sense::click_and_drag());
+        if resp.clicked() || resp.drag_started() {
+            selected = Some(pre.to_string());
+        }
+        // the offset from where the button went down: egui starts a drag only after the pointer
+        // has moved a few pixels, and measuring from there left the point trailing the pointer
+        if resp.drag_started()
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
+        {
+            grab = pos - c;
+        }
         if resp.dragged()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            ed.drafts.insert(f_id.clone(), fx_of(pos.x, r).round());
-            if gain {
+            let (f, db) = peq_drag_target(pos, grab, r, half);
+            let (lo, hi, _) = ed.range(&f_id);
+            ed.drafts.insert(f_id.clone(), ((f * 10.0).round() / 10.0).clamp(lo, hi));
+            if kind != PeqKind::Pass {
                 let (lo, hi, _) = ed.range(&g_id);
-                ed.drafts.insert(g_id.clone(), (db_of(pos.y, r, range) * 10.0).round().clamp(lo * 10.0, hi * 10.0) / 10.0);
+                ed.drafts.insert(g_id.clone(), ((db * 10.0).round() / 10.0).clamp(lo, hi));
             }
+            dragging = Some((pos, pre));
+            // one more frame shows where the last pointer move put the point (egui draws only on
+            // input, and the graph was left a move behind when the mouse stopped)
+            ui.ctx().request_repaint();
         }
         if resp.drag_stopped() {
             let fv = ed.v(&f_id);
             ed.commit(&f_id, fv);
-            if gain {
+            if kind != PeqKind::Pass {
                 let gv = ed.v(&g_id);
                 ed.commit(&g_id, gv);
             }
-        }
-        // scroll over a node changes its Q
-        if gain && resp.hovered() {
-            let s = ui.input(|i| i.smooth_scroll_delta.y);
-            if s.abs() > 0.5 {
-                let (lo, hi, _) = ed.range(&q_id);
-                let q = (ed.v(&q_id) * if s > 0.0 { 1.1 } else { 1.0 / 1.1 }).clamp(lo, hi);
-                ed.commit(&q_id, (q * 100.0).round() / 100.0);
-            }
-        }
-        if resp.double_clicked() {
-            ed.commit(&on_id, if on { 0.0 } else { 1.0 });
+            ui.ctx().request_repaint();
         }
     }
-    ui.add_space(10.0);
+    // 2. the graph, the curve and the points
+    peq_grid(ui, r, half);
+    let mut shown = ed.preview();
+    // the master Gain is not part of Premiere's curve
+    shown.params.remove("master_gain");
+    if let Some(dsp) = filmcraft_render::audio_fx::configured(&shown, ed.mt, 48000) {
+        let pts: Vec<Pos2> = (0..=320)
+            .filter_map(|i| {
+                let x = r.min.x + r.width() * i as f32 / 320.0;
+                dsp.response_db(fx_of(x, r)).map(|db| pos2(x, y_of(db, r, half)))
+            })
+            .collect();
+        ui.painter_at(r).add(egui::Shape::line(pts, Stroke::new(1.6, PEQ_BLUE)));
+    }
+    for (label, pre, kind) in PEQ_NODES {
+        if !ed.on(&format!("{pre}_on")) {
+            continue;
+        }
+        let g = if kind == PeqKind::Pass { 0.0 } else { ed.v(&format!("{pre}_gain")) };
+        let c = pos2(x_of(ed.v(&format!("{pre}_freq")), r), y_of(g, r, half));
+        let sel = selected.as_deref() == Some(pre);
+        let sq = Rect::from_center_size(c, vec2(if sel { 10.0 } else { 7.0 }, if sel { 10.0 } else { 7.0 }));
+        let p = ui.painter_at(r.expand(8.0));
+        p.rect_filled(sq, 1.0, if sel { PEQ_BLUE } else { Color32::from_rgb(0xe8, 0xf4, 0xff) });
+        if sel {
+            p.rect_stroke(sq, 1.0, Stroke::new(1.2, Color32::WHITE), StrokeKind::Outside);
+        }
+        p.text(pos2(c.x, c.y - 9.0), Align2::CENTER_BOTTOM, label, Tokens::ui(11.0), Color32::WHITE);
+        ed.auto(format!("fxEditor.{}.node.{pre}", ed.fx), Rect::from_center_size(c, vec2(16.0, 16.0)), label);
+    }
+    if let Some((pos, pre)) = dragging {
+        let f = ed.v(&format!("{pre}_freq"));
+        let g = if pre == "hp" || pre == "lp" { 0.0 } else { ed.v(&format!("{pre}_gain")) };
+        let tip = format!("{f:.1} Hz --> {g:.1} dB");
+        let at = pos2(pos.x.clamp(r.min.x + 60.0, r.max.x - 60.0), (pos.y + 22.0).clamp(r.min.y + 10.0, r.max.y - 4.0));
+        let galley = ui.painter().layout_no_wrap(tip, Tokens::ui(11.0), Color32::BLACK);
+        let tr = Rect::from_center_size(at, galley.size() + vec2(8.0, 4.0));
+        ui.painter().rect_filled(tr, 2.0, Color32::from_rgb(0xf4, 0xf4, 0xe8));
+        ui.painter().galley(tr.min + vec2(4.0, 2.0), galley, Color32::BLACK);
+    }
+    ui.add_space(12.0);
+    peq_table(ui, ed);
+    ui.add_space(8.0);
+    // Range (a view setting, like Premiere's)
     ui.horizontal(|ui| {
-        for (label, pre, _) in PEQ_NODES {
-            ed.check(ui, &format!("{pre}_on"), label, false);
-            ui.add_space(12.0);
+        ui.add_space(PEQ_LABEL_W);
+        ui.label(egui::RichText::new("Range:").color(LABEL).size(13.0));
+        for (val, text, id) in [(true, "30 dB", "30"), (false, "96 dB", "96")] {
+            let rr = ui.radio(range_30 == val, egui::RichText::new(text).color(LABEL).size(13.0));
+            ed.auto(format!("fxEditor.{}.range.{id}", ed.fx), rr.rect, text);
+            if rr.clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(range_id, val));
+            }
         }
     });
     ui.add_space(4.0);
-    ed.slider_row(ui, "master_gain", "Master Gain");
+    ed.slider_row(ui, "master_gain", "Gain");
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(grab_id, grab);
+        match &selected {
+            Some(s) => {
+                d.insert_temp(sel_id, s.clone());
+            }
+            None => d.remove::<String>(sel_id),
+        }
+    });
+}
+
+/// Premiere's grid: thin lines at every 1…9 × decade, bold at 100 Hz, 1 kHz and 10 kHz; dB
+/// lines every 2 dB (Range 96) or 1 dB (Range 30), labelled every 10 / 5 dB at the right.
+fn peq_grid(ui: &mut egui::Ui, r: Rect, half: f64) {
+    let p = ui.painter_at(r.expand2(vec2(30.0, 0.0)));
+    p.rect_filled(r, 0.0, Color32::from_gray(0x0e));
+    let mut decade = 10.0;
+    while decade <= 10000.0 {
+        for m in 1..=9 {
+            let f = decade * m as f64;
+            if !(F_MIN..=F_MAX).contains(&f) {
+                continue;
+            }
+            let x = x_of(f, r);
+            let bold = m == 1 && (100.0..=10000.0).contains(&f);
+            p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.0, Color32::from_gray(if bold { 0x6a } else { 0x2a })));
+            let label = match f as u32 {
+                20 => Some("Hz".to_string()),
+                30 | 40 | 50 | 60 | 70 | 80 | 100 | 200 | 300 | 400 | 500 | 600 | 800 => Some(format!("{}", f as u32)),
+                1000 | 2000 | 3000 | 4000 | 5000 | 6000 | 7000 | 8000 | 10000 | 20000 => Some(format!("{}k", f as u32 / 1000)),
+                _ => None,
+            };
+            if let Some(l) = label {
+                let col = if bold { LABEL } else { DIM };
+                p.text(pos2(x + 2.0, r.max.y - 2.0), Align2::LEFT_BOTTOM, l, Tokens::ui(9.5), col);
+            }
+        }
+        decade *= 10.0;
+    }
+    let (minor, major) = if half > 20.0 { (2.0, 10.0) } else { (1.0, 5.0) };
+    let mut d = -half;
+    while d <= half + 1e-9 {
+        let y = y_of(d, r, half);
+        let is_major = (d / major).round() * major == d;
+        let col = if d.abs() < 1e-9 {
+            Color32::from_gray(0x60)
+        } else if is_major {
+            Color32::from_gray(0x34)
+        } else {
+            Color32::from_gray(0x1e)
+        };
+        p.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], Stroke::new(1.0, col));
+        if is_major && d.abs() < half - 1e-9 {
+            p.text(pos2(r.max.x - 3.0, y), Align2::RIGHT_CENTER, format!("{d:.0}"), Tokens::ui(9.5), DIM);
+        }
+        d += minor;
+    }
+    p.text(pos2(r.max.x - 3.0, r.min.y + 2.0), Align2::RIGHT_TOP, "dB", Tokens::ui(9.5), DIM);
+}
+
+/// The table under the graph: Frequency, Gain, Q / Width and Band rows, one column per band.
+fn peq_table(ui: &mut egui::Ui, ed: &mut Ed) {
+    let w = body_width(ed.fx) - 28.0;
+    let col_w = (w - PEQ_LABEL_W) / PEQ_NODES.len() as f32;
+    let row = |ui: &mut egui::Ui, label: &str| -> Rect {
+        let (rr, _) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
+        ui.painter().text(pos2(rr.min.x + PEQ_LABEL_W - 12.0, rr.center().y), Align2::RIGHT_CENTER, label, FontId::proportional(13.0), LABEL);
+        rr
+    };
+    let cell = |rr: Rect, i: usize| Rect::from_min_size(pos2(rr.min.x + PEQ_LABEL_W + col_w * i as f32, rr.min.y + 4.0), vec2(col_w - 6.0, 20.0));
+    // Frequency
+    let rr = row(ui, "Frequency");
+    for (i, (_, pre, _)) in PEQ_NODES.iter().enumerate() {
+        ed.value_text(ui, &format!("{pre}_freq"), cell(rr, i), egui::Align::Max);
+    }
+    // Gain (the pass filters' slopes)
+    let rr = row(ui, "Gain");
+    for (i, (_, pre, kind)) in PEQ_NODES.iter().enumerate() {
+        if *kind == PeqKind::Pass {
+            peq_slope(ui, ed, &format!("{pre}_slope"), cell(rr, i));
+        } else {
+            ed.value_text(ui, &format!("{pre}_gain"), cell(rr, i), egui::Align::Max);
+        }
+    }
+    // Q / Width (the shelves' slope switch)
+    let rr = row(ui, "Q / Width");
+    for (i, (_, pre, kind)) in PEQ_NODES.iter().enumerate() {
+        match kind {
+            PeqKind::Band => ed.value_text(ui, &format!("{pre}_q"), cell(rr, i), egui::Align::Max),
+            PeqKind::Shelf => peq_shelf_switch(ui, ed, pre, cell(rr, i)),
+            PeqKind::Pass => {}
+        }
+    }
+    // Band buttons
+    let rr = row(ui, "Band");
+    for (i, (label, pre, _)) in PEQ_NODES.iter().enumerate() {
+        let b = cell(rr, i).shrink2(vec2(4.0, 0.0));
+        let pid = format!("{pre}_on");
+        let resp = ui.interact(b, egui::Id::new(("peq-band", ed.target.clone(), *pre)), Sense::click());
+        let on = ed.on(&pid);
+        let fill = if on { Color32::from_gray(0x50) } else { Color32::from_gray(0x0c) };
+        ui.painter().rect_filled(b, 3.0, fill);
+        if resp.hovered() {
+            ui.painter().rect_stroke(b, 3.0, Stroke::new(1.0, Color32::from_gray(0x90)), StrokeKind::Inside);
+        }
+        ui.painter().text(b.center(), Align2::CENTER_CENTER, *label, FontId::proportional(12.5), Color32::WHITE);
+        ed.auto(format!("fxEditor.{}.toggle.{pid}", ed.fx), b, label);
+        if resp.clicked() {
+            ed.commit(&pid, if on { 0.0 } else { 1.0 });
+        }
+    }
+}
+
+/// A pass filter's slope menu (6 … 48 dB/Oct).
+fn peq_slope(ui: &mut egui::Ui, ed: &mut Ed, pid: &str, r: Rect) {
+    let Some(ParamKind::Choice(opts)) = ed.def(pid).map(|p| &p.kind) else { return };
+    let cur = ed.v(pid).max(0.0).round() as usize;
+    let mut sel = cur;
+    let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(r));
+    let resp = egui::ComboBox::from_id_salt(("peq-slope", ed.target.clone(), pid))
+        .width(r.width())
+        .selected_text(egui::RichText::new(opts.get(cur).copied().unwrap_or("")).size(11.5))
+        .show_ui(&mut cui, |ui| {
+            for (i, o) in opts.iter().enumerate() {
+                ui.selectable_value(&mut sel, i, *o);
+            }
+        });
+    ed.auto(format!("fxEditor.{}.choice.{pid}", ed.fx), resp.response.rect, pid);
+    if sel != cur {
+        ed.commit(pid, sel as f64);
+    }
+}
+
+/// A shelf's slope switch: gentle (first order) or steep (second order), drawn as its shape.
+fn peq_shelf_switch(ui: &mut egui::Ui, ed: &mut Ed, pre: &str, r: Rect) {
+    let pid = format!("{pre}_steep");
+    let b = Rect::from_center_size(pos2(r.max.x - 14.0, r.center().y), vec2(26.0, 20.0));
+    let resp = ui.interact(b, egui::Id::new(("peq-steep", ed.target.clone(), pre)), Sense::click());
+    let steep = ed.on(&pid);
+    if resp.hovered() {
+        ui.painter().rect_stroke(b, 3.0, Stroke::new(1.0, Color32::from_gray(0x90)), StrokeKind::Inside);
+    }
+    // the shelf's outline: high on the boosted side, a gentle or steep step between
+    let (lo_y, hi_y) = (b.center().y + 4.0, b.center().y - 4.0);
+    let (x0, x3) = (b.min.x + 4.0, b.max.x - 4.0);
+    let (x1, x2) = if steep { (b.center().x - 2.0, b.center().x + 2.0) } else { (b.center().x - 6.0, b.center().x + 6.0) };
+    let (y_left, y_right) = if pre == "low" { (hi_y, lo_y) } else { (lo_y, hi_y) };
+    let pts = vec![pos2(x0, y_left), pos2(x1, y_left), pos2(x2, y_right), pos2(x3, y_right)];
+    ui.painter().add(egui::Shape::line(pts, Stroke::new(1.6, LABEL)));
+    ed.auto(format!("fxEditor.{}.toggle.{pid}", ed.fx), b, if steep { "Steep" } else { "Gentle" });
+    let resp = resp.on_hover_text(if steep { "Steep shelf (click: gentle)" } else { "Gentle shelf (click: steep)" });
+    if resp.clicked() {
+        ed.commit(&pid, if steep { 0.0 } else { 1.0 });
+    }
 }
 
 // --------------------------------------------------------------------------- graphic EQ

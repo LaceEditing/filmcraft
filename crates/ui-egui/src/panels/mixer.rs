@@ -2,7 +2,8 @@
 //!
 //! Track Mixer strips (audio tracks, submixes, Mix): effect and send slots (behind the ▸
 //! disclosure) with the knob of the selected slot's parameter under them (see [`rack`]: drag
-//! effects between slots and strips to move them, Alt-drag to copy, double-click to edit), input mapping, output assignment, pan knob, automation mode, M / S / R, fader with
+//! an effect within a strip to move it, onto another strip to copy it, Ctrl-drag for the other
+//! one, as in Premiere; double-click to edit), input mapping, output assignment, pan knob, automation mode, M / S / R, fader with
 //! a dB scale, stereo meters fed by the playing mix, the fader value and the strip name. Every
 //! control goes through `mixer.*` commands: fader and knob drags are `mixer.touch` while held and
 //! `mixer.release` when let go, so they are heard live during playback and recorded as automation
@@ -158,6 +159,8 @@ struct Ctx<'a> {
     now: filmcraft_time::Tick,
     recording: bool,
     acts: Vec<(String, Value)>,
+    /// The strip whose rack slot a dragged effect is over (for the copy / move cue).
+    drop_strip: Option<u64>,
 }
 
 impl Ctx<'_> {
@@ -181,13 +184,21 @@ const ARROW_W: f32 = 14.0;
 /// Height of the parameter knob area under the rack.
 const KNOB_AREA_H: f32 = 78.0;
 
-/// An effect being dragged out of a rack slot: dropped on another slot (any strip) it moves there,
-/// with Alt (Option) held it is copied.
+/// An effect being dragged out of a rack slot. As in Premiere: dropped in its own strip it moves,
+/// on another strip it is copied; Ctrl (Cmd) swaps the two. It lands at the slot it is dropped
+/// on, pushing that slot's effect and the ones below down.
 #[derive(Clone, Debug)]
 struct RackDrag {
     strip: u64,
     slot: usize,
     name: String,
+}
+
+/// Whether dropping a dragged effect copies it (else it moves): Premiere moves within a strip
+/// and copies to another one, and Ctrl (Cmd) swaps the two. Alt does nothing (and on Linux
+/// desktops Alt-drag moves the window).
+fn drop_copies(same_strip: bool, ctrl: bool) -> bool {
+    same_strip == ctrl
 }
 
 /// Paint a rack slot: its text, the dropdown arrow, the selection and a drop marker.
@@ -257,7 +268,7 @@ pub fn track_mixer(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         return;
     };
     let meters = poll_meters(app, ui);
-    let mut cx = Ctx { t, seq: &seq, now: app.session.playhead(), recording: app.session.mixrec.active(), acts: Vec::new() };
+    let mut cx = Ctx { t, seq: &seq, now: app.session.playhead(), recording: app.session.mixrec.active(), acts: Vec::new(), drop_strip: None };
     let footer = Rect::from_min_max(pos2(rect.min.x, rect.max.y - 34.0), rect.max);
     let body = Rect::from_min_max(pos2(rect.min.x, rect.min.y + 2.0), pos2(rect.max.x, footer.min.y));
     // effects / sends disclosure at the left edge
@@ -390,9 +401,10 @@ pub fn track_mixer(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         };
         strip(app, &mut cui, &mut cx, *id, sr, &m);
     }
-    // the effect being dragged follows the pointer ("+" when Alt makes the drop a copy)
+    // the effect being dragged follows the pointer ("+" where the drop makes a copy)
     if let (Some(d), Some(p)) = (egui::DragAndDrop::payload::<RackDrag>(ui.ctx()), ui.ctx().pointer_interact_pos()) {
-        let copy = ui.input(|i| i.modifiers.alt);
+        let ctrl = ui.input(|i| i.modifiers.command);
+        let copy = cx.drop_strip.is_some_and(|s| drop_copies(s == d.strip, ctrl));
         let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("mixer-rack-drag")));
         let text = if copy { format!("+ {}", d.name) } else { d.name.clone() };
         let galley = painter.layout_no_wrap(text, Tokens::ui(11.0), t.text);
@@ -668,8 +680,9 @@ fn strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, id: TrackId, s
 /// An effect slot is selected by a click (its knob shows below), opens the effect list from its
 /// arrow (or anywhere when empty; on a filled slot the list replaces it, None empties it), opens
 /// its editor on a double-click and its menu on a right-click (Edit…, Bypass, Post-Fader, the
-/// knob's parameter, Copy / Paste Track Effects, Remove). Dragging an effect onto another slot,
-/// of this strip or another, moves it there; with Alt (Option) held it is copied.
+/// knob's parameter, Copy / Paste Track Effects, Remove). Dragging an effect onto another slot
+/// of this strip moves it there, onto another strip copies it (with its settings); Ctrl (Cmd)
+/// swaps the two ([`drop_copies`]).
 #[allow(clippy::too_many_arguments)]
 fn rack(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, tr: &Track, id: TrackId, ap: &str, x: f32, w: f32, mut y: f32) -> f32 {
     use crate::state::RackSel;
@@ -694,13 +707,16 @@ fn rack(app: &mut FilmcraftApp, ui: &mut egui::Ui, cx: &mut Ctx, tr: &Track, id:
         let resp = ui.interact(r, egui::Id::new((ap, "fx", k)), Sense::click_and_drag());
         let arrow = Rect::from_min_max(pos2(r.max.x - ARROW_W, r.min.y), r.max);
         let hover_drop = dragging && resp.dnd_hover_payload::<RackDrag>().is_some();
+        if hover_drop {
+            cx.drop_strip = Some(id.0);
+        }
         paint_slot(ui, r, &text, fx.is_some(), fx.is_some_and(|e| !e.enabled), sel == Some(RackSel::Effect(k)) && fx.is_some(), resp.hovered(), hover_drop, &t);
         app.auto.add(&format!("{ap}.fx.{k}"), r, &if text.is_empty() { format!("Effect slot {}", k + 1) } else { text.clone() });
         if let (Some(_), Some(n)) = (fx, &name) {
             resp.dnd_set_drag_payload(RackDrag { strip: id.0, slot: k, name: n.clone() });
         }
         if let Some(d) = resp.dnd_release_payload::<RackDrag>() {
-            let copy = ui.input(|i| i.modifiers.alt);
+            let copy = drop_copies(d.strip == id.0, ui.input(|i| i.modifiers.command));
             cx.cmd("mixer.moveInsert", json!({"strip": d.strip, "slot": d.slot, "to": id.0, "toSlot": k, "copy": copy}));
             let landed = if !copy && d.strip == id.0 { k.min(tr.effects.len().saturating_sub(1)) } else { k.min(tr.effects.len()) };
             select = Some(Some(RackSel::Effect(landed)));

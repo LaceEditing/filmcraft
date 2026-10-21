@@ -79,7 +79,7 @@ solo, record arm, solo safe, mode Off/Read/Latch/Touch/Write, output, input map,
 `mixer.setValue`, `mixer.touch` / `mixer.release` (a fader gesture; recorded during an automation pass),
 `mixer.recordStart` / `mixer.recordStop` (playback runs them), `mixer.addSubmix`, `mixer.deleteSubmix`,
 `mixer.addInsert` / `removeInsert` / `setInsert` / `replaceInsert {effect | "none"}` /
-`moveInsert {to?, toSlot?, copy?}` (a rack drag; Alt-drag copies), `mixer.copyInserts` /
+`moveInsert {to?, toSlot?, copy?}` (a rack drag: within a strip it moves, onto another strip it copies, Ctrl-drag swaps the two), `mixer.copyInserts` /
 `pasteInserts` (Copy / Paste Track Effects: the rack replaces the target's),
 `mixer.addSend` / `setSend` / `removeSend`,
 `mixer.setKeyframe` / `deleteKeyframe` / `moveKeyframe` / `clearLane`, `mixer.writeAutomation`;

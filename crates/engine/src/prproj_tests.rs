@@ -341,28 +341,66 @@ fn a_clip_starting_before_its_source_still_saves() {
     assert!(std::fs::read_to_string(&src).unwrap().contains(&format!("<Start>{}</Start>", 2 * S)), "the empty head is left out");
 }
 
-/// A title placed by its text's origin (the first line's baseline) is given to the Premiere
-/// writer measured from its top-left corner, as Premiere places text, with its anchor moved so it
-/// stays exactly where it is on screen.
+/// Titles are given to the Premiere writer measured as Premiere measures them — point text from
+/// its first baseline, paragraph text from its box's top-left — with their anchor moved so they
+/// stay exactly where they are on screen. Point text measured from its top-left came out a line
+/// high in Premiere (Round 3: anchor 0,106.6 on a size-110 title).
 #[test]
-fn titles_are_measured_from_their_top_left_for_premiere() {
+fn titles_are_measured_as_premiere_measures_them() {
     let mut s = Session::default();
     s.execute("file.openDemoProject", json!({})).unwrap();
-    let r = s.execute("graphics.newText", json!({"text": "Hello there", "position": [400.0, 300.0], "size": 80})).unwrap();
-    let clip = r["clip"].as_u64().unwrap();
-    let quad = |s: &mut Session| s.execute("graphics.list", json!({"clip": clip})).unwrap()["layers"][0]["quad"].clone();
-    let before = quad(&mut s);
-    let converted = crate::interchange::titles_from_top_left(&s.project).expect("a text layer to convert");
-    s.project = std::sync::Arc::new(converted);
-    let after = quad(&mut s);
-    for i in 0..4 {
-        for k in 0..2 {
-            let (a, b) = (before[i][k].as_f64().unwrap(), after[i][k].as_f64().unwrap());
-            assert!((a - b).abs() < 0.01, "corner {i}: {before} vs {after}");
+    let point = s.execute("graphics.newText", json!({"text": "Hello there", "position": [400.0, 300.0], "size": 80})).unwrap()["clip"].as_u64().unwrap();
+    assert!(crate::interchange::titles_for_premiere(&s.project).is_none(), "point text on its baseline is already Premiere's");
+    let boxed = s
+        .execute("graphics.newText", json!({"text": "Paragraph text", "position": [200.0, 600.0], "size": 60, "boxWidth": 500.0, "newClip": true}))
+        .unwrap()["clip"]
+        .as_u64()
+        .unwrap();
+    let layer = |s: &Session, clip: u64| {
+        s.active_sequence().unwrap().all_tracks().flat_map(|t| t.items.iter()).find(|c| c.id.0 == clip).unwrap().effect("graphic_text").unwrap().clone()
+    };
+    let tl = crate::interchange::titles_for_premiere(&s.project).expect("the paragraph text to convert");
+    let quad = |s: &mut Session, clip: u64| s.execute("graphics.list", json!({"clip": clip})).unwrap()["layers"][0]["quad"].clone();
+    let before = (quad(&mut s, point), quad(&mut s, boxed));
+    s.project = std::sync::Arc::new(tl);
+    let after = (quad(&mut s, point), quad(&mut s, boxed));
+    for (b, a) in [(&before.0, &after.0), (&before.1, &after.1)] {
+        for i in 0..4 {
+            for k in 0..2 {
+                assert!((b[i][k].as_f64().unwrap() - a[i][k].as_f64().unwrap()).abs() < 0.01, "corner {i}: {b} vs {a}");
+            }
         }
     }
-    let q = s.active_sequence().unwrap();
-    let e = q.all_tracks().flat_map(|t| t.items.iter()).find(|c| c.id.0 == clip).unwrap().effect("graphic_text").unwrap();
-    assert_eq!(e.params["top_left_origin"].value, filmcraft_project::ParamValue::Bool(true));
-    assert!(crate::interchange::titles_from_top_left(&s.project).is_none(), "nothing left to convert");
+    assert_eq!(layer(&s, boxed).params["top_left_origin"].value, filmcraft_project::ParamValue::Bool(true), "paragraph text: its box's top-left");
+    assert_ne!(
+        layer(&s, point).params.get("top_left_origin").map(|p| p.value.clone()),
+        Some(filmcraft_project::ParamValue::Bool(true)),
+        "point text: its baseline"
+    );
+    assert!(crate::interchange::titles_for_premiere(&s.project).is_none(), "nothing left to convert");
+    // point text placed by its top-left goes back to its baseline, staying where it is
+    s.edit("Top-left", |p, _| {
+        for it in p.items.values_mut() {
+            let filmcraft_project::ItemKind::Sequence(sq) = &mut it.kind else { continue };
+            for t in sq.all_tracks_mut() {
+                for c in t.items.iter_mut().filter(|c| c.id.0 == point) {
+                    if let Some(e) = c.effects.iter_mut().find(|e| e.effect == "graphic_text") {
+                        e.params.insert("top_left_origin".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Bool(true)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    let shifted = quad(&mut s, point);
+    let back = crate::interchange::titles_for_premiere(&s.project).expect("the point text to convert");
+    s.project = std::sync::Arc::new(back);
+    let again = quad(&mut s, point);
+    for i in 0..4 {
+        for k in 0..2 {
+            assert!((shifted[i][k].as_f64().unwrap() - again[i][k].as_f64().unwrap()).abs() < 0.01, "corner {i}: {shifted} vs {again}");
+        }
+    }
+    assert_eq!(layer(&s, point).params["top_left_origin"].value, filmcraft_project::ParamValue::Bool(false));
 }
