@@ -370,6 +370,8 @@ fn invoke_inner(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: V
                 fps: seq.settings.frame_rate.as_f64(),
                 sample_rate: seq.settings.sample_rate,
                 mix: filmcraft_engine::mixer::channels_name(seq.settings.audio_master).to_string(),
+                was: (seq.settings.width, seq.settings.height),
+                scale_clips: false,
             };
             app.dialog = Some(crate::Dialog::SequenceSettings);
             return Ok(json!({"dialog": "sequenceSettings"}));

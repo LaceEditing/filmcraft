@@ -930,3 +930,109 @@ fn filter_colors(s: &mut Session, p: &Value) -> Result<Value> {
     }
     Ok(json!({"hidden": s.state.hidden_marker_colors.iter().map(|c| c.name()).collect::<Vec<_>>()}))
 }
+
+/// A sequence's frame changed from `old` to `new` (Sequence Settings): what is measured in its
+/// pixels follows, as Premiere keeps it (Premiere saves those relative to the frame) — its clips'
+/// Position (and their keyframes) moves to the same place in the new frame, titles drawn at the old
+/// size get the new size with their layers in the same places, and clips elsewhere that nest the
+/// sequence keep their anchor point at the same place in it. Sizes stay (a 1440p clip is smaller
+/// in a 4K frame) unless `scale_clips`: then every clip's Scale grows (or shrinks) with the frame,
+/// as Set to Frame Size would, so the picture fills the new frame as it filled the old one.
+pub(crate) fn reframe(pr: &mut filmcraft_project::Project, seq: ItemId, old: (u32, u32), new: (u32, u32), scale_clips: bool) {
+    use filmcraft_project::{ItemKind, Param, ParamValue, graphic};
+    if old.0 == 0 || old.1 == 0 {
+        return;
+    }
+    let (rx, ry) = (new.0 as f64 / old.0 as f64, new.1 as f64 / old.1 as f64);
+    let fit = rx.min(ry);
+    let move_point = |p: &mut Param| {
+        p.map_values(|v| match v {
+            ParamValue::Vec2(mut q) => {
+                if !q.x.is_nan() {
+                    q.x *= rx;
+                }
+                if !q.y.is_nan() {
+                    q.y *= ry;
+                }
+                ParamValue::Vec2(q)
+            }
+            other => other,
+        })
+    };
+    let times = |p: &mut Param, k: f64| {
+        p.map_values(|v| match v {
+            ParamValue::Float(x) => ParamValue::Float(x * k),
+            other => other,
+        })
+    };
+    // titles drawn at the old frame size, used only in this sequence: redrawn at the new size
+    let mut uses: std::collections::HashMap<ItemId, (usize, usize)> = std::collections::HashMap::new();
+    for it in pr.items.values() {
+        let ItemKind::Sequence(q) = &it.kind else { continue };
+        for c in q.all_tracks().flat_map(|t| t.items.iter()) {
+            let e = uses.entry(c.item).or_default();
+            if it.id == seq {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
+    }
+    let regrown: Vec<ItemId> = if scale_clips {
+        Vec::new()
+    } else {
+        pr.items
+            .values()
+            .filter(|i| matches!(i.kind, ItemKind::Graphic { width, height, .. } if (width, height) == old))
+            .filter(|i| uses.get(&i.id).is_some_and(|u| u.0 > 0 && u.1 == 0))
+            .map(|i| i.id)
+            .collect()
+    };
+    for id in &regrown {
+        if let Some(ItemKind::Graphic { width, height, .. }) = pr.item_mut(*id).map(|i| &mut i.kind) {
+            (*width, *height) = new;
+        }
+    }
+    if let Some(q) = pr.sequence_mut(seq) {
+        for t in q.video_tracks.iter_mut() {
+            for c in t.items.iter_mut() {
+                let redrawn = regrown.contains(&c.item);
+                for e in c.effects.iter_mut() {
+                    if e.effect == "motion" {
+                        if let Some(p) = e.params.get_mut("position") {
+                            move_point(p);
+                        }
+                        if scale_clips {
+                            for id in ["scale", "scale_width"] {
+                                if let Some(p) = e.params.get_mut(id) {
+                                    times(p, fit);
+                                }
+                            }
+                        }
+                    } else if redrawn && (graphic::is_layer(e) || e.effect == graphic::VECTOR_MOTION) {
+                        // the title's own points, in its canvas
+                        for id in ["position", "anchor"] {
+                            if (id == "position" || e.effect == graphic::VECTOR_MOTION)
+                                && let Some(p) = e.params.get_mut(id)
+                            {
+                                move_point(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // where the sequence is nested: its anchor point, measured in its frame, moves with it
+    for it in pr.items.values_mut() {
+        if it.id == seq {
+            continue;
+        }
+        let ItemKind::Sequence(q) = &mut it.kind else { continue };
+        for c in q.all_tracks_mut().flat_map(|t| t.items.iter_mut()).filter(|c| c.item == seq) {
+            if let Some(p) = c.effects.iter_mut().find(|e| e.effect == "motion").and_then(|e| e.params.get_mut("anchor")) {
+                move_point(p);
+            }
+        }
+    }
+}

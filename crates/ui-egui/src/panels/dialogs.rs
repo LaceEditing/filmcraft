@@ -338,6 +338,17 @@ fn sequence_settings(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             let h = ui.add(egui::DragValue::new(&mut d.height).range(16..=16384).suffix(" vertical"));
             elems.push(("sequenceSettings.height".into(), h.rect, d.height.to_string()));
         });
+        // a new frame size: clips stay where they are in the frame (as in Premiere); this also
+        // scales them with it (Set to Frame Size for the whole sequence)
+        if (d.width, d.height) != d.was && d.was.0 > 0 {
+            ui.horizontal(|ui| {
+                ui.add_space(label_w + 8.0);
+                let c = ui.checkbox(&mut d.scale_clips, "Scale clips to the new frame size").on_hover_text(
+                    "Off (as in Premiere Pro): clips keep their size and their place in the frame.\nOn: every clip's Scale changes with the frame, so the picture fills it as before.",
+                );
+                elems.push(("sequenceSettings.scaleClips".into(), c.rect, "Scale clips to the new frame size".into()));
+            });
+        }
         ui.horizontal(|ui| {
             label(ui, "Timebase");
             let shown = format!("{} frames/second", fps_label(d.fps));
@@ -407,7 +418,7 @@ fn sequence_settings(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     }
     if apply {
         let name = d.name.trim();
-        let mut params = serde_json::json!({"width": d.width, "height": d.height, "fps": d.fps});
+        let mut params = serde_json::json!({"width": d.width, "height": d.height, "fps": d.fps, "scaleClips": d.scale_clips});
         if !audio_fixed {
             params["sampleRate"] = serde_json::json!(d.sample_rate);
             params["mix"] = serde_json::json!(d.mix);

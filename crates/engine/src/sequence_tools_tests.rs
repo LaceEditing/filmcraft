@@ -510,3 +510,55 @@ fn paste_into_another_frame_size_keeps_the_position_in_the_frame() {
     let filmcraft_project::ParamValue::Vec2(v) = pos else { panic!("{pos:?}") };
     assert!((v.x - f64::from(w) / 8.0).abs() < 1e-6 && (v.y - f64::from(h) / 8.0).abs() < 1e-6, "{v:?}");
 }
+
+fn motion_of(s: &Session, clip: filmcraft_project::ClipId) -> (filmcraft_geom::Vec2, f64, filmcraft_geom::Vec2) {
+    let q = s.active_sequence().unwrap();
+    let (_, it) = q.find_item(clip).unwrap();
+    let m = it.effect("motion").unwrap();
+    (m.vec2_at("position", Tick(0)), m.f64_at("scale", Tick(0)), m.vec2_at("anchor", Tick(0)))
+}
+
+/// A new frame size keeps clips where they are in the frame, as Premiere does (it saves Position
+/// relative to the frame): a centred clip of a 1440p sequence is still centred at 4K, with its
+/// keyframes, at the same Scale. "Scale clips" also grows the Scale with the frame. Before,
+/// Position stayed in pixels, so the picture sat in the top-left of the 4K frame (and was saved
+/// so into the Premiere project). A sequence nested elsewhere keeps its anchor point in the same
+/// place in it.
+#[test]
+fn a_new_frame_size_keeps_clips_in_place() {
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name": "Edit", "width": 2560, "height": 1440, "fps": 30.0})).unwrap();
+    let seq = s.state.active_sequence.unwrap();
+    let item = s.execute("file.newBarsAndTone", json!({"seconds": 10.0, "width": 2560, "height": 1440})).unwrap()["item"].as_u64().unwrap();
+    let clips = place(&mut s, item, "V1", 0, 0, 60);
+    let c = filmcraft_project::ClipId(clips[0]);
+    // a second clip, off centre and animated
+    let clips2 = place(&mut s, item, "V2", 0, 0, 60);
+    let c2 = filmcraft_project::ClipId(clips2[0]);
+    s.execute("effects.setParam", json!({"clip": c2.0, "effect": "motion", "param": "position", "value": [640.0, 360.0]})).unwrap();
+    s.execute("effects.toggleAnimation", json!({"clip": c2.0, "effect": "motion", "param": "position"})).unwrap();
+    let (p0, sc0, _) = motion_of(&s, c);
+    assert_eq!((p0.x, p0.y, sc0), (1280.0, 720.0, 100.0));
+    // nested in another sequence
+    s.execute("file.newSequence", json!({"name": "Parent", "width": 2560, "height": 1440, "fps": 30.0})).unwrap();
+    let parent = s.state.active_sequence.unwrap();
+    let nested = place(&mut s, seq.0, "V1", 0, 0, 60);
+    let nc = filmcraft_project::ClipId(nested[0]);
+    let a0 = motion_of(&s, nc).2;
+    s.state.active_sequence = Some(seq);
+    s.execute("sequence.settings", json!({"width": 3840, "height": 2160})).unwrap();
+    let (p1, sc1, _) = motion_of(&s, c);
+    assert_eq!((p1.x, p1.y), (1920.0, 1080.0), "still centred");
+    assert_eq!(sc1, 100.0, "the same size (Premiere's Sequence Settings)");
+    let (q1, ..) = motion_of(&s, c2);
+    assert_eq!((q1.x, q1.y), (960.0, 540.0), "a quarter of the way in, as before");
+    s.state.active_sequence = Some(parent);
+    let a1 = motion_of(&s, nc).2;
+    assert_eq!((a1.x, a1.y), (a0.x * 1.5, a0.y * 1.5), "the nest's anchor follows its frame");
+    // scaling the clips with the frame: back to 1440p, at two thirds of the scale
+    s.state.active_sequence = Some(seq);
+    s.execute("sequence.settings", json!({"width": 2560, "height": 1440, "scaleClips": true})).unwrap();
+    let (p2, sc2, _) = motion_of(&s, c);
+    assert_eq!((p2.x, p2.y), (1280.0, 720.0));
+    assert!((sc2 - 100.0 * 2560.0 / 3840.0).abs() < 1e-9, "{sc2}");
+}

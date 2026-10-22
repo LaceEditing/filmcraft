@@ -1658,10 +1658,11 @@ fn build() -> Vec<CommandSpec> {
             "Sequence Settings…",
             ["Sequence"],
             None,
-            r#"{"width":u32?,"height":u32?,"fps":f64?,"name":str?,"sampleRate":u32?,"mix":"Stereo|Mono|5.1|Adaptive"?}"#,
+            r#"{"width":u32?,"height":u32?,"fps":f64?,"name":str?,"sampleRate":u32?,"mix":"Stereo|Mono|5.1|Adaptive"?,"scaleClips":bool=false}"#,
             has_seq,
             |s, p| {
                 let id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+                let scale_clips = p.get("scaleClips").and_then(Value::as_bool).unwrap_or(false);
                 let fps = fps_p(p, "sequence.settings")?;
                 let mix = match str_p(p, "mix") {
                     Some(m) => Some(
@@ -1675,12 +1676,18 @@ fn build() -> Vec<CommandSpec> {
                         pr.item_mut(id).ok_or(EngineError::NoSequence)?.name = n.to_string();
                     }
                     let q = pr.sequence_mut(id).ok_or(EngineError::NoSequence)?;
-                    if let Some(w) = u64_p(&p, "width") {
+                    let old = (q.settings.width, q.settings.height);
+                    if let Some(w) = u64_p(&p, "width").filter(|w| (1..=32_768).contains(w)) {
                         q.settings.width = w as u32;
                     }
-                    if let Some(h) = u64_p(&p, "height") {
+                    if let Some(h) = u64_p(&p, "height").filter(|h| (1..=32_768).contains(h)) {
                         q.settings.height = h as u32;
                     }
+                    let new = (q.settings.width, q.settings.height);
+                    if new != old {
+                        crate::sequence_tools::reframe(pr, id, old, new, scale_clips);
+                    }
+                    let q = pr.sequence_mut(id).ok_or(EngineError::NoSequence)?;
                     if let Some(f) = fps {
                         q.settings.frame_rate = f;
                     }

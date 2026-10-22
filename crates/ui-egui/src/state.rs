@@ -755,6 +755,10 @@ pub struct SequenceSettingsDraft {
     pub sample_rate: u32,
     /// "Stereo" | "Mono" | "5.1" | "Adaptive"
     pub mix: String,
+    /// The frame size when the dialog opened (to tell a change of it).
+    pub was: (u32, u32),
+    /// With a new frame size: scale the clips with it (else they keep their size, as in Premiere).
+    pub scale_clips: bool,
 }
 
 /// The Add Tracks dialog (Sequence ▸ Add Tracks…): for video, audio and audio submix tracks, how

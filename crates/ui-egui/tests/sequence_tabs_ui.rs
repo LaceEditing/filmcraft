@@ -194,6 +194,9 @@ fn sequence_settings_dialog_edits_the_active_sequence() {
     d.app().ui.sequence_settings.height = 720;
     d.app().ui.sequence_settings.fps = 25.0;
     d.app().ui.sequence_settings.name = "Renamed".into();
+    // (a new frame size adds the Scale clips row, which moves OK down)
+    d.frames(2);
+    assert!(d.has("sequenceSettings.scaleClips"), "offered for a new frame size");
     d.click("sequenceSettings.ok");
     assert!(d.app().dialog.is_none(), "closed");
     let app = d.app();
