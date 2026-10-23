@@ -38,8 +38,9 @@ fn target_v1(s: &mut Session) {
 
 #[test]
 fn shortcut_tables_have_no_key_used_twice_in_one_scope() {
-    let tables: [(&str, Vec<presets::Entry>); 4] = [
+    let tables: [(&str, Vec<presets::Entry>); 5] = [
         ("Premiere", presets::premiere()),
+        ("Premiere (Windows)", presets::premiere_on(false)),
         ("FilmCraft panels", presets::FILMCRAFT_PANEL.iter().chain(presets::PREMIERE_PANEL).copied().collect()),
         ("Final Cut", presets::FINAL_CUT.to_vec()),
         ("Avid", presets::AVID.to_vec()),

@@ -654,13 +654,14 @@ impl Shortcuts {
         self.audit_for(Platform::current())
     }
 
-    /// [`Self::audit`] for platform `p`. The Premiere table is Premiere's macOS keyboard: off macOS
-    /// the Control and Command keys are the same key, so an entry whose key would collide there
-    /// with one already taken (`⌃T` vs `⌘T`) is left out, and the command keeps no default key.
+    /// [`Self::audit`] for platform `p`: Premiere's macOS keyboard, or off macOS its Windows one
+    /// ([`presets::PREMIERE_WINDOWS`]). Off macOS the Control and Command keys are the same key, so
+    /// an entry whose key would collide there with one already taken (`⌃9` vs `⌘9`) is left out,
+    /// and the command keeps no default key.
     pub(crate) fn audit_for(&self, platform: Platform) -> Vec<Binding> {
         let base = self.base_defaults();
         let mut added: Vec<Binding> = Vec::new();
-        for (c, k, p) in presets::PREMIERE {
+        for (c, k, p) in presets::on_platform(presets::PREMIERE, platform.is_mac()) {
             if !self.known(c) || base.iter().any(|b| b.command == *c) {
                 continue;
             }
@@ -684,8 +685,10 @@ impl Shortcuts {
         let mut b = self.base_defaults();
         b.extend(self.audit_for(p));
         let table: Vec<Entry> = match name {
+            // FilmCraft Default's keys for these commands are Premiere's macOS ones
+            DEFAULT_PRESET if !p.is_mac() => presets::PREMIERE_WINDOWS.to_vec(),
             DEFAULT_PRESET => Vec::new(),
-            PREMIERE_PRESET => presets::premiere(),
+            PREMIERE_PRESET => presets::premiere_on(p.is_mac()),
             FCP_PRESET => presets::FINAL_CUT.to_vec(),
             AVID_PRESET => presets::AVID.to_vec(),
             _ => return None,

@@ -118,8 +118,9 @@ fn new_keys_work_in_the_app() {
     d.key("D");
     assert!(d.app().session.state.selection.iter().any(|c| c.0 == clip), "D selects the clip under the playhead");
 
-    // Cmd+Right (Timeline panel): nudge one frame right; undoable
-    d.key("Cmd+Right");
+    // Nudge Clip Selection Right (Timeline panel), one frame; undoable. Premiere's key: Cmd+Right
+    // on macOS, Alt+Right on Windows
+    d.key(if cfg!(target_os = "macos") { "Cmd+Right" } else { "Alt+Right" });
     let rate = d.app().session.sequence_rate();
     let now = d.exec("sequence.inspect", json!({}))["video"][0]["items"]
         .as_array()
@@ -203,22 +204,27 @@ fn ctrl_chords_fire_shortcuts_off_macos() {
     d.focus("Timeline");
     d.key("D");
     assert!(d.app().session.state.selection.iter().any(|c| c.0 == clip));
-    // Ctrl+Right nudges one frame right, like Cmd+Right; Ctrl+Z undoes it
+    // Alt+Right (Premiere's Windows nudge) moves the clip a frame; Ctrl+Z undoes it, like Cmd+Z
     let rate = d.app().session.sequence_rate();
-    d.key("Ctrl+Right");
-    assert_eq!(start_of(&mut d), start + rate.tick_of(1).0, "Ctrl+Right nudges");
+    d.key("Alt+Right");
+    assert_eq!(start_of(&mut d), start + rate.tick_of(1).0, "Alt+Right nudges");
     d.key("Ctrl+Z");
     assert_eq!(start_of(&mut d), start, "Ctrl+Z undoes");
     // the same chord spelt with the modifier flag
-    d.ok("ui.key", json!({"key": "Right", "ctrl": true}));
-    d.frames(3);
-    assert_eq!(start_of(&mut d), start + rate.tick_of(1).0, "`ctrl: true` nudges");
+    d.key("Alt+Right");
     d.ok("ui.key", json!({"key": "Z", "ctrl": true}));
     d.frames(3);
     assert_eq!(start_of(&mut d), start, "`ctrl: true` undoes");
     // and the bare key still does not
+    d.key("Alt+Right");
     d.key("Z");
-    assert_eq!(start_of(&mut d), start);
+    assert_eq!(start_of(&mut d), start + rate.tick_of(1).0);
+    // Ctrl+0 toggles all video targets, like Cmd+0
+    let n0 = d.app().session.targeting().targeted.len();
+    d.key("Ctrl+0");
+    assert!(d.app().session.targeting().targeted.len() < n0, "Ctrl+0 toggles the video targets");
+    d.key("Ctrl+0");
+    assert_eq!(d.app().session.targeting().targeted.len(), n0);
 }
 
 #[test]

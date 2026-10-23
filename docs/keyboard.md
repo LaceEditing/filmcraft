@@ -1,9 +1,14 @@
 # Keyboard parity with Premiere Pro
 
 FilmCraft's **Premiere Pro Compatible** shortcut preset (Edit ▸ Keyboard Shortcuts…) follows
-Premiere's default keyboard (macOS). The table lives in `crates/engine/src/shortcut_presets.rs`:
-`PREMIERE` (application-wide keys and a few panel keys) and `PREMIERE_PANEL` (panel-scoped keys
-that FilmCraft Default uses as well). `presets::premiere()` is the whole preset.
+Premiere's default keyboard: the macOS one on macOS, the Windows one elsewhere. The table lives in
+`crates/engine/src/shortcut_presets.rs`: `PREMIERE` (application-wide keys and a few panel keys)
+and `PREMIERE_PANEL` (panel-scoped keys that FilmCraft Default uses as well) are the macOS
+keyboard, and `PREMIERE_WINDOWS` lists the commands whose Windows keys differ (Trim on
+Ctrl+arrows and Nudge on Alt+arrows, Enable on Shift+E and Export Frame on Ctrl+Shift+E, Trim
+Previous/Next Edit to Playhead on Ctrl+Alt+Q/W, Toggle Trim Type, Play In to Out, the range
+markers and poster frames); FilmCraft Default takes those Windows keys too. `presets::premiere_on(mac)`
+is the whole preset; the keys listed below are the macOS ones.
 
 Every entry names a FilmCraft command id. Engine commands run through `Session::execute`; UI
 commands (frames, panels, monitor zoom, Project and Text panel navigation) run through

@@ -255,6 +255,50 @@ fn compat_presets_map_other_editors() {
     assert_eq!(s.shortcuts.primary("source.insert").as_deref(), Some(","));
 }
 
+/// The Premiere preset (and FilmCraft Default) off macOS is Premiere's Windows keyboard: trimming
+/// on Ctrl+arrows and nudging clips on Alt+arrows, Enable on Shift+E and Export Frame on
+/// Ctrl+Shift+E, and the Mac Control-key commands on keys of their own. macOS keeps the Mac
+/// keyboard.
+#[test]
+fn premiere_preset_follows_premieres_windows_keyboard() {
+    use crate::shortcuts::PREMIERE_PRESET;
+    let mut s = Session::default();
+    with_ui_commands(&mut s);
+    let has = |b: &[Binding], cmd: &str, keys: &str, panel: Option<&str>| b.iter().any(|x| x.command == cmd && x.keys == keys && x.panel.as_deref() == panel);
+    let win = s.shortcuts.builtin_for(PREMIERE_PRESET, Platform::Windows).unwrap();
+    for (cmd, keys, panel) in [
+        ("trim.backward", "Cmd+Left", None),
+        ("trim.forwardMany", "Cmd+Shift+Right", None),
+        ("timeline.nudgeLeft", "Alt+Left", Some("Timeline")),
+        ("timeline.nudgeRight5", "Alt+Shift+Right", Some("Timeline")),
+        ("trim.previous", "Cmd+Alt+Q", None),
+        ("trim.toggleType", "Cmd+Shift+T", None),
+        ("markers.addRange", "Cmd+Alt+Shift+N", None),
+        ("markers.addRangeInOut", "Alt+Shift+N", None),
+        ("clip.setPosterFrame", "Shift+P", None),
+        ("clip.enable", "Shift+E", None),
+        ("file.exportFrame", "Cmd+Shift+E", None),
+    ] {
+        assert!(has(&win, cmd, keys, panel), "{cmd} {keys} on Windows");
+    }
+    assert!(!win.iter().any(|b| b.command == "trim.backward" && b.keys == "Alt+Left"), "the Mac trim key");
+    let mut sc = s.shortcuts.clone();
+    sc.bindings = win;
+    assert!(sc.conflicts(Platform::Windows).is_empty(), "{:?}", sc.conflicts(Platform::Windows));
+    let mac = s.shortcuts.builtin_for(PREMIERE_PRESET, Platform::Mac).unwrap();
+    assert!(has(&mac, "trim.backward", "Alt+Left", None) && has(&mac, "timeline.nudgeLeft", "Cmd+Left", Some("Timeline")));
+    assert!(has(&mac, "file.exportFrame", "Shift+E", None) && has(&mac, "clip.enable", "Cmd+Shift+E", None));
+    // FilmCraft Default, whose keys for these are Premiere's macOS ones, follows Windows too
+    let default = s.shortcuts.builtin_for(crate::shortcuts::DEFAULT_PRESET, Platform::Windows).unwrap();
+    for (cmd, keys, panel) in
+        [("trim.backward", "Cmd+Left", None), ("timeline.nudgeLeft", "Alt+Left", Some("Timeline")), ("trim.toggleType", "Cmd+Shift+T", None)]
+    {
+        assert!(has(&default, cmd, keys, panel), "FilmCraft Default: {cmd} {keys} on Windows");
+    }
+    let mac_default = s.shortcuts.builtin_for(crate::shortcuts::DEFAULT_PRESET, Platform::Mac).unwrap();
+    assert!(has(&mac_default, "trim.backward", "Alt+Left", None));
+}
+
 #[test]
 fn custom_presets_persist_export_and_import() {
     let dir = temp_dir("presets");

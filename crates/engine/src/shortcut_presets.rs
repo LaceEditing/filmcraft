@@ -360,9 +360,54 @@ pub const PREMIERE_PANEL: &[Entry] = &[
     ("mediaBrowser.openInSource", "Shift+O", "Media Browser"),
 ];
 
-/// The whole "Premiere Pro Compatible" table: [`PREMIERE`] plus [`PREMIERE_PANEL`].
+/// Where Premiere Pro's Windows keyboard differs from its macOS one ([`PREMIERE`] and
+/// [`PREMIERE_PANEL`]): off macOS each command listed takes exactly these keys (Premiere 26.5's
+/// Windows defaults, Round 6), in the Premiere preset and in FilmCraft Default (whose keys for
+/// them are the macOS ones). Trimming and nudging swap modifiers, Enable and Export Frame swap
+/// keys, and the commands on the Mac Control key get keys of their own.
+pub const PREMIERE_WINDOWS: &[Entry] = &[
+    ("trim.backward", "Cmd+Left", ""),
+    ("trim.backwardMany", "Cmd+Shift+Left", ""),
+    ("trim.forward", "Cmd+Right", ""),
+    ("trim.forwardMany", "Cmd+Shift+Right", ""),
+    ("timeline.nudgeLeft", "Alt+Left", "Timeline"),
+    ("timeline.nudgeRight", "Alt+Right", "Timeline"),
+    ("timeline.nudgeLeft5", "Alt+Shift+Left", "Timeline"),
+    ("timeline.nudgeRight5", "Alt+Shift+Right", "Timeline"),
+    ("trim.previous", "Cmd+Alt+Q", ""),
+    ("trim.next", "Cmd+Alt+W", ""),
+    ("trim.toggleType", "Cmd+Shift+T", ""),
+    ("playback.inToOut", "Cmd+Shift+Space", ""),
+    ("markers.addRange", "Cmd+Alt+Shift+N", ""),
+    ("markers.addRangeInOut", "Alt+Shift+N", ""),
+    ("clip.setPosterFrame", "Shift+P", ""),
+    ("clip.clearPosterFrame", "Cmd+Shift+P", ""),
+    ("clip.enable", "Shift+E", ""),
+    ("file.exportFrame", "Cmd+Shift+E", ""),
+];
+
+/// The whole "Premiere Pro Compatible" table: [`PREMIERE`] plus [`PREMIERE_PANEL`] (macOS).
 pub fn premiere() -> Vec<Entry> {
-    PREMIERE.iter().chain(PREMIERE_PANEL).copied().collect()
+    premiere_on(true)
+}
+
+/// [`premiere`] as Premiere has it on macOS (`mac`) or on Windows (and Linux, whose keyboards
+/// are laid out the same way).
+pub fn premiere_on(mac: bool) -> Vec<Entry> {
+    let mut out = on_platform(PREMIERE, mac);
+    out.extend(on_platform(PREMIERE_PANEL, mac));
+    out
+}
+
+/// `table` with [`PREMIERE_WINDOWS`]'s keys for the commands it lists, off macOS.
+pub fn on_platform(table: &[Entry], mac: bool) -> Vec<Entry> {
+    if mac {
+        return table.to_vec();
+    }
+    let moved = |id: &str| PREMIERE_WINDOWS.iter().any(|e| e.0 == id);
+    let mut out: Vec<Entry> = table.iter().filter(|e| !moved(e.0)).copied().collect();
+    out.extend(PREMIERE_WINDOWS.iter().filter(|w| table.iter().any(|e| e.0 == w.0)));
+    out
 }
 
 /// Final Cut Pro's default keys for the equivalent FilmCraft commands.

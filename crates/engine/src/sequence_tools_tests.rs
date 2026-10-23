@@ -53,7 +53,9 @@ fn commands_are_registered_in_premiere_menu_order() {
     assert_eq!(s.shortcuts.primary("sequence.reverseMatchFrame").as_deref(), Some("Shift+R"));
     assert_eq!(s.shortcuts.primary("sequence.goToNextGap").as_deref(), Some("Shift+;"));
     assert_eq!(s.shortcuts.primary("sequence.makeSubsequence").as_deref(), Some("Shift+U"));
-    assert_eq!(s.shortcuts.primary("markers.addRangeInOut").as_deref(), Some("Ctrl+M"));
+    // Premiere's key: ⌃M on macOS, Alt+Shift+N on Windows
+    let range_in_out = if cfg!(target_os = "macos") { "Ctrl+M" } else { "Alt+Shift+N" };
+    assert_eq!(s.shortcuts.primary("markers.addRangeInOut").as_deref(), Some(range_in_out));
     // every id is unique
     let mut sorted = all.clone();
     sorted.sort_unstable();
