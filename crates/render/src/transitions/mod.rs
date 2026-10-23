@@ -71,12 +71,67 @@ pub fn apply_scaled(e: &EffectInstance, a: &Image, b: &Image, p: f32, scale: f32
         .unwrap_or_else(|| paint(t.w, t.h, |x, y| mix(t.sa(x, y), t.sb(x, y), p)))
 }
 
-/// Audio crossfade gains (out, in) for progress p.
+/// Premiere's audio fade curves, as an amplitude gain of the side fading out; the side fading in
+/// is its mirror image in time. Fitted to Premiere 26.5 within 0.1 dB in the user's Round 5 tests.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FadeCurve {
+    /// A raised cosine bent by `s` (−100 … 100): u = 1 − (1 − t)^(10^(−s/100)), g = (1 + cos πu)/2.
+    /// A Custom Fade's default; Constant Power is Cosine 19.
+    Cosine(f32),
+    /// A line bent into an exponential by `v` (−100 … 100): a = −v/10,
+    /// g = (e^(−at) − e^(−a)) / (1 − e^(−a)). Constant Gain is Linear 0, Exponential Fade
+    /// Linear −35.
+    Linear(f32),
+}
+
+impl FadeCurve {
+    /// The curve of an audio transition: its kind, and a Custom Fade's Fade Shape and Value.
+    pub fn of(e: &EffectInstance) -> Self {
+        match e.effect.as_str() {
+            "constant_gain" => Self::Linear(0.0),
+            "exponential_fade" => Self::Linear(-35.0),
+            filmcraft_project::effect::CUSTOM_FADE => {
+                let v = (e.f64_at("shape", Tick::ZERO) as f32).clamp(-100.0, 100.0);
+                let linear = e.param("curve").and_then(|p| p.value.as_f64()) == Some(f64::from(filmcraft_project::effect::FADE_LINEAR));
+                if linear { Self::Linear(v) } else { Self::Cosine(v) }
+            }
+            _ => Self::Cosine(19.0),
+        }
+    }
+
+    /// The fading-out side's gain at `t` (0 → 1 through the fade).
+    pub fn fade_out(self, t: f32) -> f32 {
+        let t = if t.is_finite() { f64::from(t.clamp(0.0, 1.0)) } else { 0.0 };
+        let g = match self {
+            Self::Cosine(s) => {
+                let p = 10f64.powf(-f64::from(s.clamp(-100.0, 100.0)) / 100.0);
+                let u = 1.0 - (1.0 - t).powf(p);
+                (1.0 + (std::f64::consts::PI * u).cos()) / 2.0
+            }
+            Self::Linear(v) => {
+                let a = -f64::from(v.clamp(-100.0, 100.0)) / 10.0;
+                if a.abs() < 1e-6 { 1.0 - t } else { ((-a * t).exp() - (-a).exp()) / (1.0 - (-a).exp()) }
+            }
+        };
+        g.clamp(0.0, 1.0) as f32
+    }
+}
+
+/// Audio crossfade gains (out, in) for progress `p` of the transition `e`.
+pub fn audio_gains_of(e: &EffectInstance, p: f32) -> (f32, f32) {
+    let curve = FadeCurve::of(e);
+    (curve.fade_out(p), curve.fade_out(1.0 - p))
+}
+
+/// Audio crossfade gains (out, in) for progress `p` of an audio transition of kind `kind` with its
+/// default settings.
 pub fn audio_gains(kind: &str, p: f32) -> (f32, f32) {
-    match kind {
-        "constant_gain" => (1.0 - p, p),
-        "exponential_fade" => ((1.0 - p).powi(3), 1.0 - (1.0 - p).powi(3)),
-        _ => ((p * std::f32::consts::FRAC_PI_2).cos(), (p * std::f32::consts::FRAC_PI_2).sin()),
+    match filmcraft_project::vtransition::find_transition(kind, filmcraft_project::EffectKind::AudioTransition) {
+        Some(def) => audio_gains_of(&def.instance(), p),
+        None => {
+            let curve = FadeCurve::Cosine(19.0);
+            (curve.fade_out(p), curve.fade_out(1.0 - p))
+        }
     }
 }
 

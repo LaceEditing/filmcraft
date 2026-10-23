@@ -202,6 +202,23 @@ fn clip_volume_and_track_automation_both_apply() {
     assert!(close(l[0], 0.5 * 10f32.powf(-12.0 / 20.0), 1e-6), "{}", l[0]);
 }
 
+/// A clip's Volume keyframes ramp in amplitude, as Premiere's do (measured in the user's Round 5
+/// tests): half way down 0 → −20 dB is −5.2 dB, not −10 dB, and a fade to −∞ (imported as
+/// −200 dB) is a straight line to silence instead of going quiet half way.
+#[test]
+fn clip_volume_keyframes_ramp_in_amplitude() {
+    for (to, half) in [(-20.0, (1.0 + 0.1) / 2.0), (-200.0, 0.5)] {
+        let mut r = Rig::new(&[dc]);
+        {
+            let lvl = r.track(0).items[0].effect_mut("volume").unwrap().param_mut("level").unwrap();
+            lvl.keyframes = vec![Keyframe::new(Tick::ZERO, ParamValue::Float(0.0)), Keyframe::new(Tick(TICKS_PER_SECOND), ParamValue::Float(to))];
+        }
+        // the block at 0.5 s (24 000 = 375 × 64 samples)
+        let [l, _] = r.mix(24_000, 64);
+        assert!(close(l[0], 0.5 * half, 1e-4), "to {to} dB: {} vs {}", l[0], 0.5 * half);
+    }
+}
+
 fn level(r: &Rig) -> f32 {
     r.mix(2000, 64)[0][10]
 }
@@ -393,18 +410,53 @@ fn audio_transition_curves() {
     use crate::transitions::audio_gains;
     for i in 0..=20 {
         let p = i as f32 / 20.0;
-        let (a, b) = audio_gains("constant_power", p);
-        assert!(close(a * a + b * b, 1.0, 1e-5), "constant power keeps power at {p}");
         let (a, b) = audio_gains("constant_gain", p);
         assert!(close(a + b, 1.0, 1e-6), "constant gain keeps amplitude at {p}");
-        let (a, b) = audio_gains("exponential_fade", p);
-        assert!((0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&b));
+        for k in ["constant_power", "exponential_fade"] {
+            let (a, b) = audio_gains(k, p);
+            assert!((0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&b), "{k} at {p}");
+            // the fade in is the fade out's mirror image
+            assert!(close(audio_gains(k, 1.0 - p).1, a, 1e-6), "{k} at {p}");
+        }
     }
     for k in ["constant_power", "constant_gain", "exponential_fade"] {
         assert_eq!(audio_gains(k, 0.0), (1.0, 0.0), "{k} starts on A");
         let (a, b) = audio_gains(k, 1.0);
         assert!(a.abs() < 1e-6 && close(b, 1.0, 1e-6), "{k} ends on B");
     }
+    // Premiere 26.5 at the middle of a crossfade, each side (the user's Round 5 measurements):
+    // Constant Power −2.96 dB (so not quite equal power), Constant Gain −6.02, Exponential −16.6
+    let db = |g: f32| 20.0 * g.log10();
+    for (k, want) in [("constant_power", -2.96), ("constant_gain", -6.02), ("exponential_fade", -16.6)] {
+        let (a, b) = audio_gains(k, 0.5);
+        assert!((db(a) - want).abs() < 0.1 && (db(b) - want).abs() < 0.1, "{k}: {} {}", db(a), db(b));
+    }
+}
+
+/// A Custom Fade (a clip's fade handle) bends with its Fade Value in Premiere's two Fade Shapes,
+/// Cosine (a fresh fade's) and Linear; measured in Premiere 26.5 (the user's Round 5 B1 kit).
+#[test]
+fn custom_fade_shapes_follow_premiere() {
+    use crate::transitions::FadeCurve;
+    let db = |g: f32| 20.0 * g.log10();
+    let cases = [
+        (FadeCurve::Cosine(0.0), 0.5, -6.02),
+        (FadeCurve::Cosine(-100.0), 0.25, -42.7),
+        (FadeCurve::Cosine(100.0), 0.95, -1.5),
+        (FadeCurve::Linear(-100.0), 0.5, -43.5),
+        (FadeCurve::Linear(100.0), 0.5, -0.06),
+        (FadeCurve::Linear(100.0), 0.9, -4.0),
+    ];
+    for (curve, t, want) in cases {
+        let got = db(curve.fade_out(t));
+        assert!((got - want).abs() < 0.6, "{curve:?} at {t}: {got} dB, Premiere {want}");
+    }
+    // the shape is read from the fade, Linear as Premiere's Fade Shape list sets it
+    let mut e = filmcraft_project::find_effect(filmcraft_project::effect::CUSTOM_FADE).unwrap().instance();
+    assert_eq!(FadeCurve::of(&e), FadeCurve::Cosine(0.0), "a fresh fade");
+    e.params.insert("shape".into(), filmcraft_project::Param::new(ParamValue::Float(-50.0)));
+    e.params.insert("curve".into(), filmcraft_project::Param::new(ParamValue::Choice(filmcraft_project::effect::FADE_LINEAR)));
+    assert_eq!(FadeCurve::of(&e), FadeCurve::Linear(-50.0));
 }
 
 /// A transition centred on a cut mixes both clips across its whole length: the outgoing clip plays

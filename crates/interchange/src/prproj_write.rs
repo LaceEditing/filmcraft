@@ -2878,7 +2878,8 @@ impl<'a, 'i> Writer<'a, 'i> {
         let id = self.alloc_id();
         let out = tr.from.is_some_and(|f| written.contains_key(&f));
         let inc = tr.to.is_some_and(|t| written.contains_key(&t));
-        let shape = format!("\n\t\t<FadeShapeValue>{}</FadeShapeValue>", fade_shape_of(tr));
+        let kind = if fade_is_linear(tr) { "\n\t\t<FadeShapeType>0</FadeShapeType>" } else { "" };
+        let shape = format!("{kind}\n\t\t<FadeShapeValue>{}</FadeShapeValue>", fade_shape_of(tr));
         self.created.push(format!(
             "<AudioTransitionTrackItem ObjectID=\"{id}\" ClassID=\"23f687b6-9c5a-42f4-bea1-e7b3e28e7082\" Version=\"4\">\n\t\t<TransitionTrackItem Version=\"3\">\n\t\t\t<TrackItem Version=\"4\">\n\t\t\t\t<Start>{}</Start>\n\t\t\t\t<End>{}</End>\n\t\t\t</TrackItem>\n\t\t\t<Alignment>{}</Alignment>\n\t\t\t<DisplayName>Custom Fade</DisplayName>\n\t\t\t<MatchName>Custom Fade</MatchName>\n\t\t\t<HasOutgoingClip>{out}</HasOutgoingClip>\n\t\t\t<HasIncomingClip>{inc}</HasIncomingClip>\n\t\t</TransitionTrackItem>\n\t\t<AudioChannelLayout>{}</AudioChannelLayout>{shape}\n\t</AudioTransitionTrackItem>\n\t",
             tr.start.0,
@@ -2890,14 +2891,32 @@ impl<'a, 'i> Writer<'a, 'i> {
         id
     }
 
-    /// A Custom Fade's shape (`FadeShapeValue`, after the transition's other children) where
-    /// FilmCraft's differs from the transition's (none saved reads as 0).
+    /// A Custom Fade's shape where FilmCraft's differs from the transition's: `FadeShapeValue`
+    /// (none saved reads as 0) and, for the Linear Fade Shape, `FadeShapeType` 0 before it (none
+    /// is Cosine), after the transition's other children.
     fn fade_shape(&mut self, inst: usize, node: Node<'a, 'i>, tr: &filmcraft_project::Transition) {
         if tr.effect.effect != filmcraft_project::effect::CUSTOM_FADE {
             return;
         }
         let want = fade_shape_of(tr);
-        match child(node, "FadeShapeValue") {
+        let linear = fade_is_linear(tr);
+        let kind = child(node, "FadeShapeType");
+        let value = child(node, "FadeShapeValue");
+        match kind {
+            Some(k) if !linear => self.remove(inst, k),
+            Some(k) if k.text().map(str::trim) != Some("0") => self.set_text(inst, k, "0"),
+            None if linear => {
+                // the type goes before the value, as Premiere writes them: both in one edit
+                let pair = format!("<FadeShapeType>0</FadeShapeType><FadeShapeValue>{want}</FadeShapeValue>");
+                match value {
+                    Some(v) => self.edit(inst, v.range(), pair),
+                    None => self.insert(inst, node, &pair),
+                }
+                return;
+            }
+            _ => {}
+        }
+        match value {
             Some(h) if h.text().and_then(|t| t.trim().parse::<i32>().ok()) != Some(want) => self.set_text(inst, h, &want.to_string()),
             None if want != 0 => self.insert(inst, node, &format!("<FadeShapeValue>{want}</FadeShapeValue>")),
             _ => {}
@@ -3084,6 +3103,11 @@ fn alignment(tr: &filmcraft_project::Transition) -> i64 {
         (Some(_), None, _) | (_, _, filmcraft_project::TransitionAlign::EndAtCut) => tr.duration.0,
         _ => tr.duration.0 / 2,
     }
+}
+
+/// Whether a Custom Fade's Fade Shape is Linear (Cosine otherwise).
+fn fade_is_linear(tr: &filmcraft_project::Transition) -> bool {
+    tr.effect.params.get("curve").and_then(|p| p.value.as_f64()) == Some(f64::from(filmcraft_project::effect::FADE_LINEAR))
 }
 
 /// A Custom Fade's `FadeShapeValue`: the curve's bend, −100…100.

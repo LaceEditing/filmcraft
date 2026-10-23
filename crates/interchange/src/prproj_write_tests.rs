@@ -642,6 +642,58 @@ fn motion_crop_round_trips() {
     assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
 }
 
+/// A Custom Fade's Fade Shape (Effect Controls: Linear or Cosine) is saved as `FadeShapeType` 0
+/// for Linear and nothing for Cosine; it comes in, stays on an unchanged save, and goes back out
+/// before the `FadeShapeValue` as Premiere writes it.
+#[test]
+fn a_clip_fades_linear_or_cosine_shape_round_trips() {
+    let s = S;
+    let frame = s / 30;
+    let fade = format!(
+        "<AudioTransitionTrackItem ObjectID=\"910\" ClassID=\"23f687b6-9c5a-42f4-bea1-e7b3e28e7082\" Version=\"4\"><TransitionTrackItem Version=\"3\"><TrackItem Version=\"4\"><Start>{}</Start><End>{}</End></TrackItem><Alignment>{}</Alignment><DisplayName>Custom Fade</DisplayName><MatchName>Custom Fade</MatchName><HasOutgoingClip>true</HasOutgoingClip><HasIncomingClip>false</HasIncomingClip></TransitionTrackItem><AudioChannelLayout>[{{\"channellabel\":100}},{{\"channellabel\":101}}]</AudioChannelLayout><FadeShapeType>0</FadeShapeType><FadeShapeValue>-27</FadeShapeValue></AudioTransitionTrackItem>\n  ",
+        5 * s - 9 * frame,
+        5 * s + frame,
+        10 * frame
+    );
+    let doc = doc()
+        .replace(
+            r#"<ClipItems><TrackItems><TrackItem Index="0" ObjectRef="70"/></TrackItems></ClipItems>
+  </ClipTrack></AudioClipTrack>"#,
+            r#"<ClipItems><TrackItems><TrackItem Index="0" ObjectRef="70"/></TrackItems></ClipItems>
+    <TransitionItems><TrackItems><TrackItem Index="0" ObjectRef="910"/></TrackItems></TransitionItems>
+  </ClipTrack></AudioClipTrack>"#,
+        )
+        .replace("<AudioClipTrackItem ObjectID=\"70\">", &format!("{fade}<AudioClipTrackItem ObjectID=\"70\">"));
+    let (imp, _) = import(doc.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let curve = |p: &Project| p.sequence(sid).unwrap().audio_tracks[0].transitions[0].effect.params.get("curve").map(|c| c.value.clone());
+    assert_eq!(curve(&p), Some(ParamValue::Choice(filmcraft_project::effect::FADE_LINEAR)), "Linear came in");
+    let (same, report) = export(&p, doc.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(same).unwrap(), doc, "unchanged ({report})");
+
+    // to Cosine: the type goes, the value stays
+    let set = |p: &mut Project, c: u32| {
+        p.sequence_mut(sid).unwrap().audio_tracks[0].transitions[0].effect.params.insert("curve".into(), Param::new(ParamValue::Choice(c)));
+    };
+    set(&mut p, filmcraft_project::effect::FADE_COSINE);
+    let (out, _) = export(&p, doc.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(!text.contains("FadeShapeType") && text.contains("<FadeShapeValue>-27</FadeShapeValue>"), "{text}");
+    let cosine = read(&out);
+    let t = &cosine.sequences().next().and_then(|i| i.as_sequence()).unwrap().audio_tracks[0].transitions[0];
+    assert!(t.effect.params.get("curve").is_none_or(|c| c.value == ParamValue::Choice(filmcraft_project::effect::FADE_COSINE)));
+
+    // and back to Linear on that Cosine file: the type before the value
+    let cosine_doc = text;
+    let (imp, _) = import(cosine_doc.as_bytes(), None);
+    let mut p = imp.project;
+    set(&mut p, filmcraft_project::effect::FADE_LINEAR);
+    let (out, _) = export(&p, cosine_doc.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(text.contains("<FadeShapeType>0</FadeShapeType><FadeShapeValue>-27</FadeShapeValue>"), "{text}");
+}
+
 /// Premiere's fade handles save a one-sided audio transition, "Custom Fade", with no effect
 /// component and a `FadeShapeValue` (the curve's bend, −100…100); its `Alignment` puts the cut at
 /// the fade's start (fade in) or end (fade out), and the fade can run a frame past its clip. It

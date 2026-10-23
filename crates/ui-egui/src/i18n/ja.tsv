@@ -3642,6 +3642,8 @@
 	Origin at Top Left	原点を左上に
 	Custom Fade	カスタムフェード
 	Fade Shape	フェードの形状
+	Fade Value	フェードの値
+	Cosine	コサイン
 	Steep	急峻なスロープ
 	Detection	検出
 	Peak	ピーク

@@ -812,10 +812,16 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let outgoing = child_text(tt, "HasOutgoingClip").is_none_or(|v| v == "true");
         let incoming = child_text(tt, "HasIncomingClip").is_none_or(|v| v == "true");
         let mut effect = transition_effect(name, kind == TrackKind::Audio, self.report);
-        if effect.effect == filmcraft_project::effect::CUSTOM_FADE
-            && let Some(shape) = child_text(t, "FadeShapeValue").and_then(|v| v.trim().parse::<i32>().ok())
-        {
-            effect.params.insert("shape".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(f64::from(shape.clamp(-100, 100)))));
+        if effect.effect == filmcraft_project::effect::CUSTOM_FADE {
+            if let Some(shape) = child_text(t, "FadeShapeValue").and_then(|v| v.trim().parse::<i32>().ok()) {
+                effect.params.insert("shape".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(f64::from(shape.clamp(-100, 100)))));
+            }
+            // Fade Shape: Linear is saved as `FadeShapeType` 0, Cosine (a fresh fade's) as none
+            if child_text(t, "FadeShapeType").is_some_and(|v| v.trim() == "0") {
+                effect
+                    .params
+                    .insert("curve".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Choice(filmcraft_project::effect::FADE_LINEAR)));
+            }
         }
         // where Premiere puts the cut (`Alignment` from the start): a clip's fade can run a frame
         // past the clip it belongs to

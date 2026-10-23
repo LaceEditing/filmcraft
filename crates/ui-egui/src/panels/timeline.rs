@@ -560,7 +560,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             filmcraft_edit::Edge::In => (layout.x_of(it.start + len), x0),
                             filmcraft_edit::Edge::Out => (layout.x_of(it.end() - len), x1),
                         };
-                        draw_fade(&p, body, full, edge_x);
+                        // the fade's own curve (a fresh one while its handle is dragged out)
+                        let curve = clip_fade(tr, it.id, edge)
+                            .map(|f| filmcraft_render::transitions::FadeCurve::of(&f.effect))
+                            .unwrap_or(filmcraft_render::transitions::FadeCurve::Cosine(0.0));
+                        draw_fade(&p, body, full, edge_x, curve);
                     }
                 }
                 let hot = app.tl.drag.is_none() && !tr.locked && hover.is_some_and(|h| body.contains(h)) && app.ui.tool == Tool::Selection;
@@ -2070,8 +2074,8 @@ fn fade_handles(
 }
 
 /// A clip fade drawn as Premiere draws one: its gain line across the clip (full at the clip side,
-/// silent at the edge) with the faded part shaded above it.
-fn draw_fade(p: &egui::Painter, body: Rect, x_full: f32, x_edge: f32) {
+/// silent at the edge) in the fade's own curve, with the faded part shaded above it.
+fn draw_fade(p: &egui::Painter, body: Rect, x_full: f32, x_edge: f32, curve: filmcraft_render::transitions::FadeCurve) {
     if (x_full - x_edge).abs() < 1.0 {
         return;
     }
@@ -2079,8 +2083,8 @@ fn draw_fade(p: &egui::Painter, body: Rect, x_full: f32, x_edge: f32) {
     let pts: Vec<Pos2> = (0..=n)
         .map(|i| {
             let f = i as f32 / n as f32;
-            // constant power from full (f = 0) to silent (f = 1)
-            let g = (f * std::f32::consts::FRAC_PI_2).cos();
+            // from full (f = 0) to silent (f = 1)
+            let g = curve.fade_out(f);
             pos2(x_full + (x_edge - x_full) * f, body.max.y - (body.height() - 2.0) * g)
         })
         .collect();

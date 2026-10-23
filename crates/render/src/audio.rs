@@ -134,9 +134,10 @@ pub(crate) fn track_input_at(
         }
         let dur = (tr.end() - tr.start).to_units_floor(sr as i64).max(1) as f32;
         let base = (s0 - tr.start.to_units_floor(sr as i64)) as f32;
+        let curve = transitions::FadeCurve::of(&tr.effect);
         for i in 0..n {
             let p = (base + i as f32) / dur;
-            let (ga, gb) = transitions::audio_gains(&tr.effect.effect, p);
+            let (ga, gb) = (curve.fade_out(p), curve.fade_out(1.0 - p));
             for c in 0..w {
                 tbuf.channels[c][off + i] += a.channels[c][i] * ga + b.channels[c][i] * gb;
             }
@@ -245,6 +246,8 @@ fn mix_item(
         let mt = item.source_time_at(t_tl);
         let level = |auto: f64| live.vol.map(|o| o.at(t_tl, auto)).unwrap_or(auto);
         let v = match vol {
+            // the level's keyframes are interpolated in amplitude, as Premiere does
+            Some(e) if live.vol.is_none() => e.param("level").map_or(1.0, |p| p.scalar_at_mapped(mt, |db| f64::from(db_to_gain(db))) as f32),
             Some(e) => db_to_gain(level(e.f64_at("level", mt))),
             None if live.vol.is_some() => db_to_gain(level(0.0)),
             None => 1.0,

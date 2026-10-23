@@ -306,8 +306,15 @@ impl Param {
     /// Allocation-free [`Param::f64_at`] for scalar parameters (Float / Choice / Bool), for
     /// per-sample evaluation in the audio mixer. Non-scalar values evaluate to 0.
     pub fn scalar_at(&self, t: Tick) -> f64 {
+        self.scalar_at_mapped(t, |v| v)
+    }
+
+    /// [`Param::scalar_at`] with every value mapped through `f` before it is interpolated. A
+    /// Volume level is kept in dB but Premiere interpolates it in amplitude: half way down a
+    /// 0 → −20 dB ramp it is −5.2 dB, not −10 dB, and a fade to −∞ is a straight line to silence.
+    pub fn scalar_at_mapped(&self, t: Tick, f: impl Fn(f64) -> f64) -> f64 {
         let k = &self.keyframes;
-        let s = |v: &ParamValue| v.as_f64().unwrap_or(0.0);
+        let s = |v: &ParamValue| f(v.as_f64().unwrap_or(0.0));
         if k.is_empty() {
             return s(&self.value);
         }
