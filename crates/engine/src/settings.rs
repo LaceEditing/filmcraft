@@ -54,7 +54,7 @@ pub struct GeneralPrefs {
     pub show_mask_tracker_preview: bool,
     /// "Save a project opened from Premiere Pro": `premiereCopy` (Save writes a Premiere Pro
     /// project beside the original; the first Save asks where), `premiereOriginal` (over the
-    /// original, keeping `<file>.before-filmcraft`), or `filmcraft` (a FilmCraft project).
+    /// original), or `filmcraft` (a FilmCraft project).
     pub save_premiere_projects: String,
     /// Most recently opened / saved projects (newest first; not shown in the dialog).
     pub recent_projects: Vec<String>,

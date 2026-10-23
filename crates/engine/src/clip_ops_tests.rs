@@ -875,3 +875,65 @@ fn ultra_key_setting_follows_matte_generation() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(get(&s, "setting"), filmcraft_project::ParamValue::Choice(3));
 }
+
+/// A clip's fade handles (`clip.setFade`): a Custom Fade on an audio clip's edge, a one-sided Cross
+/// Dissolve on a video clip's; dragging again resizes it, 0 removes it, the two fades fit in the
+/// clip together, and an edge joined to the next clip by a transition has no fade of its own.
+#[test]
+fn clip_fades_are_made_resized_and_removed() {
+    let mut s = demo();
+    // clips no transition touches yet
+    let free = |tracks: &[filmcraft_project::Track]| {
+        tracks
+            .iter()
+            .flat_map(|t| t.items.iter().map(move |i| (t, i)))
+            .find(|(t, i)| !t.transitions.iter().any(|x| x.from == Some(i.id) || x.to == Some(i.id)) && i.duration.0 > 3 * TICKS_PER_SECOND)
+            .map(|(_, i)| i.clone())
+            .expect("a clip without transitions")
+    };
+    let (a, v) = {
+        let q = s.active_sequence().unwrap();
+        (free(&q.audio_tracks), free(&q.video_tracks))
+    };
+    let s1 = TICKS_PER_SECOND;
+    let fades = |s: &Session, c: &TrackItem| -> Vec<(String, bool, Tick, Tick)> {
+        let q = s.active_sequence().unwrap();
+        q.all_tracks()
+            .flat_map(|t| t.transitions.iter())
+            .filter(|t| (t.from == Some(c.id) && t.to.is_none()) || (t.to == Some(c.id) && t.from.is_none()))
+            .map(|t| (t.effect.effect.clone(), t.to == Some(c.id), t.start, t.duration))
+            .collect()
+    };
+    s.execute("clip.setFade", json!({"clip": a.id.0, "edge": "out", "duration": s1, "shape": -27})).unwrap();
+    let got = fades(&s, &a);
+    let frame = s.sequence_rate().tick_of(1);
+    assert_eq!((got.len(), got[0].0.as_str(), got[0].1), (1, filmcraft_project::effect::CUSTOM_FADE, false));
+    assert!((got[0].3 - Tick(s1)).abs() <= frame && got[0].2 + got[0].3 == a.end(), "a whole number of frames ending at the clip's end: {got:?}");
+    let q = s.active_sequence().unwrap();
+    let tr = q.audio_tracks[0].transitions.iter().find(|t| t.from == Some(a.id)).unwrap();
+    assert_eq!(tr.effect.params["shape"].value, filmcraft_project::ParamValue::Float(-27.0));
+    // resized; a fade in that would overlap it is held to the room left
+    s.execute("clip.setFade", json!({"clip": a.id.0, "edge": "out", "duration": 2 * s1})).unwrap();
+    s.execute("clip.setFade", json!({"clip": a.id.0, "edge": "in", "duration": a.duration.0})).unwrap();
+    let got = fades(&s, &a);
+    assert_eq!(got.len(), 2);
+    let total: i64 = got.iter().map(|f| f.3.0).sum();
+    assert!(total <= a.duration.0, "{got:?}");
+    // undo takes back one fade step; 0 removes
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(fades(&s, &a).len(), 1);
+    s.execute("clip.setFade", json!({"clip": a.id.0, "edge": "out", "duration": 0})).unwrap();
+    assert!(fades(&s, &a).is_empty());
+    // video: a Cross Dissolve to nothing
+    s.execute("clip.setFade", json!({"clip": v.id.0, "edge": "in", "frames": 12})).unwrap();
+    let got = fades(&s, &v);
+    assert_eq!((got.len(), got[0].0.as_str(), got[0].1, got[0].2), (1, "cross_dissolve", true, v.start));
+    // an edge already joined to its neighbour by a transition
+    s.execute("clip.setFade", json!({"clip": v.id.0, "edge": "in", "duration": 0})).unwrap();
+    if let Ok(r) = s.execute("sequence.applyVideoTransition", json!({"clip": v.id.0, "edge": "out"}))
+        && s.active_sequence().unwrap().video_tracks[0].transitions.iter().any(|t| t.from == Some(v.id) && t.to.is_some())
+    {
+        assert!(r.get("transition").is_some());
+        assert!(s.execute("clip.setFade", json!({"clip": v.id.0, "edge": "out", "frames": 5})).is_err());
+    }
+}

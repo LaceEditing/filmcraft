@@ -45,6 +45,7 @@ pub mod text;
 pub mod timecode;
 pub mod timeline;
 pub mod timeline_automation;
+pub mod timeline_band;
 pub mod timeline_captions;
 pub mod tools;
 pub mod trim_monitor;

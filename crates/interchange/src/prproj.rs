@@ -808,7 +808,15 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let name = child_text(tt, "DisplayName").unwrap_or("Cross Dissolve");
         let outgoing = child_text(tt, "HasOutgoingClip").is_none_or(|v| v == "true");
         let incoming = child_text(tt, "HasIncomingClip").is_none_or(|v| v == "true");
-        let effect = transition_effect(name, kind == TrackKind::Audio, self.report);
+        let mut effect = transition_effect(name, kind == TrackKind::Audio, self.report);
+        if effect.effect == filmcraft_project::effect::CUSTOM_FADE
+            && let Some(shape) = child_text(t, "FadeShapeValue").and_then(|v| v.trim().parse::<i32>().ok())
+        {
+            effect.params.insert("shape".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(f64::from(shape.clamp(-100, 100)))));
+        }
+        // where Premiere puts the cut (`Alignment` from the start): a clip's fade can run a frame
+        // past the clip it belongs to
+        let at = time(child_text(tt, "Alignment")).filter(|a| *a == 0 || *a == e - s);
         let (s, e) = (Tick(s), Tick(e));
         let Some(track) = seq.tracks_mut(kind).get_mut(ti) else { return };
         let from = outgoing.then(|| track.items.iter().filter(|i| i.end() >= s && i.end() <= e).max_by_key(|i| i.end()).map(|i| (i.id, i.end()))).flatten();
@@ -818,12 +826,12 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             self.report.warn(format!("transition \"{name}\" has no adjacent clip; skipped"));
             return;
         };
-        let align = if cut == s {
-            TransitionAlign::StartAtCut
-        } else if cut == e {
-            TransitionAlign::EndAtCut
-        } else {
-            TransitionAlign::CenterAtCut
+        let align = match at.map(|a| s + Tick(a)) {
+            Some(c) if c == s && from.is_none() => TransitionAlign::StartAtCut,
+            Some(c) if c == e && to.is_none() => TransitionAlign::EndAtCut,
+            _ if cut == s => TransitionAlign::StartAtCut,
+            _ if cut == e => TransitionAlign::EndAtCut,
+            _ => TransitionAlign::CenterAtCut,
         };
         let id = TransitionId(self.b.alloc());
         let (from, to): (Option<ClipId>, Option<ClipId>) = (from.map(|f| f.0), to.map(|t| t.0));

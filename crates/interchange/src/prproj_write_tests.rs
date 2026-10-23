@@ -642,6 +642,108 @@ fn motion_crop_round_trips() {
     assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
 }
 
+/// Premiere's fade handles save a one-sided audio transition, "Custom Fade", with no effect
+/// component and a `FadeShapeValue` (the curve's bend, −100…100); its `Alignment` puts the cut at
+/// the fade's start (fade in) or end (fade out), and the fade can run a frame past its clip. It
+/// comes in as FilmCraft's clip fade on the right clip, its shape goes back, and new ones are
+/// written. A transition on a clip FilmCraft could not import stays on save (before, KFC2 lost
+/// 7 of its 9 there).
+#[test]
+fn clip_fades_round_trip_and_transitions_on_foreign_clips_stay() {
+    let s = S;
+    let fade = |id: u32, start: i64, end: i64, align: i64, out: bool, shape: i32| {
+        format!(
+            "<AudioTransitionTrackItem ObjectID=\"{id}\" ClassID=\"23f687b6-9c5a-42f4-bea1-e7b3e28e7082\" Version=\"4\"><TransitionTrackItem Version=\"3\"><TrackItem Version=\"4\"><Start>{start}</Start><End>{end}</End></TrackItem><Alignment>{align}</Alignment><DisplayName>Custom Fade</DisplayName><MatchName>Custom Fade</MatchName><HasOutgoingClip>{out}</HasOutgoingClip><HasIncomingClip>{}</HasIncomingClip></TransitionTrackItem><AudioChannelLayout>[{{\"channellabel\":100}},{{\"channellabel\":101}}]</AudioChannelLayout><FadeShapeValue>{shape}</FadeShapeValue></AudioTransitionTrackItem>\n  ",
+            !out
+        )
+    };
+    let frame = s / 30;
+    // the interview's audio ends at 5 s; its fade out runs to a frame past that. A clip whose media
+    // FilmCraft cannot read sits at 10–12 s with a fade out of its own.
+    let doc = doc()
+        .replace(
+            r#"<ClipItems><TrackItems><TrackItem Index="0" ObjectRef="70"/></TrackItems></ClipItems>
+  </ClipTrack></AudioClipTrack>"#,
+            r#"<ClipItems><TrackItems><TrackItem Index="0" ObjectRef="70"/><TrackItem Index="1" ObjectRef="900"/></TrackItems></ClipItems>
+    <TransitionItems><TrackItems><TrackItem Index="0" ObjectRef="910"/><TrackItem Index="1" ObjectRef="911"/></TrackItems></TransitionItems>
+  </ClipTrack></AudioClipTrack>"#,
+        )
+        .replace(
+            "<AudioClipTrackItem ObjectID=\"70\">",
+            &format!(
+                "<AudioClipTrackItem ObjectID=\"900\"><ClipTrackItem><TrackItem><Start>{}</Start><End>{}</End></TrackItem><SubClip ObjectRef=\"901\"/></ClipTrackItem></AudioClipTrackItem>\n  {}{}<AudioClipTrackItem ObjectID=\"70\">",
+                10 * s,
+                12 * s,
+                fade(910, 5 * s - 10 * frame + frame, 5 * s + frame, 10 * frame, true, -27),
+                fade(911, 11 * s, 12 * s, s, true, 30),
+            ),
+        );
+    let (imp, report) = import(doc.as_bytes(), None);
+    assert!(!report.mentions("\"Custom Fade\" is not supported"), "{report}");
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let a1 = &p.sequence(sid).unwrap().audio_tracks[0];
+        assert_eq!(a1.transitions.len(), 1, "the foreign clip's fade is not FilmCraft's");
+        let t = &a1.transitions[0];
+        assert_eq!(t.effect.effect, filmcraft_project::effect::CUSTOM_FADE);
+        assert_eq!(t.effect.params["shape"].value, ParamValue::Float(-27.0));
+        assert_eq!((t.from, t.to, t.align), (Some(a1.items[0].id), None, filmcraft_project::TransitionAlign::EndAtCut), "the interview's fade out");
+    }
+    // unchanged: the same document, the foreign clip's fade too
+    let (same, report) = export(&p, doc.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(same).unwrap(), doc, "{report}");
+    // a new shape, and a fade in added in FilmCraft (modelled on the fade there)
+    {
+        let a1 = &mut p.sequence_mut(sid).unwrap().audio_tracks[0];
+        let clip = a1.items[0].id;
+        a1.transitions[0].effect.params.insert("shape".into(), Param::new(ParamValue::Float(10.0)));
+        let mut fade_in = a1.transitions[0].clone();
+        fade_in.id = filmcraft_project::TransitionId(777);
+        fade_in.effect.params.insert("shape".into(), Param::new(ParamValue::Float(-50.0)));
+        (fade_in.from, fade_in.to, fade_in.start, fade_in.duration, fade_in.align) =
+            (None, Some(clip), Tick(0), Tick(15 * frame), filmcraft_project::TransitionAlign::StartAtCut);
+        a1.transitions.push(fade_in);
+    }
+    let (out, report) = export(&p, doc.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(text.contains("<FadeShapeValue>10</FadeShapeValue>") && text.contains("<FadeShapeValue>-50</FadeShapeValue>"), "{report}");
+    assert!(text.contains("<FadeShapeValue>30</FadeShapeValue>"), "the foreign clip's fade stays");
+    let back = read(&out);
+    let a1 = &back.sequences().next().and_then(|i| i.as_sequence()).unwrap().audio_tracks[0];
+    let mut got: Vec<(Option<bool>, f64, i64)> =
+        a1.transitions.iter().map(|t| (t.from.map(|_| true), t.effect.params["shape"].value.as_f64().unwrap(), t.duration.0 / frame)).collect();
+    got.sort_by(|a, b| a.1.total_cmp(&b.1));
+    assert_eq!(got, vec![(None, -50.0, 15), (Some(true), 10.0, 10)]);
+    // a project with no fade to copy gets one built from scratch
+    let plain = default_chains_doc(true);
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let a1 = &mut p.sequence_mut(sid).unwrap().audio_tracks[0];
+        let clip = a1.items[0].clone();
+        let mut e = filmcraft_project::find_effect(filmcraft_project::effect::CUSTOM_FADE).unwrap().instance();
+        e.params.insert("shape".into(), Param::new(ParamValue::Float(-27.0)));
+        a1.transitions.push(filmcraft_project::Transition {
+            id: filmcraft_project::TransitionId(778),
+            effect: e,
+            start: clip.end() - Tick(20 * frame),
+            duration: Tick(20 * frame),
+            from: Some(clip.id),
+            to: None,
+            align: filmcraft_project::TransitionAlign::EndAtCut,
+            reverse: false,
+        });
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(text.contains("<MatchName>Custom Fade</MatchName>") && text.contains(&format!("<Alignment>{}</Alignment>", 20 * frame)), "{report}");
+    let back = read(&out);
+    let t = &back.sequences().next().and_then(|i| i.as_sequence()).unwrap().audio_tracks[0].transitions;
+    assert_eq!((t.len(), t[0].effect.effect.as_str(), t[0].to), (1, filmcraft_project::effect::CUSTOM_FADE, None));
+}
+
 /// An effect the project has no instance of is laid out as in another Premiere project (and
 /// reported when none has it); a clip with an empty chain gets a component list for it.
 #[test]

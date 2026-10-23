@@ -94,6 +94,13 @@ pub enum Drag {
         clip: ClipId,
         delta: Tick,
     },
+    /// A clip's fade handle: its fade at that edge is `dur` long (`from` when grabbed).
+    Fade {
+        clip: ClipId,
+        edge: filmcraft_edit::Edge,
+        from: Tick,
+        dur: Tick,
+    },
     Stretch {
         clip: ClipId,
         edge: filmcraft_edit::Edge,
@@ -367,6 +374,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         draw_clip(app, &ctx, &p, body, it, *kind, true, &t, rate);
         app.auto.add(&format!("timeline.newTrackGhost.{}", cid.0), body.intersect(shown), "New track");
     }
+    let hover = ctx.input(|i| i.pointer.hover_pos());
     let mut copies: Vec<(ClipId, Tick, Tick, Option<TrackId>)> = Vec::new();
     if copying {
         copies = previews.drain().map(|(c, (s, d, t))| (c, s, d, t)).collect();
@@ -390,8 +398,41 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let x0 = layout.x_of(start);
             let x1 = layout.x_of(start + dur);
             let body = Rect::from_min_max(pos2(x0, r.rect.min.y + 1.0), pos2(x1.max(x0 + 1.0), r.rect.max.y - 1.0));
-            draw_clip(app, &ctx, &p, body, it, r.kind, selection.contains(&it.id), &t, rate);
+            // a clip being dragged is drawn as it will be (its waveform and thumbnail stay put
+            // under a trimmed head instead of sliding with it)
+            let shown = previews.contains_key(&it.id).then(|| as_previewed(it, start, dur, app.tl.drag.as_ref()));
+            draw_clip(app, &ctx, &p, body, shown.as_ref().unwrap_or(it), r.kind, selection.contains(&it.id), &t, rate);
             app.auto.add(&format!("timeline.clip.{}", it.id.0), body.intersect(content), &it.name);
+            // its fades (a Custom Fade as its gain line, one being dragged too) and, under the
+            // pointer, the fade handles at its top corners
+            if !previews.contains_key(&it.id) {
+                let dragged = match app.tl.drag {
+                    Some(Drag::Fade { clip, edge, dur, .. }) if clip == it.id => Some((clip, edge, dur)),
+                    _ => None,
+                };
+                for edge in [filmcraft_edit::Edge::In, filmcraft_edit::Edge::Out] {
+                    let len = match dragged {
+                        Some((_, e, d)) if e == edge => Some(d),
+                        _ => clip_fade(tr, it.id, edge).filter(|f| f.effect.effect == filmcraft_project::effect::CUSTOM_FADE).map(|f| f.duration),
+                    };
+                    if let Some(len) = len {
+                        let (full, edge_x) = match edge {
+                            filmcraft_edit::Edge::In => (layout.x_of(it.start + len), x0),
+                            filmcraft_edit::Edge::Out => (layout.x_of(it.end() - len), x1),
+                        };
+                        draw_fade(&p, body, full, edge_x);
+                    }
+                }
+                let show = dragged.is_some() || (app.tl.drag.is_none() && hover.is_some_and(|h| body.contains(h)) && app.ui.tool == Tool::Selection);
+                for (edge, hr) in fade_handles(tr, it, &layout, r.rect, dragged) {
+                    let id = if edge == filmcraft_edit::Edge::In { "fadeIn" } else { "fadeOut" };
+                    app.auto.add(&format!("timeline.clip.{}.{id}", it.id.0), hr.intersect(content), "Fade handle");
+                    if show {
+                        p.rect_filled(hr, 1.0, Color32::WHITE);
+                        p.rect_stroke(hr, 1.0, Stroke::new(1.0, Color32::from_black_alpha(170)), StrokeKind::Inside);
+                    }
+                }
+            }
             // a nest that runs past the end of its sequence's contents: that part is empty
             if !previews.contains_key(&it.id)
                 && let Some(empty) = app.session.project.nest_overhang(it)
@@ -442,7 +483,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let x0 = layout.x_of(trn.start);
             let x1 = layout.x_of(trn.end());
             let tr_rect = Rect::from_min_max(pos2(x0, r.rect.min.y + 17.0), pos2(x1, r.rect.max.y - 1.0));
-            draw_transition(&p, tr_rect, trn, &t);
+            // (a clip's Custom Fade is drawn on the clip, as its gain line)
+            if trn.effect.effect != filmcraft_project::effect::CUSTOM_FADE {
+                draw_transition(&p, tr_rect, trn, &t);
+            }
             app.auto.add(&format!("timeline.transition.{}", trn.id.0), tr_rect, &trn.effect.effect);
         }
     }
@@ -535,6 +579,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     interact(app, ui, &seq, &layout, rect);
     // track keyframes (drawn and edited on top of the clips)
     super::timeline_automation::show(app, ui, &seq, &layout, aclip);
+    super::timeline_band::show(app, ui, &seq, &layout, vclip, aclip);
     if cap_n > 0 {
         super::timeline_captions::interact(app, ui, &seq, caption_area, &layout);
     }
@@ -772,16 +817,7 @@ fn draw_waveform(app: &mut FilmcraftApp, p: &egui::Painter, body: Rect, it: &Tra
         p.rect_filled(cb, 1.0, Color32::from_black_alpha(160));
         p.text(cb.center(), Align2::CENTER_CENTER, "1", Tokens::ui(7.5), Color32::from_rgb(0xd9, 0xd9, 0xd9));
     }
-    // volume rubber band (white line with a black shadow) at mid-height of the upper zone
-    let level = it.effect("volume").map(|e| e.f64_at("level", it.source_in)).unwrap_or(0.0);
-    let upper = Rect::from_min_max(pos2(body.min.x, body.min.y + 16.0), pos2(body.max.x, area.min.y));
-    if upper.height() > 6.0 {
-        let norm = ((level + 60.0) / 66.0).clamp(0.0, 1.0) as f32;
-        let y = upper.max.y - norm * upper.height();
-        let cp = p.with_clip_rect(body.intersect(p.clip_rect()));
-        cp.line_segment([pos2(body.min.x, y + 1.0), pos2(body.max.x, y + 1.0)], Stroke::new(1.0, Color32::BLACK));
-        cp.line_segment([pos2(body.min.x, y), pos2(body.max.x, y)], Stroke::new(1.0, Color32::WHITE));
-    }
+    // (the volume rubber band is drawn over the clip with its keyframes: `timeline_band`)
 }
 
 /// Display gain for a clip's waveform: clip gain, plus normalisation of the source to full scale
@@ -1278,6 +1314,10 @@ fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequenc
             egui::Popup::menu(&resp).show(|ui| {
                 ui.checkbox(&mut app.ui.timeline.show_thumbnails, "Show Video Thumbnails");
                 ui.checkbox(&mut app.ui.timeline.show_waveforms, "Show Audio Waveform");
+                let c = ui.checkbox(&mut app.ui.timeline.show_video_keyframes, "Show Video Keyframes");
+                app.auto.add("timeline.settings.showVideoKeyframes", c.rect, "Show Video Keyframes");
+                let c = ui.checkbox(&mut app.ui.timeline.show_audio_keyframes, "Show Audio Keyframes");
+                app.auto.add("timeline.settings.showAudioKeyframes", c.rect, "Show Audio Keyframes");
                 ui.separator();
                 let mut te = app.session.state.show_through_edits;
                 let c = ui.checkbox(&mut te, "Show Through Edits");
@@ -1602,10 +1642,39 @@ fn snap(app: &mut FilmcraftApp, seq: &Sequence, layout: &Layout, t: Tick, exclud
 #[derive(Clone, Debug)]
 pub enum Hit {
     Ruler,
-    Clip { track: TrackId, clip: ClipId, edge: Option<filmcraft_edit::Edge> },
-    Transition { track: TrackId, id: filmcraft_project::TransitionId },
-    Empty { track: TrackId },
+    Clip {
+        track: TrackId,
+        clip: ClipId,
+        edge: Option<filmcraft_edit::Edge>,
+    },
+    /// A clip's fade handle (the square at its top corner).
+    Fade {
+        track: TrackId,
+        clip: ClipId,
+        edge: filmcraft_edit::Edge,
+    },
+    Transition {
+        track: TrackId,
+        id: filmcraft_project::TransitionId,
+    },
+    Empty {
+        track: TrackId,
+    },
     None,
+}
+
+/// What a tool other than Selection, or a click / menu, sees: a fade handle is part of its clip.
+fn handle_as_clip(h: Hit) -> Hit {
+    match h {
+        Hit::Fade { track, clip, .. } => Hit::Clip { track, clip, edge: None },
+        h => h,
+    }
+}
+
+/// [`hit`] as `tool` sees it (only the Selection tool drags fade handles).
+fn hit_with(tool: Tool, seq: &Sequence, layout: &Layout, pos: Pos2) -> Hit {
+    let h = hit(seq, layout, pos);
+    if tool == Tool::Selection { h } else { handle_as_clip(h) }
 }
 
 pub fn hit(seq: &Sequence, layout: &Layout, pos: Pos2) -> Hit {
@@ -1617,6 +1686,14 @@ pub fn hit(seq: &Sequence, layout: &Layout, pos: Pos2) -> Hit {
     }
     let Some(row) = layout.row_at(pos.y) else { return Hit::None };
     let Some(tr) = seq.track(row.track) else { return Hit::None };
+    // fade handles, at the top corners of a clip
+    for it in tr.items.iter().filter(|i| layout.x_of(i.start) <= pos.x + FADE_HANDLE && layout.x_of(i.end()) >= pos.x - FADE_HANDLE) {
+        for (edge, r) in fade_handles(tr, it, layout, row.rect, None) {
+            if r.expand(2.0).contains(pos) {
+                return Hit::Fade { track: row.track, clip: it.id, edge };
+            }
+        }
+    }
     for trn in &tr.transitions {
         let x0 = layout.x_of(trn.start);
         let x1 = layout.x_of(trn.end());
@@ -1645,12 +1722,88 @@ pub fn hit(seq: &Sequence, layout: &Layout, pos: Pos2) -> Hit {
     Hit::Empty { track: row.track }
 }
 
+/// Size of a fade handle (px).
+const FADE_HANDLE: f32 = 8.0;
+
+/// A clip's own fade at an edge: the one-sided transition on it there (Premiere's fade handles).
+fn clip_fade(tr: &filmcraft_project::Track, clip: ClipId, edge: filmcraft_edit::Edge) -> Option<&filmcraft_project::Transition> {
+    tr.transitions.iter().find(|t| match edge {
+        filmcraft_edit::Edge::In => t.to == Some(clip) && t.from.is_none(),
+        filmcraft_edit::Edge::Out => t.from == Some(clip) && t.to.is_none(),
+    })
+}
+
+/// Whether an edge of a clip is joined to its neighbour by a transition (no fade handle there).
+fn edge_joined(tr: &filmcraft_project::Track, clip: ClipId, edge: filmcraft_edit::Edge) -> bool {
+    tr.transitions.iter().any(|t| match edge {
+        filmcraft_edit::Edge::In => t.to == Some(clip) && t.from.is_some(),
+        filmcraft_edit::Edge::Out => t.from == Some(clip) && t.to.is_some(),
+    })
+}
+
+/// The fade handles of a clip in a track row: at its top corners, moved in by its fades
+/// (`drag`: a fade handle being dragged and its length). None on a clip too narrow for them or
+/// an edge joined to the next clip.
+fn fade_handles(
+    tr: &filmcraft_project::Track,
+    it: &TrackItem,
+    layout: &Layout,
+    row: Rect,
+    drag: Option<(ClipId, filmcraft_edit::Edge, Tick)>,
+) -> Vec<(filmcraft_edit::Edge, Rect)> {
+    let (x0, x1) = (layout.x_of(it.start), layout.x_of(it.end()));
+    if x1 - x0 < 4.0 * FADE_HANDLE || row.height() < 2.0 * FADE_HANDLE {
+        return Vec::new();
+    }
+    let len = |edge| match drag {
+        Some((c, e, d)) if c == it.id && e == edge => d,
+        _ => clip_fade(tr, it.id, edge).map_or(Tick::ZERO, |t| t.duration),
+    };
+    let y = row.min.y + 2.0;
+    let mut out = Vec::new();
+    for edge in [filmcraft_edit::Edge::In, filmcraft_edit::Edge::Out] {
+        if edge_joined(tr, it.id, edge) {
+            continue;
+        }
+        let x = match edge {
+            filmcraft_edit::Edge::In => (layout.x_of(it.start + len(edge)) - FADE_HANDLE / 2.0).max(x0 + 1.0),
+            filmcraft_edit::Edge::Out => (layout.x_of(it.end() - len(edge)) - FADE_HANDLE / 2.0).min(x1 - FADE_HANDLE - 1.0),
+        };
+        out.push((edge, Rect::from_min_size(pos2(x, y), vec2(FADE_HANDLE, FADE_HANDLE))));
+    }
+    out
+}
+
+/// A clip fade drawn as Premiere draws one: its gain line across the clip (full at the clip side,
+/// silent at the edge) with the faded part shaded above it.
+fn draw_fade(p: &egui::Painter, body: Rect, x_full: f32, x_edge: f32) {
+    if (x_full - x_edge).abs() < 1.0 {
+        return;
+    }
+    let n = 24;
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|i| {
+            let f = i as f32 / n as f32;
+            // constant power from full (f = 0) to silent (f = 1)
+            let g = (f * std::f32::consts::FRAC_PI_2).cos();
+            pos2(x_full + (x_edge - x_full) * f, body.max.y - (body.height() - 2.0) * g)
+        })
+        .collect();
+    // the faded part shaded above the line (in strips: the region is not convex)
+    for w in pts.windows(2) {
+        let (l, r) = if w[0].x <= w[1].x { (w[0], w[1]) } else { (w[1], w[0]) };
+        p.add(egui::Shape::convex_polygon(vec![pos2(l.x, body.min.y), pos2(r.x, body.min.y), r, l], Color32::from_black_alpha(80), Stroke::NONE));
+    }
+    p.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::WHITE)));
+}
+
 pub fn hit_json(app: &FilmcraftApp, pos: Pos2) -> Value {
     let (Some(layout), Some(seq)) = (app.tl.layout.as_ref(), app.session.active_sequence()) else { return json!({"hit": "none"}) };
     let t = layout.tick_at(pos.x);
     match hit(seq, layout, pos) {
         Hit::Ruler => json!({"hit": "ruler", "time": t.0}),
         Hit::Clip { track, clip, edge } => json!({"hit": "clip", "track": track.0, "clip": clip.0, "edge": edge.map(|e| format!("{e:?}")), "time": t.0}),
+        Hit::Fade { track, clip, edge } => json!({"hit": "fade", "track": track.0, "clip": clip.0, "edge": format!("{edge:?}")}),
         Hit::Transition { track, id } => json!({"hit": "transition", "track": track.0, "transition": id.0}),
         Hit::Empty { track } => json!({"hit": "empty", "track": track.0, "time": t.0}),
         Hit::None => json!({"hit": "none"}),
@@ -1674,6 +1827,26 @@ pub fn locate(app: &FilmcraftApp, clip: u64, edge: Option<&str>) -> Option<(f32,
 
 /// The preview's stand-in track for a clip dragged onto a track that does not exist yet.
 const NEW_TRACK: TrackId = TrackId(u64::MAX);
+
+/// A clip as a drag in progress will leave it, shown at `start` for `dur`: a trimmed or rolled
+/// head moves its In point with it (the media stays where it is on the timeline), a rate stretch
+/// changes its speed, a move only its place.
+fn as_previewed(it: &TrackItem, start: Tick, dur: Tick, drag: Option<&Drag>) -> TrackItem {
+    let mut c = it.clone();
+    let head = start - it.start;
+    match drag {
+        Some(Drag::Stretch { .. }) if dur > Tick::ZERO => {
+            c.speed = (it.speed * it.duration.0 as f64 / dur.0 as f64).clamp(1e-3, 1e3);
+        }
+        Some(Drag::Trim { edge: filmcraft_edit::Edge::In, .. }) | Some(Drag::Roll { .. }) if !it.reverse && head != Tick::ZERO => {
+            c.source_in = it.source_in + Tick((head.0 as f64 * it.speed.abs()).round() as i64);
+        }
+        _ => {}
+    }
+    c.start = start;
+    c.duration = dur;
+    c
+}
 
 /// A drag's preview: each moving clip's (start, duration, track). A clip headed for a new track
 /// has [`NEW_TRACK`] as its track and its place in `new_tracks` (kind, 0-based index).
@@ -1970,9 +2143,10 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         && let Some(p) = pos
         && area.contains(p)
     {
-        let h = hit(seq, layout, p);
+        let h = hit_with(tool, seq, layout, p);
         let cur = match (tool, &h) {
             (Tool::Selection, Hit::Clip { edge: Some(_), .. }) => CursorIcon::ResizeColumn,
+            (Tool::Selection, Hit::Fade { .. }) => CursorIcon::ResizeHorizontal,
             (Tool::Ripple | Tool::Rolling | Tool::RateStretch, Hit::Clip { edge: Some(_), .. }) => CursorIcon::ResizeColumn,
             (Tool::Remix, Hit::Clip { edge: Some(filmcraft_edit::Edge::Out), .. }) => CursorIcon::ResizeColumn,
             (Tool::Razor, Hit::Clip { .. }) => CursorIcon::Crosshair,
@@ -1999,7 +2173,7 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         // down (an edge grabbed is trimmed, a clip moves by the whole distance), not where it is
         let origin = if resp.drag_started() { ctx.input(|i| i.pointer.press_origin()) } else { None };
         let Some(p) = origin.or_else(|| resp.interact_pointer_pos()) else { return };
-        let h = hit(seq, layout, p);
+        let h = hit_with(tool, seq, layout, p);
         let t = layout.tick_at(p.x);
         let started = match (tool, h.clone()) {
             (_, Hit::Ruler) => Some(Drag::Scrub),
@@ -2011,6 +2185,10 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     app.tl.zoom_anchor = Some((t.seconds(), p.x));
                 }
                 None
+            }
+            (Tool::Selection, Hit::Fade { track, clip, edge }) => {
+                let from = seq.track(track).and_then(|tr| clip_fade(tr, clip, edge)).map_or(Tick::ZERO, |f| f.duration);
+                Some(Drag::Fade { clip, edge, from, dur: from })
             }
             (Tool::Razor, Hit::Clip { clip, .. }) => {
                 if resp.clicked() || resp.drag_started() {
@@ -2116,7 +2294,8 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     None
                 }
             }
-            (_, Hit::None) => None,
+            // (only the Selection tool sees fade handles: `hit_with`)
+            (_, Hit::None | Hit::Fade { .. }) => None,
         };
         if let Some(d) = started {
             if matches!(d, Drag::Scrub) {
@@ -2185,6 +2364,10 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 let target = rate.snap_nearest(it.end() + moved).max(it.start + rate.frame_duration());
                 Drag::Remix { clip, delta: target - it.end() }
             }),
+            Drag::Fade { clip, edge, from, .. } => seq.find_item(clip).map(|(_, it)| {
+                let d = if edge == filmcraft_edit::Edge::In { from + moved } else { from - moved };
+                Drag::Fade { clip, edge, from, dur: rate.snap_nearest(d).clamp(Tick::ZERO, it.duration) }
+            }),
             Drag::Stretch { clip, edge, .. } => seq.find_item(clip).map(|(_, it)| {
                 let base = if edge == filmcraft_edit::Edge::In { it.start } else { it.end() };
                 let target = snap(app, seq, layout, rate.snap_nearest(base + moved), &[clip]);
@@ -2243,6 +2426,10 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 "timeline.trim",
                 json!({"clip": clip.0, "edge": if edge == filmcraft_edit::Edge::In {"in"} else {"out"}, "mode": if mode == filmcraft_edit::TrimMode::Ripple {"ripple"} else {"regular"}, "delta": delta.0}),
             )),
+            Drag::Fade { clip, edge, from, dur } if dur != from => Some(app.session.execute(
+                "clip.setFade",
+                json!({"clip": clip.0, "edge": if edge == filmcraft_edit::Edge::In {"in"} else {"out"}, "duration": dur.0}),
+            )),
             Drag::Stretch { clip, edge, delta } if delta != Tick::ZERO => Some(app.session.execute("timeline.rateStretch", json!({"clip": clip.0, "edge": if edge == filmcraft_edit::Edge::In {"in"} else {"out"}, "delta": delta.0}))),
             Drag::Remix { clip, delta } if delta != Tick::ZERO => {
                 let d = seq.find_item(clip).map(|(_, it)| it.duration + delta).unwrap_or(Tick::ZERO);
@@ -2278,7 +2465,7 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
     if resp.double_clicked()
         && tool == Tool::Selection
         && let Some(p) = resp.interact_pointer_pos()
-        && let Hit::Clip { clip, .. } = hit(seq, layout, p)
+        && let Hit::Clip { clip, .. } = handle_as_clip(hit(seq, layout, p))
         && seq.find_item(clip).is_some_and(|(_, it)| app.session.project.sequence(it.item).is_some())
     {
         let _ = app.session.execute("timeline.select", json!({"clips": [clip.0]}));
@@ -2290,7 +2477,7 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
     // ---- context menu on clips (right-clicking an unselected clip selects it first)
     if resp.secondary_clicked()
         && let Some(p) = resp.interact_pointer_pos()
-        && let Hit::Clip { clip, .. } = hit(seq, layout, p)
+        && let Hit::Clip { clip, .. } = handle_as_clip(hit(seq, layout, p))
         && !app.session.state.selection.contains(&clip)
     {
         let _ = app.session.execute("timeline.select", json!({"clips": [clip.0]}));
@@ -2454,7 +2641,7 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
     if let Some(effect) = crate::panels::dragged_effect(ui)
         && let Some(p) = ctx.pointer_hover_pos()
         && layout.content.contains(p)
-        && let Hit::Clip { clip, .. } = hit(seq, layout, p)
+        && let Hit::Clip { clip, .. } = handle_as_clip(hit(seq, layout, p))
         && let Some((tid, it)) = seq.find_item(clip)
         && let Some(row) = layout.rows.iter().find(|r| r.track == tid)
     {
@@ -2515,5 +2702,47 @@ mod waveform_tests {
         assert!(waveform_display_gain(0.0, 0.0).is_finite());
         // clip gain still applies
         assert!((db(waveform_display_gain(1.0, -6.0)) - (-6.0)).abs() < 0.1);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::{Drag, as_previewed};
+    use filmcraft_project::{ClipId, TrackItem};
+    use filmcraft_time::{TICKS_PER_SECOND, Tick, TimeRange};
+
+    /// An 8 s clip at 10 s showing its media from 30 s.
+    fn clip(speed: f64, reverse: bool) -> TrackItem {
+        let mut p = filmcraft_project::Project::new("t");
+        let rate = filmcraft_time::FrameRate::FPS_25;
+        let g = p.add_item("G", filmcraft_project::Label::Rose, filmcraft_project::ItemKind::Graphic { width: 64, height: 64, rate }, None);
+        let s = TICKS_PER_SECOND;
+        let mut it = p.make_track_item(g, filmcraft_project::TrackKind::Video, Tick(10 * s), TimeRange::new(Tick(30 * s), Tick(8 * s)), rate).expect("a clip");
+        it.speed = speed;
+        it.reverse = reverse;
+        it
+    }
+
+    /// Dragging a clip's head shows the media that stays where it is on the timeline: before,
+    /// the waveform slid with the edge (as if the clip were moved) and jumped back on release.
+    #[test]
+    fn a_trimmed_head_keeps_the_media_in_place() {
+        let s = TICKS_PER_SECOND;
+        for (speed, reverse) in [(1.0, false), (2.0, false), (0.5, false), (1.0, true)] {
+            let it = clip(speed, reverse);
+            for head in [Tick(3 * s), Tick(-2 * s)] {
+                let trim = Drag::Trim { clip: it.id, edge: filmcraft_edit::Edge::In, mode: filmcraft_edit::TrimMode::Regular, delta: head };
+                let roll = Drag::Roll { left: ClipId(9), right: it.id, delta: head };
+                for drag in [trim, roll] {
+                    let shown = as_previewed(&it, it.start + head, it.duration - head, Some(&drag));
+                    for t in [shown.start, shown.start + Tick(s / 2), shown.end() - Tick(1)] {
+                        assert_eq!(shown.source_time_at(t), it.source_time_at(t), "speed {speed} reverse {reverse} head {head:?} at {t:?}");
+                    }
+                }
+            }
+            // a move keeps the media with the clip
+            let moved = as_previewed(&it, it.start + Tick(5 * s), it.duration, None);
+            assert_eq!(moved.source_time_at(moved.start), it.source_time_at(it.start));
+        }
     }
 }

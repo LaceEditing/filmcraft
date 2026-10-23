@@ -2687,7 +2687,10 @@ impl<'a, 'i> Writer<'a, 'i> {
             let t = self.ix.at(n, &["ClipTrackItem", "TrackItem"])?;
             Some((time(child_text(t, "Start")).unwrap_or(0), time(child_text(t, "End"))?))
         };
+        // (a clip FilmCraft could not import, which the track keeps as it is, does not count)
+        let importable = |id: &str| clip_items.iter().find(|c| c.attribute("ObjectID") == Some(id)).is_some_and(|c| crate::prproj::importable(&self.ix, *c));
         let mut joins: Vec<(Node<'a, 'i>, Option<&'a str>, Option<&'a str>)> = Vec::new();
+        let mut foreign_sides: HashMap<roxmltree::NodeId, (bool, bool)> = HashMap::new();
         for t in &originals {
             let Some(r) = self.ix.at(*t, &["TransitionTrackItem", "TrackItem"]) else { continue };
             let (s, e) = (time(child_text(r, "Start")).unwrap_or(0), time(child_text(r, "End")).unwrap_or(0));
@@ -2705,7 +2708,9 @@ impl<'a, 'i> Writer<'a, 'i> {
                 .filter(|(_, (cs, _))| *cs >= s && *cs <= e)
                 .min_by_key(|(_, (cs, _))| *cs)
                 .and_then(|(c, _)| c.attribute("ObjectID"));
-            joins.push((*t, from.filter(|_| outgoing), to.filter(|_| incoming)));
+            let (from, to) = (from.filter(|_| outgoing), to.filter(|_| incoming));
+            foreign_sides.insert(t.id(), (from.is_some_and(|f| !importable(f)), to.is_some_and(|c| !importable(c))));
+            joins.push((*t, from.filter(|f| importable(f)), to.filter(|c| importable(c))));
         }
         let origin_of = |id: filmcraft_project::ClipId| ft.items.iter().find(|i| i.id == id).and_then(|i| i.origin.clone());
         let mut kept = Vec::new();
@@ -2735,23 +2740,31 @@ impl<'a, 'i> Writer<'a, 'i> {
             let inst = self.here(node);
             if let Some(r) = self.ix.at(node, &["TransitionTrackItem", "TrackItem"]) {
                 let (s, e) = (tr.start.0.to_string(), tr.end().0.to_string());
+                let moved = child_text(r, "Start").unwrap_or("0").trim() != s || child_text(r, "End").map(str::trim) != Some(e.as_str());
                 if child_text(r, "Start").unwrap_or("0").trim() != s {
                     self.set_child(inst, r, "Start", &s);
                 }
                 if child_text(r, "End").map(str::trim) != Some(e.as_str()) {
                     self.set_child(inst, r, "End", &e);
                 }
+                // the cut, from the start, where FilmCraft has it
+                if moved && let Some(tt) = child(node, "TransitionTrackItem") {
+                    self.set_child(inst, tt, "Alignment", &alignment(tr).to_string());
+                }
             }
+            self.fade_shape(inst, node, tr);
             if let Some(tt) = child(node, "TransitionTrackItem")
                 && let Some((_, jf, jt)) = joins.get(m).copied()
             {
-                // a side changes only when FilmCraft's clip there differs from what was imported
+                // a side changes only when FilmCraft's clip there differs from what was imported (a
+                // side on a clip FilmCraft could not import stays)
+                let (out_foreign, in_foreign) = foreign_sides.get(&node.id()).copied().unwrap_or((false, false));
                 let sides = [
-                    ("HasOutgoingClip", tr.from.is_some_and(|f| written.contains_key(&f)), jf.is_some()),
-                    ("HasIncomingClip", tr.to.is_some_and(|t| written.contains_key(&t)), jt.is_some()),
+                    ("HasOutgoingClip", tr.from.is_some_and(|f| written.contains_key(&f)), jf.is_some(), out_foreign),
+                    ("HasIncomingClip", tr.to.is_some_and(|t| written.contains_key(&t)), jt.is_some(), in_foreign),
                 ];
-                for (tag, has, had) in sides {
-                    if has != had {
+                for (tag, has, had, foreign) in sides {
+                    if has != had && !(foreign && !has) {
                         self.set_child(inst, tt, tag, if has { "true" } else { "false" });
                     }
                 }
@@ -2784,6 +2797,16 @@ impl<'a, 'i> Writer<'a, 'i> {
                 self.set_list(tinst, list, &refs);
             } else if let Some(ti) = self.ix.at(pt, &["ClipTrack", "TransitionItems"]) {
                 self.insert(tinst, ti, &format!("<TrackItems Version=\"1\">{refs}</TrackItems>"));
+            } else if let Some(ct) = child(pt, "ClipTrack") {
+                // (a track saved with no transition list at all)
+                let xml = format!("<TransitionItems Version=\"3\"><TrackItems Version=\"1\">{refs}</TrackItems></TransitionItems>");
+                match child(ct, "ClipItems") {
+                    Some(ci) => {
+                        let at = ci.range().end;
+                        self.edit(tinst, at..at, xml);
+                    }
+                    None => self.insert(tinst, ct, &xml),
+                }
             }
         }
         // clips that pointed at a dropped transition, and clips joined by a new one
@@ -2820,7 +2843,11 @@ impl<'a, 'i> Writer<'a, 'i> {
             .children()
             .filter(|n| n.has_tag_name(tag))
             .find(|n| path_text(*n, &["TransitionTrackItem", "DisplayName"]).is_some_and(|d| d.eq_ignore_ascii_case(&name)));
+        let custom = tr.effect.effect == filmcraft_project::effect::CUSTOM_FADE;
         let Some(model) = model else {
+            if custom && tag.starts_with("Audio") {
+                return Some(self.new_custom_fade(tr, written));
+            }
             self.missing.insert(crate::prproj_new::Need::transition(&tr.effect, tag.starts_with("Audio")));
             self.report.warn(format!(
                 "a {name} transition FilmCraft added was not written: neither this Premiere project nor the others FilmCraft has opened has a {name} to model it on (add one in Premiere once, or open a Premiere project that uses it in FilmCraft)"
@@ -2838,9 +2865,43 @@ impl<'a, 'i> Writer<'a, 'i> {
             let inc = tr.to.is_some_and(|t| written.contains_key(&t));
             self.set_child(inst, tt, "HasOutgoingClip", if out { "true" } else { "false" });
             self.set_child(inst, tt, "HasIncomingClip", if inc { "true" } else { "false" });
+            self.set_child(inst, tt, "Alignment", &alignment(tr).to_string());
         }
+        self.fade_shape(inst, model, tr);
         self.report.info(format!("added a {name} transition (modelled on another one in the project)"));
         Some(self.id_of(inst))
+    }
+
+    /// A clip's fade (Premiere's "Custom Fade", which has no effect component) built from scratch
+    /// when the project has none to copy, as Premiere saves one.
+    fn new_custom_fade(&mut self, tr: &filmcraft_project::Transition, written: &HashMap<filmcraft_project::ClipId, String>) -> String {
+        let id = self.alloc_id();
+        let out = tr.from.is_some_and(|f| written.contains_key(&f));
+        let inc = tr.to.is_some_and(|t| written.contains_key(&t));
+        let shape = format!("\n\t\t<FadeShapeValue>{}</FadeShapeValue>", fade_shape_of(tr));
+        self.created.push(format!(
+            "<AudioTransitionTrackItem ObjectID=\"{id}\" ClassID=\"23f687b6-9c5a-42f4-bea1-e7b3e28e7082\" Version=\"4\">\n\t\t<TransitionTrackItem Version=\"3\">\n\t\t\t<TrackItem Version=\"4\">\n\t\t\t\t<Start>{}</Start>\n\t\t\t\t<End>{}</End>\n\t\t\t</TrackItem>\n\t\t\t<Alignment>{}</Alignment>\n\t\t\t<DisplayName>Custom Fade</DisplayName>\n\t\t\t<MatchName>Custom Fade</MatchName>\n\t\t\t<HasOutgoingClip>{out}</HasOutgoingClip>\n\t\t\t<HasIncomingClip>{inc}</HasIncomingClip>\n\t\t</TransitionTrackItem>\n\t\t<AudioChannelLayout>{}</AudioChannelLayout>{shape}\n\t</AudioTransitionTrackItem>\n\t",
+            tr.start.0,
+            tr.end().0,
+            alignment(tr),
+            crate::xml::escape(crate::prproj_intrinsic::STEREO),
+        ));
+        self.report.info("added a clip fade (Premiere's Custom Fade)");
+        id
+    }
+
+    /// A Custom Fade's shape (`FadeShapeValue`, after the transition's other children) where
+    /// FilmCraft's differs from the transition's (none saved reads as 0).
+    fn fade_shape(&mut self, inst: usize, node: Node<'a, 'i>, tr: &filmcraft_project::Transition) {
+        if tr.effect.effect != filmcraft_project::effect::CUSTOM_FADE {
+            return;
+        }
+        let want = fade_shape_of(tr);
+        match child(node, "FadeShapeValue") {
+            Some(h) if h.text().and_then(|t| t.trim().parse::<i32>().ok()) != Some(want) => self.set_text(inst, h, &want.to_string()),
+            None if want != 0 => self.insert(inst, node, &format!("<FadeShapeValue>{want}</FadeShapeValue>")),
+            _ => {}
+        }
     }
 
     fn links(&mut self, seq: &Sequence, pseq: Node<'a, 'i>, written: &HashMap<filmcraft_project::ClipId, String>) {
@@ -3013,6 +3074,22 @@ impl<'a, 'i> Writer<'a, 'i> {
 struct Output {
     text: String,
     report: Report,
+}
+
+/// Premiere's `Alignment` of a transition: where its cut is, from its start (a fade in starts at
+/// it, a fade out ends at it).
+fn alignment(tr: &filmcraft_project::Transition) -> i64 {
+    match (tr.from, tr.to, tr.align) {
+        (None, Some(_), _) | (_, _, filmcraft_project::TransitionAlign::StartAtCut) => 0,
+        (Some(_), None, _) | (_, _, filmcraft_project::TransitionAlign::EndAtCut) => tr.duration.0,
+        _ => tr.duration.0 / 2,
+    }
+}
+
+/// A Custom Fade's `FadeShapeValue`: the curve's bend, −100…100.
+fn fade_shape_of(tr: &filmcraft_project::Transition) -> i32 {
+    let v = tr.effect.params.get("shape").and_then(|p| p.value.as_f64()).filter(|v| v.is_finite()).unwrap_or(0.0);
+    v.round().clamp(-100.0, 100.0) as i32
 }
 
 fn inst_is_copy(instances: &[Instance], i: usize) -> bool {

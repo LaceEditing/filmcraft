@@ -85,7 +85,7 @@ fn open_edit_and_export_a_premiere_project() {
 }
 
 #[test]
-fn exporting_over_the_source_needs_overwrite_and_keeps_a_backup() {
+fn exporting_over_the_source_needs_overwrite_and_leaves_no_backup_beside_it() {
     let dir = tmp_dir("prproj-overwrite");
     let src = dir.join("show.prproj");
     std::fs::write(&src, prproj()).unwrap();
@@ -95,8 +95,23 @@ fn exporting_over_the_source_needs_overwrite_and_keeps_a_backup() {
     let e = s.execute("file.exportPrproj", json!({"path": src.to_string_lossy()})).unwrap_err().to_string();
     assert!(e.contains("overwrite"), "{e}");
     s.execute("file.exportPrproj", json!({"path": src.to_string_lossy(), "overwrite": true})).unwrap();
-    assert_eq!(std::fs::read_to_string(dir.join("show.prproj.before-filmcraft")).unwrap(), prproj());
+    assert!(!dir.join("show.prproj.before-filmcraft").exists(), "no backup file in the project's folder");
     assert!(std::fs::read_to_string(&src).unwrap().contains(&format!("<End>{}</End>", 4 * S)));
+    // a save that cannot be written leaves the file as it was
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let before = std::fs::read(&src).unwrap();
+        trim_first_video_clip(&mut s);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = s.execute("file.exportPrproj", json!({"path": src.to_string_lossy(), "overwrite": true}));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // (root may write anyway; then the save simply succeeded)
+        if r.is_err() {
+            assert_eq!(std::fs::read(&src).unwrap(), before, "untouched");
+            assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("before-filmcraft")));
+        }
+    }
 }
 
 #[test]
@@ -167,11 +182,11 @@ fn a_filmcraft_project_becomes_a_new_premiere_project() {
     assert!(clips_of(&saved, &dir).contains(&(0, 4 * S, 0)));
     assert!(!dir.join("saved.prproj.before-filmcraft").exists(), "its own file is simply replaced");
 
-    // a .prproj FilmCraft did not write is kept
+    // a .prproj FilmCraft did not write is replaced (the dialog asks first), with no backup beside it
     let mut t = filmcraft_project(&dir);
     let foreign = dir.join("show.prproj");
     t.execute("file.saveCopy", json!({"path": foreign.to_string_lossy()})).unwrap();
-    assert_eq!(std::fs::read_to_string(dir.join("show.prproj.before-filmcraft")).unwrap(), prproj());
+    assert!(!dir.join("show.prproj.before-filmcraft").exists());
     assert!(t.premiere_save_path.is_none(), "Save a Copy does not change where Save goes");
 }
 
@@ -237,14 +252,14 @@ fn save_writes_a_premiere_project_for_projects_opened_from_one() {
     assert!(!s.is_dirty());
     assert_eq!(std::fs::read_to_string(&src).unwrap(), prproj(), "the original is never touched");
 
-    // over the original: a backup is kept
+    // over the original: no backup beside it
     let mut s = session(&dir);
     s.prefs.general.save_premiere_projects = "premiereOriginal".into();
     s.execute("file.open", json!({"path": src.to_string_lossy()})).unwrap();
     set_first_video_clip(&mut s, 5);
     s.execute("file.save", json!({})).unwrap();
     assert!(std::fs::read_to_string(&src).unwrap().contains(&format!("<End>{}</End>", 5 * S)));
-    assert_eq!(std::fs::read_to_string(dir.join("show.prproj.before-filmcraft")).unwrap(), prproj());
+    assert!(!dir.join("show.prproj.before-filmcraft").exists());
     assert!(!s.is_dirty());
 
     // as a FilmCraft project: Save asks for a .fcproj, as before

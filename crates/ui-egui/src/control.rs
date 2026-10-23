@@ -281,6 +281,10 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                 Err(e) => return err(e),
             };
             let m = modifiers(p);
+            // hovering with keys held (⌘ over a rubber band shows where a keyframe would go)
+            if req.method == "ui.move" && m != egui::Modifiers::NONE {
+                app.synthetic.push(egui::Event::ModifiersChanged(m));
+            }
             app.synthetic.push(egui::Event::PointerMoved(pos));
             if req.method == "ui.click" {
                 let button = match s("button") {

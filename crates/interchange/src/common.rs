@@ -619,6 +619,8 @@ pub(crate) fn transition_effect(name: &str, audio: bool, report: &mut Report) ->
         "dissolve" | "cross dissolve" | "smpte_dissolve" | "d" | "crossdissolve" => Some(if audio { "constant_power" } else { "cross_dissolve" }),
         "cross fade (+3db)" | "cross fade +3db" | "crossfade (+3db)" | "cross fade" => Some("constant_power"),
         "cross fade (0db)" | "cross fade 0db" | "crossfade (0db)" => Some("constant_gain"),
+        // Premiere's fade handles (the drag at an audio clip's top corner)
+        "custom fade" if audio => Some(filmcraft_project::effect::CUSTOM_FADE),
         "dip to color dissolve" | "fade in fade out dissolve" | "fade to color" => Some("dip_to_black"),
         "edge wipe" | "wipe" | "smpte_wipe" => Some("wipe"),
         _ => None,

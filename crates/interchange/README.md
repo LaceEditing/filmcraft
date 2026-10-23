@@ -194,8 +194,14 @@ committed).
   `DVAMarker` JSON value: `mStartTime.ticks`, `mDuration.ticks`, `mName`, `mComment`, `mType`).
   Markers on a media master clip are source markers; on a sequence's master clip, sequence markers.
 - Transitions: `VideoTransitionTrackItem` / `AudioTransitionTrackItem` → `TransitionTrackItem`
-  (`TrackItem/Start`, `End`, `DisplayName`, `HasOutgoingClip`, `HasIncomingClip`); joined to the
-  clips whose edges fall inside its range on the sides it has.
+  (`TrackItem/Start`, `End`, `Alignment` — the cut, from the start — `DisplayName`,
+  `HasOutgoingClip`, `HasIncomingClip`); joined to the clips whose edges fall inside its range on
+  the sides it has. Premiere's fade handles (the drag at an audio clip's top corner) save a
+  one-sided **Custom Fade**: no effect component, `MatchName` "Custom Fade", and
+  `FadeShapeValue` −100…100 (the curve's bend; every one of 422 in the user's projects carries
+  one). Such a fade can run a frame past its clip; `Alignment` (0 or the duration) says which
+  edge it belongs to. It is FilmCraft's clip fade (`custom_fade`), written back with its shape;
+  new ones are built from scratch when the project has none to copy.
 
 ### Writing back
 
@@ -222,7 +228,7 @@ was opened is the one patched.
   off; an effect added in FilmCraft copies a component of the same effect elsewhere in the project
 (reported when there is none).
 - Clips and transitions FilmCraft never imported (sources it does not understand, transitions
-  joined to no clip) are kept where they are. A clip the importer moved off its track because it
+  joined to no clip or only to such clips) are kept where they are. A clip the importer moved off its track because it
   overlapped another goes back to its track while its timing is unchanged.
 - Transitions follow their clips; new ones copy a transition of the same name in the project, and
   the clips they join get `HeadTransition` / `TailTransition`. Links are rebuilt (links FilmCraft
@@ -286,13 +292,14 @@ back: 85 of the 85 local projects with a sequence.
 In the app the project is written by File ▸ Export ▸ Premiere Pro Project, and by File ▸ Save
 (Ctrl+S) on a project opened from Premiere that was not saved as a FilmCraft project: Settings ▸
 General ▸ Save a project opened from Premiere Pro chooses a `.prproj` beside the original (the
-default; the first Save asks where, later ones write there), over the original (keeping
-`<file>.before-filmcraft`), or a FilmCraft project (`file.save {path?}`; engine
+default; the first Save asks where, later ones write there), over the original, or a FilmCraft
+project (`file.save {path?}`; engine
 `interchange::save_as_premiere`). A Save there leaves the project saved (not dirty). Any other
 project becomes a new Premiere project through File ▸ Export ▸ Premiere Pro Project or Save As /
 Save a Copy with a `.prproj` name; after Save As, Save writes that file again
-(`interchange::create_prproj`). A `.prproj` FilmCraft did not write there is kept as
-`<file>.before-filmcraft`.
+(`interchange::create_prproj`). No backup is left beside the project: a save is verified before
+it is written, and written atomically, so one that fails leaves the file as it was (the original
+as it was opened stays in the data folder's `Premiere Originals`).
 
 ## Tests
 

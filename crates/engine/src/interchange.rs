@@ -303,7 +303,7 @@ pub fn learn_layouts_cmd(s: &mut Session, p: &Value) -> Result<Value> {
 pub enum PremiereSave {
     /// A new .prproj beside the original (asks where the first time).
     Copy,
-    /// Over the original (keeping `<file>.before-filmcraft`).
+    /// Over the original.
     Original,
 }
 
@@ -414,18 +414,11 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
         let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
         a == b || (a.canonicalize().ok().is_some() && a.canonicalize().ok() == b.canonicalize().ok())
     };
-    if !source.is_empty() && same_file(&path, &source) {
-        if !overwrite {
-            return Err(bad(format!(
-                "{path} is the Premiere project the sequences came from. Save to a new file, or export with overwrite (a backup of the original is kept)."
-            )));
-        }
-        let backup = format!("{source}.before-filmcraft");
-        if !std::path::Path::new(&backup).exists() {
-            let original = s.services.read_file(&source).map_err(|e| bad(format!("{source}: {e}")))?;
-            s.services.write_file(&backup, &original).map_err(|e| bad(format!("{backup}: {e}")))?;
-            warnings.push(format!("the original was kept as {backup}"));
-        }
+    // Over the source only when asked. No backup beside it: the project is written only once it
+    // has been verified, and atomically (a failed or interrupted save leaves the file as it was);
+    // the original as it was opened stays in the data folder's Premiere Originals.
+    if !source.is_empty() && same_file(&path, &source) && !overwrite {
+        return Err(bad(format!("{path} is the Premiere project the sequences came from. Save to a new file, or export with overwrite.")));
     }
     // every sequence unless some were asked for: sequences made here are added to the project
     let written: &[ItemId] = if p.get("sequences").is_some() { &wanted } else { &[] };
@@ -541,16 +534,7 @@ pub fn create_prproj(s: &mut Session, path: &str, adopt: bool) -> Result<Value> 
     let measured = titles_for_premiere(&s.project);
     let (bytes, report) = filmcraft_interchange::create_prproj(measured.as_ref().unwrap_or(&s.project), &opts).map_err(|e| bad(e.to_string()))?;
     let mut lines = report_json(&report);
-    // a .prproj FilmCraft did not write for this project is kept
-    let ours = s.premiere_save_path.as_deref() == Some(path);
-    if !ours && s.services.read_file(path).is_ok() {
-        let backup = format!("{path}.before-filmcraft");
-        if s.services.read_file(&backup).is_err() {
-            let old = s.services.read_file(path).map_err(|e| bad(format!("{path}: {e}")))?;
-            s.services.write_file(&backup, &old).map_err(|e| bad(format!("{backup}: {e}")))?;
-            lines.push(format!("the file that was there was kept as {backup}"));
-        }
-    }
+    // (verified and written atomically: a failed save leaves what was there)
     s.services.write_file(path, &bytes).map_err(|e| bad(format!("{path}: {e}")))?;
     let has_files = s.project.items.values().any(is_file_media);
     if path_map.is_empty() && has_files {

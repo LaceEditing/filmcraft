@@ -296,6 +296,104 @@ fn trimming_with_the_mouse() {
     assert_eq!((d.span(a), d.span(b), d.span(c)), ((0, 48), (48, 96), (96, 144)), "every gesture undid in one step");
 }
 
+/// The fade handles at a clip's top corners (Premiere's): dragged in, they give the clip a fade
+/// of that length — a Custom Fade on audio, a Cross Dissolve to nothing on video — in one undo
+/// step; dragged back out to the corner, the fade goes.
+#[test]
+fn fade_handles_make_clip_fades() {
+    let mut d = Driver::new();
+    let [_a, _b, c] = three_clips(&mut d);
+    let audio_c = d.app().session.active_sequence().and_then(|q| q.audio_tracks[0].items.iter().find(|i| i.start == d.f(96)).map(|i| i.id)).expect("C's sound");
+    let fades = |d: &Driver, clip: ClipId| -> Vec<(String, bool, i64)> {
+        let q = d.app().session.active_sequence().unwrap();
+        let rate = d.app().session.sequence_rate();
+        q.all_tracks()
+            .flat_map(|t| t.transitions.iter())
+            .filter(|t| (t.from == Some(clip) && t.to.is_none()) || (t.to == Some(clip) && t.from.is_none()))
+            .map(|t| (t.effect.effect.clone(), t.to == Some(clip), rate.frame_at(t.duration)))
+            .collect()
+    };
+    // C's sound: its fade out handle in by 12 frames
+    d.frames(4);
+    let h = centre(&mut d, &format!("timeline.clip.{}.fadeOut", audio_c.0));
+    d.drag(h, (h.0 - 12.0 * d.ppf, h.1), json!({}));
+    assert_eq!(fades(&d, audio_c), vec![("custom_fade".to_string(), false, 12)], "a 12-frame fade out");
+    // the picture: a fade in of 6 frames
+    let h = centre(&mut d, &format!("timeline.clip.{}.fadeIn", c.0));
+    d.drag(h, (h.0 + 6.0 * d.ppf, h.1), json!({}));
+    assert_eq!(fades(&d, c), vec![("cross_dissolve".to_string(), true, 6)]);
+    // the handle sits at the fade's end now: dragged back to the corner, the fade goes
+    let h = centre(&mut d, &format!("timeline.clip.{}.fadeIn", c.0));
+    d.drag(h, (h.0 - 8.0 * d.ppf, h.1), json!({}));
+    assert!(fades(&d, c).is_empty());
+    d.undo();
+    assert_eq!(fades(&d, c).len(), 1, "one undo step brings it back");
+    d.undo();
+    d.undo();
+    assert!(fades(&d, c).is_empty() && fades(&d, audio_c).is_empty());
+    assert_eq!(d.span(c), (96, 144), "no trim happened");
+}
+
+/// Clip keyframes on the clip (Premiere's rubber band): ⌘-click on a video clip's Opacity line
+/// adds keyframes there, a keyframe dragged down makes a fade in, dragging an audio clip's Volume
+/// line sets its level, and a keyframe's right-click menu deletes it. (Opacity fades in the
+/// user's projects are drawn this way.)
+#[test]
+fn rubber_bands_draw_fades_on_clips() {
+    let mut d = Driver::new();
+    let [_a, _b, c] = three_clips(&mut d);
+    let audio_c = d.app().session.active_sequence().and_then(|q| q.audio_tracks[0].items.iter().find(|i| i.start == d.f(96)).map(|i| i.id)).expect("C's sound");
+    let rect = |d: &mut Driver, id: &str| -> [f64; 4] {
+        let els = d.ok("ui.elements", json!({"prefix": id}));
+        let e = els.as_array().and_then(|a| a.iter().find(|e| e["id"] == json!(id))).cloned().unwrap_or_else(|| panic!("no element {id}: {els}"));
+        let r = &e["rect"];
+        [r[0].as_f64().unwrap(), r[1].as_f64().unwrap(), r[2].as_f64().unwrap(), r[3].as_f64().unwrap()]
+    };
+    let param = |d: &Driver, clip: ClipId, effect: &str, pid: &str| -> filmcraft_project::Param {
+        let q = d.app().session.active_sequence().unwrap();
+        q.find_item(clip).unwrap().1.effect(effect).unwrap().param(pid).cloned().unwrap()
+    };
+    // Opacity is at 100 %: its line runs along the top of the band
+    d.frames(4);
+    let band = rect(&mut d, &format!("timeline.clip.{}.band", c.0));
+    let top = band[1] + 0.5;
+    // (⌘ held while hovering, as a hand on the keyboard does)
+    for f in [100.0, 110.0] {
+        d.ok("ui.move", json!({"x": d.x(f), "y": top, "modifiers": {"command": true}}));
+        d.frames(2);
+        d.click(d.x(f), top, json!({"command": true}));
+    }
+    let p = param(&d, c, "opacity", "opacity");
+    assert_eq!(p.keyframes.len(), 2, "two keyframes added on the line");
+    assert!(p.keyframes.iter().all(|k| (k.value.as_f64().unwrap() - 100.0).abs() < 1e-6));
+    // the first one dragged to the bottom: a fade in from 0 %
+    d.frames(2);
+    let k0 = rect(&mut d, &format!("timeline.clip.{}.band.kf.0", c.0));
+    let from = (k0[0] + k0[2] / 2.0, k0[1] + k0[3] / 2.0);
+    d.drag(from, (from.0, band[1] + band[3] + 10.0), json!({}));
+    let p = param(&d, c, "opacity", "opacity");
+    assert_eq!(p.keyframes.len(), 2);
+    assert!(p.keyframes[0].value.as_f64().unwrap() < 1.0, "{:?}", p.keyframes[0].value);
+    // its right-click menu deletes it
+    d.frames(2);
+    let k0 = rect(&mut d, &format!("timeline.clip.{}.band.kf.0", c.0));
+    d.ok("ui.click", json!({"x": k0[0] + k0[2] / 2.0, "y": k0[1] + k0[3] / 2.0, "button": "right"}));
+    d.frames(3);
+    let del = centre(&mut d, &format!("timeline.clip.{}.band.kf.0.delete", c.0));
+    d.click(del.0, del.1, json!({}));
+    assert_eq!(param(&d, c, "opacity", "opacity").keyframes.len(), 1);
+    // C's sound: its Volume line dragged down lowers its level
+    let band = rect(&mut d, &format!("timeline.clip.{}.band", audio_c.0));
+    let level0 = param(&d, audio_c, "volume", "level").value.as_f64().unwrap();
+    // (the line: where the level sits in the band, on the fader's taper)
+    let y_line = band[1] + band[3] * (1.0 - f64::from(filmcraft_ui_egui::panels::mixer::db_to_pos(level0)));
+    d.ok("ui.move", json!({"x": d.x(120.0), "y": y_line}));
+    d.frames(2);
+    d.drag((d.x(120.0), y_line), (d.x(120.0), y_line + band[3] * 0.3), json!({}));
+    let level1 = param(&d, audio_c, "volume", "level").value.as_f64().unwrap();
+    assert!(level1 < level0 - 3.0, "{level0} → {level1}");
+}
+
 /// The editing keys act on the selection and the playhead as their names say.
 #[test]
 fn editing_keys_do_what_they_say() {
@@ -423,8 +521,9 @@ fn dragging_past_the_last_track_makes_a_new_one() {
     let mut d = Driver::new();
     let [_, b, c] = three_clips(&mut d);
     let sound_c = d.app().session.active_sequence().unwrap().audio_tracks[0].items[2].id;
-    // take only C's sound (Alt-click selects one side of the link), then drag it below A1
-    let ya = d.y(sound_c);
+    // take only C's sound (Alt-click selects one side of the link), then drag it below A1 (by its
+    // name bar: across the middle runs its Volume line, which a drag there moves)
+    let ya = d.y(sound_c) - d.app().ui.timeline.audio_track_h as f64 / 2.0 + 9.0;
     d.exec("edit.deselectAll", json!({}));
     d.click(d.x(120.0), ya, json!({"alt": true}));
     assert_eq!(d.selected(), vec![sound_c]);

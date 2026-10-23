@@ -187,6 +187,11 @@ pub struct TimelineView {
     pub header_w: f32,
     pub show_thumbnails: bool,
     pub show_waveforms: bool,
+    /// Clip keyframes (Opacity / Volume rubber bands) on video and audio clips.
+    #[serde(default = "yes")]
+    pub show_video_keyframes: bool,
+    #[serde(default = "yes")]
+    pub show_audio_keyframes: bool,
     /// Follow playhead during playback (page scroll).
     pub follow: bool,
     pub fit_pending: bool,
@@ -222,6 +227,8 @@ impl Default for TimelineView {
             header_w: 204.0,
             show_thumbnails: true,
             show_waveforms: true,
+            show_video_keyframes: true,
+            show_audio_keyframes: true,
             follow: true,
             fit_pending: true,
             fit_empty: None,

@@ -57,6 +57,16 @@ macro_rules! label_cmd {
 /// The new commands.
 pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
+        // ---------------- Timeline: a clip's own fades (the handles at its top corners) ----------------
+        spec(
+            "clip.setFade",
+            "Clip Fade",
+            &[],
+            None,
+            r#"{"clip":id,"edge":"in"|"out","duration":ticks?,"frames":i64?,"shape":-100..100?} (duration 0 removes the fade)"#,
+            has_seq,
+            set_fade,
+        ),
         // ---------------- File ----------------
         spec("file.newSequenceFromClip", "Sequence From Clip", &["File", "New"], None, r#"{"items":[id]?}"#, has_clip_items, sequence_from_clip),
         spec(
@@ -1755,4 +1765,76 @@ fn short_clips(s: &Session, clips: &[u64]) -> Vec<Value> {
             (frames > 0).then(|| json!({"clip": c, "shortByFrames": frames}))
         })
         .collect()
+}
+
+/// A clip's fade in or out (Premiere's fade handles): a transition on that one clip's edge — a
+/// Custom Fade on audio, a Cross Dissolve to nothing on video — made, resized, or (duration 0)
+/// removed. The two fades of a clip together fit in it; an edge already joined to the next clip by
+/// a transition has no fade of its own.
+pub(crate) fn set_fade(s: &mut Session, p: &Value) -> Result<Value> {
+    let clip = crate::commands::clip_p(p, "clip").ok_or_else(|| bad("clip.setFade", "need `clip`"))?;
+    let fade_in = match str_p(p, "edge") {
+        Some("in") => true,
+        Some("out") => false,
+        _ => return Err(bad("clip.setFade", "`edge` is `in` or `out`")),
+    };
+    let rate = s.sequence_rate();
+    let want = match (p.get("duration").and_then(Value::as_i64), p.get("frames").and_then(Value::as_i64)) {
+        (Some(d), _) => Tick(d),
+        (None, Some(f)) => rate.tick_of(f.clamp(0, 1 << 32)),
+        _ => return Err(bad("clip.setFade", "need `duration` (ticks) or `frames`")),
+    };
+    let shape = f64_p(p, "shape").filter(|v| v.is_finite()).map(|v| v.clamp(-100.0, 100.0));
+    let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let (track, it) = seq.find_item(clip).ok_or_else(|| bad("clip.setFade", format!("no clip {}", clip.0)))?;
+    let tr = seq.track(track).ok_or_else(|| bad("clip.setFade", "no track"))?;
+    let audio = tr.kind == TrackKind::Audio;
+    let mine = |t: &filmcraft_project::Transition| if fade_in { t.to == Some(clip) && t.from.is_none() } else { t.from == Some(clip) && t.to.is_none() };
+    if tr.transitions.iter().any(|t| if fade_in { t.to == Some(clip) && t.from.is_some() } else { t.from == Some(clip) && t.to.is_some() }) {
+        return Err(bad("clip.setFade", "that edge already has a transition with the neighbouring clip"));
+    }
+    // room left by the other fade
+    let other = tr.transitions.iter().find(|t| if fade_in { t.from == Some(clip) && t.to.is_none() } else { t.to == Some(clip) && t.from.is_none() });
+    let room = it.duration - other.map_or(Tick::ZERO, |t| t.duration);
+    let dur = rate.snap(want.clamp(Tick::ZERO, room.max(Tick::ZERO))).min(room.max(Tick::ZERO));
+    let existing = tr.transitions.iter().find(|t| mine(t)).map(|t| t.id);
+    let (start, end) = (it.start, it.end());
+    if existing.is_none() && dur <= Tick::ZERO {
+        return Ok(json!({"clip": clip.0, "fade": Value::Null}));
+    }
+    let label = if fade_in { "Fade In" } else { "Fade Out" };
+    let id = s.edit_sequence(label, move |q, ctx, _| {
+        let t = q.track_mut(track).ok_or_else(|| EngineError::Other("no track".into()))?;
+        if t.locked {
+            return Err(EngineError::Other("the track is locked".into()));
+        }
+        let at = if fade_in { start } else { end - dur };
+        match existing.and_then(|id| t.transitions.iter().position(|x| x.id == id)) {
+            Some(i) if dur <= Tick::ZERO => {
+                t.transitions.remove(i);
+                Ok(None)
+            }
+            Some(i) => {
+                let x = &mut t.transitions[i];
+                (x.start, x.duration) = (at, dur);
+                if let Some(v) = shape {
+                    x.effect.params.insert("shape".into(), filmcraft_project::Param::new(ParamValue::Float(v)));
+                }
+                Ok(Some(x.id))
+            }
+            None => {
+                let def = if audio { filmcraft_project::effect::CUSTOM_FADE } else { "cross_dissolve" };
+                let mut effect = filmcraft_project::find_effect(def).map(|d| d.instance()).ok_or_else(|| EngineError::Other(format!("no {def} effect")))?;
+                if let (Some(v), true) = (shape, audio) {
+                    effect.params.insert("shape".into(), filmcraft_project::Param::new(ParamValue::Float(v)));
+                }
+                let (from, to) = if fade_in { (None, Some(clip)) } else { (Some(clip), None) };
+                let align = if fade_in { filmcraft_project::TransitionAlign::StartAtCut } else { filmcraft_project::TransitionAlign::EndAtCut };
+                let x =
+                    filmcraft_project::Transition { id: filmcraft_project::TransitionId(0), effect, start: at, duration: dur, from, to, align, reverse: false };
+                Ok(Some(edit::add_transition(q, track, x, ctx)?))
+            }
+        }
+    })?;
+    Ok(json!({"clip": clip.0, "fade": id.map(|i| i.0), "duration": dur.0}))
 }

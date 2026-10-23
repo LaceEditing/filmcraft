@@ -118,7 +118,7 @@ fn ctrl_s_saves_a_premiere_project_as_prproj() {
     assert_eq!(asked.load(Ordering::Relaxed), 0, "no dialog: Save knows where");
     let first = std::fs::read_to_string(&src).expect("the .prproj is there");
     assert_ne!(first, prproj(), "written into the original");
-    assert_eq!(std::fs::read_to_string(dir.join("show.prproj.before-filmcraft")).unwrap(), prproj(), "the original is kept as a backup");
+    assert!(!dir.join("show.prproj.before-filmcraft").exists(), "no backup file beside the project");
     assert!(!d.harness.state().session.is_dirty(), "saved");
     // another edit; Ctrl+S writes there again
     d.ok("engine.execute", json!({"command": "playhead.set", "params": {"seconds": 6.0}}));

@@ -257,6 +257,8 @@ const A_SPECIAL: &[&str] = &["Audio Effects", "Special"];
 const A_STEREO: &[&str] = &["Audio Effects", "Stereo Imagery"];
 const A_TIME: &[&str] = &["Audio Effects", "Time and Pitch"];
 const A_TRANS: &[&str] = &["Audio Transitions", "Crossfade"];
+/// The audio transition a clip's fade handle makes ([`EffectDef`] "Custom Fade").
+pub const CUSTOM_FADE: &str = "custom_fade";
 
 fn build_effects() -> Vec<EffectDef> {
     let mut v = vec![
@@ -845,6 +847,20 @@ fn build_effects() -> Vec<EffectDef> {
             kind: EffectKind::AudioTransition,
             category: A_TRANS,
             params: vec![],
+            intrinsic: false,
+            accelerated: false,
+            float32: true,
+            yuv: false,
+        },
+        // a clip's own fade in or out, made by dragging the fade handle at a clip's top corner
+        // (Premiere's "Custom Fade"; not in the Effects panel). `shape` is Premiere's fade shape,
+        // the curve's bend, −100…100 (every one in 422 of the user's fades carries one).
+        EffectDef {
+            id: CUSTOM_FADE,
+            name: "Custom Fade",
+            kind: EffectKind::AudioTransition,
+            category: &[],
+            params: vec![ParamDef { animatable: false, ..fs("shape", "Fade Shape", 0.0, (-100.0, 100.0), (-100.0, 100.0), "", 0) }],
             intrinsic: false,
             accelerated: false,
             float32: true,
