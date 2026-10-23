@@ -38,7 +38,7 @@ fn edits_round_trip_through_the_premiere_project() {
     {
         let seq = p.sequence_mut(sid).unwrap();
         let v1 = &mut seq.video_tracks[0];
-        // trim the first clip's head by one second (keyframes keep their clip times)
+        // trim the first clip's head by one second (keyframes stay at their media times)
         let a = &mut v1.items[0];
         a.start = Tick(S);
         a.duration = Tick(4 * S);
@@ -81,7 +81,7 @@ fn edits_round_trip_through_the_premiere_project() {
     assert_eq!(got, vec![(S, 4 * S, 11 * S, 1.0, false), (5 * S, S, 20 * S, 2.0, true), (6 * S, S, 22 * S, 2.0, true)], "{report}");
     let (a, left, right) = (&v1.items[0], &v1.items[1], &v1.items[2]);
     let keys: Vec<(Tick, f64)> = a.effect("motion").unwrap().params["scale"].keyframes.iter().map(|k| (k.time, k.value.as_f64().unwrap())).collect();
-    assert_eq!(keys, vec![(Tick(0), 100.0), (Tick(2 * S), 150.0)]);
+    assert_eq!(keys, vec![(Tick(10 * S), 100.0), (Tick(12 * S), 150.0)]);
     assert!(left.effect("gaussian_blur").is_none());
     assert!(right.effect("gaussian_blur").is_some(), "the copy keeps the blur");
     assert_ne!(left.origin, right.origin, "the right half is a new Premiere object");
@@ -551,6 +551,95 @@ fn motion_opacity_volume_and_enable_changed_first_in_filmcraft_are_written() {
     p2.sequence_mut(sid2).unwrap().video_tracks[0].items[0].enabled = true;
     let (on, _) = export(&p2, text.as_bytes(), &[], None).unwrap();
     assert!(!String::from_utf8(prproj_graph::decompress(&on).unwrap().0).unwrap().contains("IsMuted"));
+}
+
+/// Opacity ▸ Blend Mode: Premiere saves the mode's code in its first "Blend Mode" and the menu
+/// position (counting separators) in the second; the code is what is read, as older projects
+/// leave the second stale.
+#[test]
+fn blend_modes_are_read_and_written_as_premiere_numbers_them() {
+    let plain = default_chains_doc(true);
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    let set_blend = |p: &mut filmcraft_project::Project, mode: u32| {
+        let b = &mut p.sequence_mut(sid).unwrap().video_tracks[0].items[1];
+        b.effect_mut("opacity").unwrap().params.insert("blend".into(), Param::new(ParamValue::Choice(mode)));
+    };
+    // Multiply: code 17, menu position 4 (after Normal, Dissolve, a separator and Darken)
+    set_blend(&mut p, 3);
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    let blend_values = |text: &str| -> Vec<String> {
+        text.split("<Name>Blend Mode</Name>").skip(1).filter_map(|s| s.split("<StartKeyframe>").nth(1)?.split(',').nth(1).map(str::to_string)).collect()
+    };
+    assert_eq!(blend_values(&text), ["17", "4"], "{report}");
+    let blend_of = |bytes: &[u8]| {
+        read(bytes).sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[0].items[1].effect("opacity").unwrap().params["blend"].value.clone()
+    };
+    assert_eq!(blend_of(&out), ParamValue::Choice(3));
+    // Luminosity (last) and Color (code 0)
+    for (mode, code, menu) in [(26, "16", "31"), (25, "0", "30")] {
+        set_blend(&mut p, mode);
+        let (out, _) = export(&p, plain.as_bytes(), &[], None).unwrap();
+        let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+        assert_eq!(blend_values(&text), [code, menu]);
+        assert_eq!(blend_of(&out), ParamValue::Choice(mode));
+    }
+    // a stale menu position: the code wins, and an unchanged mode leaves the document as it was
+    let stale = text.replacen("<StartKeyframe>-91445760000000000,4,", "<StartKeyframe>-91445760000000000,0,", 1);
+    assert_ne!(stale, text, "the menu position is in the document");
+    assert_eq!(blend_of(stale.as_bytes()), ParamValue::Choice(3));
+    let (imp2, _) = import(stale.as_bytes(), None);
+    let (again, _) = export(&imp2.project, stale.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), stale);
+}
+
+/// Premiere's effect colours have no alpha, and some projects save it as 0 (NintendoVHS's Tint
+/// ▸ Map Black To): they come in opaque, and saving unchanged leaves them as they were.
+#[test]
+fn effect_colours_saved_with_no_alpha_come_in_opaque() {
+    let opaque_black = "-91445760000000000,18374686479671623680,";
+    let plain = doc();
+    assert!(plain.contains(opaque_black));
+    // red with alpha 0
+    let clear = plain.replacen(opaque_black, "-91445760000000000,280375465082880,", 1);
+    let (imp, _) = import(clear.as_bytes(), None);
+    let tint_black = |p: &filmcraft_project::Project| {
+        let seq = p.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+        let item = seq.video_tracks.iter().flat_map(|t| &t.items).find(|i| i.effect("tint").is_some()).unwrap();
+        item.effect("tint").unwrap().params["black"].value.clone()
+    };
+    assert_eq!(tint_black(&imp.project), ParamValue::Color([1.0, 0.0, 0.0, 1.0]));
+    let (same, report) = export(&imp.project, clear.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(same).unwrap(), clear, "{report}");
+}
+
+/// Motion ▸ Crop (Premiere 25+: Crop Left / Top / Right / Bottom in %) comes in and goes back.
+/// Before, FilmCraft showed a cropped clip whole (Round 4: NintendoVHS's `lob.png`, Crop Top 88 %).
+#[test]
+fn motion_crop_round_trips() {
+    let plain = default_chains_doc(true);
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let b = &mut p.sequence_mut(sid).unwrap().video_tracks[0].items[1];
+        let m = b.effect_mut("motion").unwrap();
+        m.params.insert("crop_top".into(), Param::new(ParamValue::Float(88.1)));
+        m.params.insert("crop_left".into(), Param::new(ParamValue::Float(0.8)));
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(text.contains("<Name>Crop Top</Name><ParameterID>9</ParameterID><StartKeyframe>-91445760000000000,88.1,"), "{report}");
+    let back = read(&out);
+    let b = &back.sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[0].items[1];
+    let m = b.effect("motion").unwrap();
+    assert_eq!((m.params["crop_top"].value.clone(), m.params["crop_left"].value.clone()), (ParamValue::Float(88.1), ParamValue::Float(0.8)));
+    // unchanged: the same document
+    let (imp2, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&imp2.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
 }
 
 /// An effect the project has no instance of is laid out as in another Premiere project (and
@@ -1105,12 +1194,44 @@ fn label_colours_round_trip() {
     let (out, report) = export(&p, labelled.as_bytes(), &[], None).unwrap();
     let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
     assert_eq!(text.matches("<asl.clip.label.name>BE.Prefs.LabelColors.7</asl.clip.label.name>").count(), 2, "both master clips: {report}");
+    assert_eq!(text.matches("<Column.PropertyText.Label>BE.Prefs.LabelColors.7</Column.PropertyText.Label>").count(), 1, "the Project panel's column");
     assert!(text.contains("<asl.clip.label.name>BE.Prefs.LabelColors.6</asl.clip.label.name>"), "the clip");
     let back = read(&out);
     assert_eq!(back.items.values().find(|i| i.name == "interview.mov").unwrap().label, filmcraft_project::Label::Mango);
     let q = back.sequences().find_map(|i| i.as_sequence()).unwrap();
     assert_eq!(q.video_tracks[0].items[0].label, filmcraft_project::Label::Rose);
     assert_eq!(q.video_tracks[0].items[1].label, filmcraft_project::Label::Caribbean, "the other clip keeps its colour");
+}
+
+/// Premiere's Project panel shows an item's Label column (`Column.PropertyText.Label` in its
+/// `ClipProjectItem`), which can differ from its master clip's label: it is the item's label in
+/// FilmCraft, and a new one is written there too (Round 4: the master clip changed, the Project
+/// panel did not).
+#[test]
+fn the_project_panel_label_column_is_read_and_written() {
+    let column = |n: u32| {
+        format!(
+            "<ProjectItem><Node Version=\"1\"><Properties Version=\"1\"><Column.PropertyText.Label>BE.Prefs.LabelColors.{n}</Column.PropertyText.Label></Properties></Node><Name>interview.mov</Name></ProjectItem>"
+        )
+    };
+    let labelled = doc()
+        .replace(r#"<ProjectItem><Name>interview.mov</Name></ProjectItem>"#, &column(3))
+        .replace(
+            r#"<AudioClip ObjectID="16"><Clip><Source ObjectRef="76"/></Clip></AudioClip>"#,
+            r#"<AudioClip ObjectID="16"><Clip><Node Version="1"><Properties Version="1"><asl.clip.label.color>480554</asl.clip.label.color><asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name></Properties></Node><Source ObjectRef="76"/></Clip></AudioClip>"#,
+        );
+    let (imp, _) = import(labelled.as_bytes(), None);
+    let mut p = imp.project;
+    let media = p.items.values().find(|i| i.name == "interview.mov").unwrap().id;
+    let panel = filmcraft_project::Label::ALL[3];
+    assert_eq!(p.item(media).unwrap().label, panel, "the column, not the master clip's Caribbean");
+    let (same, _) = export(&p, labelled.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&same).unwrap().0).unwrap(), labelled);
+    p.item_mut(media).unwrap().label = filmcraft_project::Label::Mango;
+    let (out, report) = export(&p, labelled.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert!(text.contains(&column(7)), "{report}");
+    assert_eq!(read(&out).items.values().find(|i| i.name == "interview.mov").unwrap().label, filmcraft_project::Label::Mango);
 }
 
 /// The Parametric Equalizer's pass filters and shelf slopes (values from an EQ edited in

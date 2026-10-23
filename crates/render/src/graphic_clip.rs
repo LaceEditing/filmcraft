@@ -42,29 +42,56 @@ pub fn layer_matrix(spec: &LayerSpec) -> Affine {
 }
 
 /// Where a layer's origin is in its layout coordinates: (0, 0), or for text whose origin is the
-/// top-left corner of its bounds ([`TextProps::top_left_origin`]), that corner.
+/// top-left corner of its box or bounds ([`TextProps::top_left_origin`]), that corner.
 pub fn layer_origin(spec: &LayerSpec) -> (f32, f32) {
     match &spec.content {
         LayerContent::Text(t) if t.top_left_origin => {
-            let b = text_layout(t).bounds;
-            (b[0], b[1] - valign_shift(t, b[3] - b[1]))
+            let lay = text_layout(t);
+            let b = lay.bounds;
+            match paragraph_top(t, &lay) {
+                Some(top) => (b[0], top),
+                None => (b[0], b[1]),
+            }
         }
         _ => (0.0, 0.0),
     }
 }
 
-/// How far paragraph text moves down in its box for its vertical alignment (Premiere's centre /
-/// bottom): the box's spare height, halved for centre. Point text and top alignment: 0.
-pub fn valign_shift(t: &TextProps, text_height: f32) -> f32 {
-    if t.box_width <= 0.0 || t.box_height <= 0.0 || t.vertical {
-        return 0.0;
+/// Where the top of paragraph text's box is in its layout coordinates, as Premiere places text in
+/// its box (measured in Premiere 26.5): aligned to the top, the first line's capitals touch the
+/// box's top; to the bottom, the last baseline sits on its bottom (descenders hang below);
+/// centred, halfway between. A box with no height is aligned to the top. None: point or vertical
+/// text (placed by its bounds).
+pub fn paragraph_top(t: &TextProps, lay: &Layout) -> Option<f32> {
+    if t.box_width <= 0.0 || t.vertical {
+        return None;
     }
-    let spare = t.box_height - text_height;
-    match t.valign {
-        1 => spare / 2.0,
-        2 => spare,
-        _ => 0.0,
-    }
+    let (first, last) = (lay.lines.first()?, lay.lines.last()?);
+    let top = first.baseline - first.ascent * cap_ratio(t);
+    let bottom = last.baseline - t.box_height;
+    Some(match t.valign {
+        _ if t.box_height <= 0.0 => top,
+        1 => (top + bottom) / 2.0,
+        2 => bottom,
+        _ => top,
+    })
+}
+
+/// Paragraph text's box `[x0, y0, x1, y1]` in its layout coordinates (Premiere's selection box):
+/// a box with no height is as tall as its lines. None: point or vertical text.
+pub fn paragraph_box(t: &TextProps, lay: &Layout) -> Option<[f32; 4]> {
+    let top = paragraph_top(t, lay)?;
+    let b = lay.bounds;
+    let h = if t.box_height > 0.0 { t.box_height } else { b[3] - b[1] };
+    Some([b[0], top, b[0] + t.box_width, top + h])
+}
+
+/// The layer font's cap height as a share of its ascent (Arial: 0.716 / 0.905 em).
+fn cap_ratio(t: &TextProps) -> f32 {
+    let (st, _) = text_styles(t);
+    let face = filmcraft_text::fonts::face(filmcraft_text::fonts::resolve(&st.family, &st.style).face);
+    let m = face.metrics(st.size.max(1.0));
+    if m.ascent > 0.0 && m.cap_height > 0.0 { (m.cap_height / m.ascent).min(1.0) } else { 0.7 }
 }
 
 /// Text style + paragraph style of a text layer.
@@ -159,7 +186,10 @@ pub fn shape_path(s: &ShapeProps) -> filmcraft_text::Path {
 /// Content bounds `[x0, y0, x1, y1]` of a layer in layer pixels (text box or shape box).
 pub fn layer_local_bounds(spec: &LayerSpec) -> [f32; 4] {
     match &spec.content {
-        LayerContent::Text(t) => text_layout(t).bounds,
+        LayerContent::Text(t) => {
+            let lay = text_layout(t);
+            paragraph_box(t, &lay).unwrap_or(lay.bounds)
+        }
         LayerContent::Shape(s) => match shape_path(s).bounds() {
             Some(b) => [b.0, b.1, b.2, b.3],
             None => [0.0; 4],
@@ -659,6 +689,45 @@ mod tests {
         let (b1, b2) = (ink_box(&img).unwrap(), ink_box(&img2).unwrap());
         assert!(b2[1] + 30 < b1[1], "the big letter rises higher: {b1:?} {b2:?}");
         assert!(b2[3].abs_diff(b1[3]) <= 1, "same baseline: {b1:?} {b2:?}");
+    }
+
+    /// Paragraph text in its box, as Premiere places it: top-aligned capitals touch the box's top,
+    /// a bottom-aligned last baseline sits on its bottom, centred is halfway.
+    #[test]
+    fn paragraph_text_aligns_in_its_box_as_premiere() {
+        let mut e = new_text_layer("Valign\nHVE", Vec2::new(100.0, 50.0), 70.0);
+        set(&mut e, "box_width", ParamValue::Float(600.0));
+        set(&mut e, "box_height", ParamValue::Float(400.0));
+        set(&mut e, "top_left_origin", ParamValue::Bool(true));
+        set(&mut e, "fill_color", ParamValue::Color([1.0; 4]));
+        let baselines = |e: &EffectInstance| {
+            let spec = eval_layer(e, Tick::ZERO, (800, 600)).unwrap();
+            let LayerContent::Text(t) = &spec.content else { panic!("text") };
+            let lay = text_layout(t);
+            let m = layer_matrix(&spec);
+            let at = |l: &filmcraft_text::Line| m.apply(Vec2::new(0.0, f64::from(l.baseline))).y as f32;
+            (at(&lay.lines[0]), at(&lay.lines[1]), lay.lines[0].ascent * cap_ratio(t))
+        };
+        // top: the first line's capitals from the box's top (and the ink agrees)
+        let (first, last_top, cap) = baselines(&e);
+        assert!((first - (50.0 + cap)).abs() < 1e-3, "{first} {cap}");
+        assert!(cap > 70.0 * 0.6 && cap < 70.0 * 0.8, "cap height {cap}");
+        let mut img = Image::new(800, 600);
+        render_graphic_layers(std::slice::from_ref(&e), Tick::ZERO, (800, 600), &Affine::IDENTITY, &mut img);
+        let ink = ink_box(&img).unwrap();
+        assert!(ink[1].abs_diff(50) <= 2, "capitals at the box top: {ink:?}");
+        // bottom: the last baseline on the box's bottom
+        set(&mut e, "valign", ParamValue::Choice(2));
+        let (_, last, _) = baselines(&e);
+        assert!((last - 450.0).abs() < 1e-3, "{last}");
+        // centre: halfway between the two
+        set(&mut e, "valign", ParamValue::Choice(1));
+        let first_bottom = first + (450.0 - last_top);
+        let (mid, _, _) = baselines(&e);
+        assert!((mid - (first + first_bottom) / 2.0).abs() < 1e-3, "{mid} {first} {first_bottom}");
+        // a box with no height is aligned to the top
+        set(&mut e, "box_height", ParamValue::Float(0.0));
+        assert!((baselines(&e).0 - first).abs() < 1e-3);
     }
 
     #[test]

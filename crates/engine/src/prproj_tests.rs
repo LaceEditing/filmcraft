@@ -372,6 +372,10 @@ fn titles_are_measured_as_premiere_measures_them() {
         }
     }
     assert_eq!(layer(&s, boxed).params["top_left_origin"].value, filmcraft_project::ParamValue::Bool(true), "paragraph text: its box's top-left");
+    // its box, as tall as FilmCraft showed it (Round 4: Premiere hid the line that did not fit)
+    let h = layer(&s, boxed).params["box_height"].value.as_f64().unwrap();
+    let shown = after.1[2][1].as_f64().unwrap() - after.1[0][1].as_f64().unwrap();
+    assert!(h > 60.0 && (h - shown).abs() < 0.01, "box height {h}, shown {shown}");
     assert_ne!(
         layer(&s, point).params.get("top_left_origin").map(|p| p.value.clone()),
         Some(filmcraft_project::ParamValue::Bool(true)),

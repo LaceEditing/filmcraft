@@ -4,7 +4,7 @@
 //! of the per-pixel max channel difference ≤ 6, mean < 1.5; antialiased edges and half-float
 //! textures differ slightly). Exact inputs drawn 1:1 (no resampling) must agree to 2e-3 in linear
 //! premultiplied values (half-float accumulator), except Hard Mix, a step function, which may
-//! flip a pixel whose blend lands on its 0.5 threshold.
+//! flip a pixel whose colours sum to its threshold of 1.
 
 use super::*;
 use filmcraft_geom::{Affine, Vec2};

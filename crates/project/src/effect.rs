@@ -274,6 +274,11 @@ fn build_effects() -> Vec<EffectDef> {
                 ang("rotation", "Rotation", 0.0),
                 pt("anchor", "Anchor Point", f64::NAN, f64::NAN),
                 fs("anti_flicker", "Anti-flicker Filter", 0.0, (0.0, 1.0), (0.0, 1.0), "", 2),
+                // the source's edges cut away, in % of its width / height (Premiere 25+)
+                fs("crop_left", "Crop Left", 0.0, (0.0, 100.0), (0.0, 100.0), "%", 1),
+                fs("crop_top", "Crop Top", 0.0, (0.0, 100.0), (0.0, 100.0), "%", 1),
+                fs("crop_right", "Crop Right", 0.0, (0.0, 100.0), (0.0, 100.0), "%", 1),
+                fs("crop_bottom", "Crop Bottom", 0.0, (0.0, 100.0), (0.0, 100.0), "%", 1),
             ],
             intrinsic: true,
             accelerated: true,

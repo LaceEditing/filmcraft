@@ -119,15 +119,28 @@ committed).
   reversed); `FrameHold` = 4 with `FrameHoldStart` (media ticks) is a hold on that frame.
   `HeadTransition` / `TailTransition` point at the transitions over the clip's start / end.
   Linked clips are `Link` objects listed in `Sequence/PersistentGroupContainer/LinkContainer`.
+- Labels: a clip object's `Clip/Node/Properties/asl.clip.label.name` (`BE.Prefs.LabelColors.N`,
+  N in the order of FilmCraft's `Label::ALL`) and `asl.clip.label.color` (R + G·256 + B·65536).
+  The Project panel shows a `ClipProjectItem`'s own Label column,
+  `ProjectItem/Node/Properties/Column.PropertyText.Label` (same names), which can differ from its
+  master clip's; both are read (the column first) and written.
 - Effects: `ClipTrackItem/ComponentOwner/Components` → component chain → components (video:
   `Component/DisplayName`, `MatchName`; audio: `AudioComponent/Component`, `FilterMatchName`) →
   `…ComponentParam` objects with `Name`, `StartKeyframe` (`time,value,…`) and `Keyframes`
   (`time,value,f2,f3,in speed,in influence,out speed,out influence;` repeated).
   **Keyframe times are source-media ticks** (checked on clips whose timeline and source positions
-  differ); FilmCraft's are clip time: `(t − InPoint) / speed`. `f2` = 0 linear, 5 Bézier, with `f3`
+  differ), as FilmCraft's are: they are read and written unchanged. (Until Round 4 they were
+  converted to `(t − InPoint) / speed`, which FilmCraft then played at media time: every keyed
+  clip with an In point sat at its last value.) `f2` = 0 linear, 5 Bézier, with `f3`
   = 0 Bézier, 2 auto Bézier, 4 continuous Bézier (observed on ~500 000 keys). Points are `x:y`
   normalised to the frame (Position) or the source (Anchor Point). Motion is `AE.ADBE Motion` (its
-  one boolean, Uniform Scale, has no name), Opacity `AE.ADBE Opacity`. Clip volume is the
+  one boolean, Uniform Scale, has no name; Premiere 25+ adds Crop Left / Top / Right / Bottom,
+  ParameterID 8–11, % of the source), Opacity `AE.ADBE Opacity`. Opacity has two parameters
+  named Blend Mode: ParameterID 2 holds the mode's code (menu order Normal, Dissolve, Darken… →
+  18, 6, 3, 17, 1, 13, 4, 11, 22, 2, 14, 12, 19, 23, 8, 24, 15, 20, 9, 5, 7, 25, 26, 10, 21, 0,
+  16), ParameterID 3 its menu position counting the five separators; older projects leave the
+  second stale, so the first is read (measured in Premiere 26.5). Effect colours have no alpha
+  (some projects save it as 0); they are read opaque. Clip volume is the
   `Internal Volume …` component's `Level`, linear gain where `0.177828` (the value on every untouched
   clip) is 0 dB: `dB = 20·log10(level / 0.177828)` (an observed convention). A clip can carry a second
   Motion / Opacity / volume; only the first maps.
@@ -259,7 +272,7 @@ A FilmCraft project that did not come from Premiere becomes a new `.prproj` (`pr
   templates and borrowed layouts, which nothing refers to, are dropped last.
 - Left out, and listed in the report: effects and transitions with no layout to borrow, graphics /
   titles, adjustment layers, generated media (clips of them), captions, submixes, track effects,
-  pan, mute and solo, time remapping, clip pan / channel volume, blend modes, masks, audio gain.
+  pan, mute and solo, time remapping, clip pan / channel volume, masks, audio gain.
 - Media paths: FilmCraft's local paths are written as the Premiere machine sees them, with the
   drive mapping the engine learns from the Premiere projects it has opened (a media path
   `L:\Editing\a.mp4` in one of them that exists here as `/mnt/LocalDisk/Editing/a.mp4` maps

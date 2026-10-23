@@ -177,18 +177,19 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 
 // ---- the other blend modes: W3C Compositing and Blending formulas on straight, sRGB-encoded
-// colour, exactly as `filmcraft_render::blend` (no recursion in WGSL, so helpers are split out).
+// colour with Premiere's differences, exactly as `filmcraft_render::blend` (no recursion in WGSL,
+// so helpers are split out).
 
 fn screen(b: f32, s: f32) -> f32 { return b + s - b * s; }
 
 fn color_burn(b: f32, s: f32) -> f32 {
-    if b >= 1.0 { return 1.0; }
+    if b >= 1.0 - 1e-4 { return 1.0; }
     if s <= 0.0 { return 0.0; }
     return 1.0 - min((1.0 - b) / s, 1.0);
 }
 
 fn color_dodge(b: f32, s: f32) -> f32 {
-    if b <= 0.0 { return 0.0; }
+    if b <= 1e-4 { return 0.0; }
     if s >= 1.0 { return 1.0; }
     return min(b / (1.0 - s), 1.0);
 }
@@ -212,34 +213,33 @@ fn sep(mode: u32, b: f32, s: f32) -> f32 {
         case 7u: { return max(b, s); }                       // Lighten
         case 8u: { return screen(b, s); }
         case 9u: { return color_dodge(b, s); }
-        case 10u: { return min(b + s, 1.0); }                // Linear Dodge (Add)
+        case 10u: { return b + s; }                          // Linear Dodge (Add, unclamped)
         case 12u: { return hard_light(s, b); }               // Overlay
-        case 13u: {                                          // Soft Light
+        case 13u: {                                          // Soft Light (Premiere's: √b)
             if s <= 0.5 { return b - (1.0 - 2.0 * s) * b * (1.0 - b); }
-            var d = sqrt(b);
-            if b <= 0.25 { d = ((16.0 * b - 12.0) * b + 4.0) * b; }
-            return b + (2.0 * s - 1.0) * (d - b);
+            return b + (2.0 * s - 1.0) * (sqrt(max(b, 0.0)) - b);
         }
         case 14u: { return hard_light(b, s); }
         case 15u: { return vivid_light(b, s); }
-        case 16u: { return clamp(b + 2.0 * s - 1.0, 0.0, 1.0); } // Linear Light
+        case 16u: { return b + 2.0 * s - 1.0; }              // Linear Light (unclamped)
         case 17u: {                                          // Pin Light
             if s <= 0.5 { return min(b, 2.0 * s); }
             return max(b, 2.0 * s - 1.0);
         }
-        case 18u: { return select(0.0, 1.0, vivid_light(b, s) >= 0.5); } // Hard Mix
+        case 18u: { return select(0.0, 1.0, b + s >= 1.0 - 1e-3); } // Hard Mix
         case 19u: { return abs(b - s); }                     // Difference
         case 20u: { return b + s - 2.0 * b * s; }            // Exclusion
-        case 21u: { return max(b - s, 0.0); }                // Subtract
-        case 22u: {                                          // Divide
-            if s <= 0.0 { return 1.0; }
-            return min(b / s, 1.0);
-        }
+        case 21u: { return b - s; }                          // Subtract (unclamped)
+        case 22u: { return b / max(s, 1e-4); }               // Divide (0 / 0 = 0, unclamped)
         default: { return s; }
     }
 }
 
-fn lum(c: vec3<f32>) -> f32 { return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b; }
+// Rec. 601 luma, exactly (Premiere's; the W3C rounds it to 0.3, 0.59, 0.11).
+fn lum(c: vec3<f32>) -> f32 { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// Rec. 709 luma: what Premiere's Darker and Lighter Color compare.
+fn luma709(c: vec3<f32>) -> f32 { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
 fn clip_color(c: vec3<f32>) -> vec3<f32> {
     let l = lum(c);
@@ -268,8 +268,8 @@ fn blend_rgb(mode: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
         case 24u: { return set_lum(set_sat(b, sat(s)), lum(b)); } // Saturation
         case 25u: { return set_lum(s, lum(b)); }                  // Color
         case 26u: { return set_lum(b, lum(s)); }                  // Luminosity
-        case 6u: { return select(b, s, lum(s) < lum(b)); }        // Darker Color
-        case 11u: { return select(b, s, lum(s) > lum(b)); }       // Lighter Color
+        case 6u: { return select(b, s, luma709(s) < luma709(b)); } // Darker Color
+        case 11u: { return select(b, s, luma709(s) > luma709(b)); } // Lighter Color
         default: { return vec3(sep(mode, b.r, s.r), sep(mode, b.g, s.g), sep(mode, b.b, s.b)); }
     }
 }
@@ -294,8 +294,14 @@ fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
     }
     let cs = linear_to_srgb(sp.rgb / sa);
     let cb = linear_to_srgb(d.rgb / da);
-    let mixed = srgb_to_linear(clamp(blend_rgb(u32(u.p3.x), cb, cs), vec3(0.0), vec3(1.0)));
-    return vec4(sp.rgb * (1.0 - da) + d.rgb * (1.0 - sa) + sa * da * mixed, sa + da - sa * da);
+    let mode = u32(u.p3.x);
+    let bl = blend_rgb(mode, cb, cs);
+    // Linear Dodge, Linear Light, Subtract and Divide go into the mix unclamped (as Premiere's do)
+    let b = select(clamp(bl, vec3(0.0), vec3(1.0)), bl, mode == 10u || mode == 16u || mode == 21u || mode == 22u);
+    // source-over of the blended colour on the encoded straight values, as Premiere mixes it
+    let ao = sa + da - sa * da;
+    let enc = (sa * (1.0 - da) * cs + (1.0 - sa) * da * cb + sa * da * b) / ao;
+    return vec4(srgb_to_linear(clamp(enc, vec3(0.0), vec3(1.0))) * ao, ao);
 }
 
 // ---- final pass: accumulator (linear premul) over black → sRGB target

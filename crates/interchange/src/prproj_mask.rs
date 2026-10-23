@@ -36,7 +36,7 @@ use filmcraft_project::{Keyframe, Mask, MaskMode, MaskPath, MaskVertex, Param, P
 use filmcraft_time::Tick;
 use roxmltree::Node;
 
-use crate::prproj_fx::{self, Conv, Ctx, MAX_TIME, STATIC_TIME};
+use crate::prproj_fx::{self, Conv, Ctx, STATIC_TIME};
 use crate::prproj_graph::Index;
 use crate::xml::child_text;
 
@@ -195,7 +195,7 @@ fn path_param<'a, 'i>(node: Node<'a, 'i>, ctx: &Ctx, binary: &mut dyn FnMut(Node
                 continue;
             }
             let Some(path) = crate::prproj_text::base64(b64.trim()).and_then(|b| decode(&b)) else { continue };
-            keys.push((Tick(ctx.clip_time(t.clamp(-MAX_TIME, MAX_TIME))), to_px(path)));
+            keys.push((Tick(prproj_fx::key_time(t)), to_px(path)));
         }
     }
     keys.sort_by_key(|k| k.0);

@@ -263,11 +263,14 @@ fn push_item(
     let mt = item.effect_time_at(t);
     let (op, own) = crate::opacity_blend(item, mt);
     let bl = blend.unwrap_or(own);
+    // Motion ▸ Crop is cut on the CPU (`item_layer`), as opacity masks are
+    let cropped = crate::motion_crop(item, mt).is_some();
     // A multi-camera clip that only shows its angle (no effects, untransformed, same frame size)
     // draws the angle's clip directly: no CPU pass over the nested sequence.
     if let Some(ItemKind::Sequence(nested)) = project.item(item.item).map(|p| &p.kind)
         && nest < crate::MAX_NEST_DEPTH
         && let Some(angle) = item.multicam_angle(nested)
+        && !cropped
         && !(opts.effects && item.has_standard_effects())
         && (nested.settings.width, nested.settings.height) == (seq.settings.width, seq.settings.height)
         && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), mt))
@@ -290,6 +293,7 @@ fn push_item(
         && item.multicam_angle(nested).is_none()
         && !(opts.effects && item.has_standard_effects())
         && !item.has_opacity_masks()
+        && !cropped
         && bl == Blend::Normal
         && extra_opacity * op >= 1.0 - 1e-6
         && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), mt))
@@ -315,6 +319,7 @@ fn push_item(
         && item.multicam_angle(nested).is_none()
         && !(opts.effects && item.has_standard_effects())
         && !item.has_opacity_masks()
+        && !cropped
         && nested.settings.color == seq.settings.color
         && layered_at(project, nested, ft)
     {
@@ -344,6 +349,7 @@ fn push_item(
     // image the GPU places as a layer.
     if !(opts.effects && item.has_standard_effects())
         && !item.has_opacity_masks()
+        && !cropped
         && project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Graphic { .. }))
     {
         let Some(size) = crate::source_size(project, item.item) else { return };
@@ -354,7 +360,7 @@ fn push_item(
         }
         return;
     }
-    if let Some(chain) = gpu_chain(project, item, opts) {
+    if let Some(chain) = gpu_chain(project, item, opts).filter(|_| !cropped) {
         let Some(src) = sources.source(item.item) else { return };
         let Some(size) = crate::source_size(project, item.item) else { return };
         let motion = motion_matrix(seq, item, size, mt);

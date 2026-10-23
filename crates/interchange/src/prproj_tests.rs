@@ -202,10 +202,14 @@ fn imports_bins_media_sequences_clips_and_effects() {
     assert_eq!((a.start, a.duration, a.source_in, a.speed, a.reverse), (Tick(0), Tick(5 * S), Tick(10 * S), 1.0, false));
     assert_eq!((b.start, b.duration, b.source_in, b.speed, b.reverse), (Tick(5 * S), Tick(2 * S), Tick(20 * S), 2.0, true));
 
-    // Motion: Scale keyframes move from source time (10 s, 12 s) to clip time (0 s, 2 s)
+    // Motion: Scale keyframes stay at their media times (10 s, 12 s), where FilmCraft plays them
     let scale = a.effect("motion").and_then(|e| e.params.get("scale")).unwrap();
     let keys: Vec<(Tick, f64)> = scale.keyframes.iter().map(|k| (k.time, k.value.as_f64().unwrap())).collect();
-    assert_eq!(keys, vec![(Tick(0), 100.0), (Tick(2 * S), 120.0)]);
+    assert_eq!(keys, vec![(Tick(10 * S), 100.0), (Tick(12 * S), 120.0)]);
+    // (one second into the clip it is on its way: before, keys came in at 0 s / 2 s and every
+    // keyed clip with an In point showed its last value throughout)
+    let halfway = scale.f64_at(a.effect_time_at(a.start + Tick(S)));
+    assert!(halfway > 100.5 && halfway < 119.5, "{halfway}");
     let pos = a.effect("motion").and_then(|e| e.params.get("position")).and_then(|p| p.value.as_vec2()).unwrap();
     assert_eq!((pos.x, pos.y), (480.0, 540.0));
     assert_eq!(a.effect("motion").and_then(|e| e.params.get("uniform_scale")).map(|p| p.value.clone()), Some(ParamValue::Bool(false)));
@@ -225,11 +229,11 @@ fn imports_bins_media_sequences_clips_and_effects() {
 
     assert!(report.mentions("RSMB Pro"), "{report}");
 
-    // a FilmCraft effect with the same name: eased keyframes in clip time (the clip plays its
-    // source at 2x, so source 20 s / 22 s are clip 0 s / 1 s), a boolean, and the choice reported
+    // a FilmCraft effect with the same name: eased keyframes at their media times (20 s / 22 s,
+    // which the clip plays at 2x), a boolean, and the choice reported
     let blur = b.effect("gaussian_blur").expect("Gaussian Blur imported");
     let keys = &blur.params["blurriness"].keyframes;
-    assert_eq!(keys.iter().map(|k| (k.time, k.value.as_f64().unwrap())).collect::<Vec<_>>(), vec![(Tick(0), 0.0), (Tick(S), 40.0)]);
+    assert_eq!(keys.iter().map(|k| (k.time, k.value.as_f64().unwrap())).collect::<Vec<_>>(), vec![(Tick(20 * S), 0.0), (Tick(22 * S), 40.0)]);
     assert_eq!((keys[0].interp, keys[1].interp), (Interpolation::Bezier, Interpolation::AutoBezier));
     assert_eq!((keys[1].in_influence, keys[1].out_influence), (0.25, 0.5));
     assert_eq!(blur.params["repeat_edge"].value, ParamValue::Bool(true));
@@ -512,14 +516,14 @@ fn effect_masks_come_in_with_their_shape_and_settings() {
     // the Object Mask is not carried over, and says so
     assert!(second.effect("opacity").is_some_and(|o| o.masks.is_empty()));
     assert!(report.to_string().contains("Object mask"), "{report}");
-    // the keyed rectangle: inverted, keys at clip times 0 and 2 s (source 10 s and 12 s)
+    // the keyed rectangle: inverted, keys at media times 10 and 12 s
     let tint = first.effect("tint").expect("the tint");
     let r = &tint.masks[0];
     assert!(r.inverted);
-    assert_eq!(r.path.keyframes.iter().map(|k| k.time).collect::<Vec<_>>(), vec![filmcraft_time::Tick(0), filmcraft_time::Tick(2 * S)]);
+    assert_eq!(r.path.keyframes.iter().map(|k| k.time).collect::<Vec<_>>(), vec![filmcraft_time::Tick(10 * S), filmcraft_time::Tick(12 * S)]);
     let at = |t| r.path_at(t).vertices[0].p;
-    assert!((at(filmcraft_time::Tick(0)) - Vec2::new(256.0, 144.0)).length() < 1e-3);
-    assert!((at(filmcraft_time::Tick(S)) - Vec2::new(0.3 * 2560.0, 144.0)).length() < 1e-3, "halfway");
+    assert!((at(filmcraft_time::Tick(10 * S)) - Vec2::new(256.0, 144.0)).length() < 1e-3);
+    assert!((at(filmcraft_time::Tick(11 * S)) - Vec2::new(0.3 * 2560.0, 144.0)).length() < 1e-3, "halfway");
 }
 
 /// Premiere's synthetic media: an adjustment layer (a master clip marked `IsAdjustmentLayer` over

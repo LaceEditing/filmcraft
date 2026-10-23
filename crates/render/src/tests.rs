@@ -94,6 +94,42 @@ fn motion_scale_and_position() {
     assert_eq!(img.get(200, 120)[3], 0.0, "rest transparent");
 }
 
+/// Motion ▸ Crop (Premiere 25+) cuts the source's edges away before Motion places it, with
+/// partly covered edge pixels; the render plan draws a cropped clip as the reference does.
+#[test]
+fn motion_crop_cuts_the_source_edges() {
+    let (mut p, red, ocean, seq, map) = setup();
+    place(&mut p, seq, 0, ocean, 0, 48);
+    let id = place(&mut p, seq, 1, red, 0, 48);
+    {
+        let s = p.sequence_mut(seq).unwrap();
+        let (_, it) = s.find_item_mut(id).unwrap();
+        let m = it.effect_mut("motion").unwrap();
+        for (k, v) in [("crop_left", 25.0), ("crop_top", 10.0), ("crop_bottom", 50.0), ("crop_right", 10.3)] {
+            m.params.insert(k.into(), filmcraft_project::Param::new(ParamValue::Float(v)));
+        }
+    }
+    let img = render_sequence(&p, seq, Tick(0), RenderOptions::default(), &map);
+    let red_at = |x: usize, y: usize| {
+        let c = img.get(x, y);
+        c[0] > 0.99 && c[1] < 1e-3 && c[2] < 1e-3
+    };
+    assert!(red_at(160, 50) && red_at(81, 19) && red_at(286, 89), "inside the crop");
+    for (x, y) in [(40, 50), (160, 10), (160, 120), (300, 50)] {
+        assert!(!red_at(x, y), "cropped away at {x},{y}: {:?}", img.get(x, y));
+    }
+    let plan = plan::plan_frame(&p, seq, Tick(0), RenderOptions::default(), &map);
+    let got = plan::execute_cpu(&plan);
+    let max = got.px.iter().zip(&img.px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(max < 0.02, "plan vs reference: {max}");
+    // right edge at 320 · (1 − 0.103) = 287.04: pixel 287 is 4 % red over the ocean
+    p.sequence_mut(seq).unwrap().find_item_mut(id).unwrap().1.enabled = false;
+    let ocean = render_sequence(&p, seq, Tick(0), RenderOptions::default(), &map).get(287, 50);
+    let edge = img.get(287, 50);
+    let want = [0.04 + 0.96 * ocean[0], 0.96 * ocean[1], 0.96 * ocean[2]];
+    assert!((0..3).all(|k| (edge[k] - want[k]).abs() < 0.01), "{edge:?} vs {want:?}");
+}
+
 #[test]
 fn cross_dissolve_midpoint() {
     let (mut p, red, _o, seq, map) = setup();

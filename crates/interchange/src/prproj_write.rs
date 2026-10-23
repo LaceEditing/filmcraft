@@ -1141,13 +1141,34 @@ impl<'a, 'i> Writer<'a, 'i> {
             if was == Some(it.label) || (was.is_none() && !self.new_items.contains_key(&it.id)) {
                 continue;
             }
-            let clips: Vec<Node<'a, 'i>> = self.all_master_clips_of(&uid, sequence).into_iter().flatten().collect();
-            if clips.iter().all(|c| crate::prproj::clip_label(*c) == Some(it.label)) {
-                continue;
+            // the Project panel shows its item's Label column, the clips carry their own
+            for (pi, clips) in self.all_master_clips_of(&uid, sequence) {
+                if crate::prproj::project_item_label(pi) != Some(it.label) {
+                    self.set_item_label(pi, it.label);
+                }
+                for c in clips.into_iter().filter(|c| crate::prproj::clip_label(*c) != Some(it.label)) {
+                    let inst = self.here(c);
+                    self.set_clip_label(inst, c, it.label);
+                }
             }
-            for c in clips {
-                let inst = self.here(c);
-                self.set_clip_label(inst, c, it.label);
+        }
+    }
+
+    /// Set a `ClipProjectItem`'s Label column (the label Premiere's Project panel shows), made
+    /// when it has none.
+    fn set_item_label(&mut self, pi: Node<'a, 'i>, label: filmcraft_project::Label) {
+        let (name, _) = crate::prproj::label_props(label);
+        let inst = self.here(pi);
+        let Some(body) = child(pi, "ProjectItem") else { return };
+        match self.ix.at(pi, &["ProjectItem", "Node", "Properties"]) {
+            Some(props) => self.set_child(inst, props, crate::prproj::PROJECT_LABEL_COLUMN, &name),
+            None => {
+                let column = crate::prproj::PROJECT_LABEL_COLUMN;
+                let props = format!("<{column}>{name}</{column}>");
+                match child(body, "Node") {
+                    Some(node) => self.insert(inst, node, &format!("<Properties Version=\"1\">{props}</Properties>")),
+                    None => self.insert_first(inst, body, &format!("<Node Version=\"1\"><Properties Version=\"1\">{props}</Properties></Node>")),
+                }
             }
         }
     }
@@ -1950,7 +1971,7 @@ impl<'a, 'i> Writer<'a, 'i> {
             return;
         };
         let chain_inst = self.inst_of(chain, copies);
-        let ctx = Ctx { source_in: c.source_in.0.max(0), speed: c.speed, frame, src: source_frame(project, c.item).unwrap_or(frame) };
+        let ctx = Ctx { speed: c.speed, frame, src: source_frame(project, c.item).unwrap_or(frame) };
         let comps = prproj_fx::chain(&self.ix, chain);
         let targets = prproj_fx::targets(&comps);
         // Motion, Opacity or clip volume changed on a clip Premiere saved without one
@@ -2254,8 +2275,9 @@ impl<'a, 'i> Writer<'a, 'i> {
         (Vec::new(), None)
     }
 
-    /// The clips of every master clip of a sequence or media (one per Project panel entry).
-    fn all_master_clips_of(&self, uid: &str, sequence: bool) -> Vec<Vec<Node<'a, 'i>>> {
+    /// Every Project panel entry of a sequence or media: its `ClipProjectItem` and its master
+    /// clip's clips.
+    fn all_master_clips_of(&self, uid: &str, sequence: bool) -> Vec<(Node<'a, 'i>, Vec<Node<'a, 'i>>)> {
         let mut out = Vec::new();
         for pi in self.root.children().filter(|n| n.has_tag_name("ClipProjectItem")) {
             let Some(master) = self.ix.follow(pi, &["MasterClip"]) else { continue };
@@ -2265,7 +2287,7 @@ impl<'a, 'i> Writer<'a, 'i> {
                 target.and_then(|t| t.attribute("ObjectUID")) == Some(uid)
             });
             if ours {
-                out.push(clips);
+                out.push((pi, clips));
             }
         }
         out

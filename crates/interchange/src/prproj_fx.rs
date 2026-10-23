@@ -342,6 +342,22 @@ pub(crate) enum Conv {
     FxDb,
     /// A pass-filter slope saved as dB/Oct ÷ 60 ↔ the index of the nearest [`SLOPE_DB`].
     Slope,
+    /// Opacity's blend mode as Premiere saves it (its first "Blend Mode": [`BLEND_CODES`]) ↔
+    /// FilmCraft's (the menu's order).
+    BlendCode,
+    /// Its second "Blend Mode": the menu position counting the separators.
+    BlendMenu,
+}
+
+/// Premiere's saved code of each blend mode, in the menu's (and FilmCraft's) order: Normal 18,
+/// Dissolve 6, Darken 3, Multiply 17… (measured in Premiere 26.5).
+const BLEND_CODES: [i64; 27] = [18, 6, 3, 17, 1, 13, 4, 11, 22, 2, 14, 12, 19, 23, 8, 24, 15, 20, 9, 5, 7, 25, 26, 10, 21, 0, 16];
+
+/// The menu position of each mode, counting the separators after Dissolve, Darker Color, Lighter
+/// Color, Hard Mix and Divide.
+fn blend_menu_position(index: usize) -> i64 {
+    let separators = [1usize, 6, 11, 18, 22].iter().filter(|s| index > **s).count();
+    (index + separators) as i64
 }
 
 /// Match name of Premiere's current Gaussian Blur (the one that is not "Legacy").
@@ -378,6 +394,9 @@ pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Ma
             add(named("Rotation"), "motion", "rotation", Conv::Float);
             add(named("Anchor Point"), "motion", "anchor", Conv::SourcePoint);
             add(named("Anti-flicker Filter"), "motion", "anti_flicker", Conv::Float);
+            for (name, id) in [("Crop Left", "crop_left"), ("Crop Top", "crop_top"), ("Crop Right", "crop_right"), ("Crop Bottom", "crop_bottom")] {
+                add(named(name), "motion", id, Conv::Float);
+            }
             // Uniform Scale is Motion's one boolean parameter; it is saved without a name.
             let uniform = c
                 .params
@@ -401,7 +420,14 @@ pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Ma
                 .find(|p| child_text(*p, "Name").is_none_or(|n| n.trim().is_empty()) && start_value(*p).is_some_and(|v| v == "true" || v == "false"));
             add(uniform, id, "uniform_scale", Conv::Bool);
         }
-        Target::Opacity => add(named("Opacity"), "opacity", "opacity", Conv::Float),
+        Target::Opacity => {
+            add(named("Opacity"), "opacity", "opacity", Conv::Float);
+            // two parameters named Blend Mode: the mode's code (read), then its menu position
+            // (kept up to date when the mode is written; older projects leave it stale)
+            let mut blend = c.params.iter().copied().filter(|p| child_text(*p, "Name").is_some_and(|n| n.trim().eq_ignore_ascii_case("Blend Mode")));
+            add(blend.next(), "opacity", "blend", Conv::BlendCode);
+            add(blend.next(), "opacity", "blend", Conv::BlendMenu);
+        }
         Target::Volume => add(named("Level"), "volume", "level", Conv::Db),
         Target::Effect(def) if def.id == "gaussian_blur" && c.match_name == IMPACT_BLUR => {
             // Premiere's current Gaussian Blur: Amount (and Thickness, the same with Uniform Blur
@@ -524,25 +550,21 @@ pub(crate) struct Canon {
     pub keys: Vec<Key>,
 }
 
-/// Clip timing and frame sizes needed to convert times and points.
+/// Clip speed and frame sizes needed to convert points (and compare key times).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ctx {
-    pub source_in: i64,
     pub speed: f64,
     pub frame: (f64, f64),
     pub src: (f64, f64),
 }
 
+/// A key's time in FilmCraft from Premiere's and back: both keep a clip's keyframes in its media
+/// time (where its In point is), so it is the same number, kept in range.
+pub(crate) fn key_time(t: i64) -> i64 {
+    t.clamp(-MAX_TIME, MAX_TIME)
+}
+
 impl Ctx {
-    pub(crate) fn clip_time(&self, t: i64) -> i64 {
-        let d = t.saturating_sub(self.source_in).clamp(-MAX_TIME, MAX_TIME);
-        if self.speed == 1.0 { d } else { ((d as f64 / self.speed).round() as i64).clamp(-MAX_TIME, MAX_TIME) }
-    }
-    fn source_time(&self, clip_t: i64) -> i64 {
-        let c = clip_t.clamp(-MAX_TIME, MAX_TIME);
-        let d = if self.speed == 1.0 { c } else { (c as f64 * self.speed).round() as i64 };
-        self.source_in.saturating_add(d).clamp(-MAX_TIME, MAX_TIME)
-    }
     /// How far apart two source times may be and still be the same key after a round trip.
     fn tolerance(&self) -> i64 {
         (self.speed.ceil() as i64).max(1) + 1
@@ -571,6 +593,7 @@ fn parse_val(s: &str, conv: Conv) -> Option<Val> {
             let n = s.trim_end_matches('.').parse::<i64>().ok()?;
             (n >= 0 && (n as usize) < len).then_some(Val::F(n as f64))
         }
+        Conv::BlendCode | Conv::BlendMenu => s.trim_end_matches('.').parse::<i64>().ok().filter(|n| (0..64).contains(n)).map(|n| Val::F(n as f64)),
         Conv::Color => s.parse::<u64>().ok().map(Val::C),
         Conv::Flag(on) => s.trim_end_matches('.').parse::<i64>().ok().map(|n| Val::F(if n == on { on as f64 } else { 0.0 })),
     }
@@ -652,12 +675,19 @@ fn to_value(v: &Val, conv: Conv, ctx: &Ctx) -> ParamValue {
         (Val::F(x), Conv::Db | Conv::FxDb) => ParamValue::Float(if *x > 0.0 { (20.0 * (x / UNITY_LEVEL).log10()).max(-200.0) } else { -200.0 }),
         (Val::F(x), Conv::Choice(_)) => ParamValue::Choice(x.round().max(0.0) as u32),
         (Val::F(x), Conv::Flag(on)) => ParamValue::Bool(x.round() as i64 == on),
-        (Val::C(c), _) => ParamValue::Color(unpack_color(*c)),
+        // an effect colour has no alpha in Premiere (some projects save it as 0): opaque
+        (Val::C(c), _) => {
+            let [r, g, b, _] = unpack_color(*c);
+            ParamValue::Color([r, g, b, 1.0])
+        }
         (Val::F(x), Conv::Scale(k)) => ParamValue::Float(x * k),
         (Val::F(n), Conv::Lin(lo, hi)) => ParamValue::Float(lo + (hi - lo) * n.clamp(0.0, 1.0)),
         (Val::F(n), Conv::Sq(lo, hi)) => ParamValue::Float(lo + (hi - lo) * n.clamp(0.0, 1.0).powi(2)),
         (Val::F(n), Conv::Ratio) => ParamValue::Float(12.0 * (0.5 + 1.5 * n.clamp(0.0, 1.0)).log2()),
         (Val::F(n), Conv::Slope) => ParamValue::Choice(nearest_slope(*n) as u32),
+        // (an unknown code is Normal)
+        (Val::F(code), Conv::BlendCode) => ParamValue::Choice(BLEND_CODES.iter().position(|c| *c == *code as i64).unwrap_or(0) as u32),
+        (Val::F(pos), Conv::BlendMenu) => ParamValue::Choice((0..BLEND_CODES.len()).find(|i| blend_menu_position(*i) == *pos as i64).unwrap_or(0) as u32),
         (Val::F(x), _) => ParamValue::Float(*x),
         (Val::B(b), _) => ParamValue::Bool(*b),
         (Val::P(x, y), Conv::FramePoint) => ParamValue::Vec2(Vec2::new(x * ctx.frame.0, y * ctx.frame.1)),
@@ -677,6 +707,8 @@ fn from_value(v: &ParamValue, conv: Conv, ctx: &Ctx) -> Option<Val> {
         (ParamValue::Float(semis), Conv::Ratio) => Val::F(((2f64.powf(semis.clamp(-12.0, 12.0) / 12.0) - 0.5) / 1.5).clamp(0.0, 1.0)),
         (ParamValue::Choice(n), Conv::Choice(len)) if (*n as usize) < len => Val::F(*n as f64),
         (ParamValue::Choice(n), Conv::Slope) => Val::F(SLOPE_DB.get(*n as usize)? / 60.0),
+        (ParamValue::Choice(n), Conv::BlendCode) => Val::F(*BLEND_CODES.get(*n as usize)? as f64),
+        (ParamValue::Choice(n), Conv::BlendMenu) if (*n as usize) < BLEND_CODES.len() => Val::F(blend_menu_position(*n as usize) as f64),
         (ParamValue::Color(c), Conv::Color) => Val::C(pack_color(*c)),
         (ParamValue::Bool(b), Conv::Bool) => Val::B(*b),
         (ParamValue::Bool(b), Conv::Flag(on)) => Val::F(if *b { on as f64 } else { 0.0 }),
@@ -690,7 +722,7 @@ fn from_value(v: &ParamValue, conv: Conv, ctx: &Ctx) -> Option<Val> {
 pub(crate) fn to_param(c: &Canon, conv: Conv, ctx: &Ctx) -> Param {
     let mut p = Param::new(to_value(&c.value, conv, ctx));
     for k in &c.keys {
-        let mut kf = Keyframe::new(filmcraft_time::Tick(ctx.clip_time(k.t)), to_value(&k.v, conv, ctx));
+        let mut kf = Keyframe::new(filmcraft_time::Tick(key_time(k.t)), to_value(&k.v, conv, ctx));
         kf.interp = interp_of(k.kind);
         if kf.interp != Interpolation::Linear {
             if k.infl.0 > 0.0 {
@@ -716,7 +748,7 @@ pub(crate) fn from_param(p: &Param, conv: Conv, ctx: &Ctx) -> Option<Canon> {
     let mut keys = Vec::with_capacity(p.keyframes.len());
     for k in &p.keyframes {
         keys.push(Key {
-            t: ctx.source_time(k.time.0),
+            t: key_time(k.time.0),
             v: from_value(&k.value, conv, ctx)?,
             kind: kind_of(k.interp),
             infl: if k.interp == Interpolation::Linear { (0.0, 0.0) } else { (k.in_influence, k.out_influence) },
@@ -735,7 +767,8 @@ fn same_val(a: &Val, b: &Val) -> bool {
         (Val::F(x), Val::F(y)) => close(*x, *y),
         (Val::P(x1, y1), Val::P(x2, y2)) => close(*x1, *x2) && close(*y1, *y2),
         (Val::B(x), Val::B(y)) => x == y,
-        (Val::C(x), Val::C(y)) => x == y,
+        // the colour itself, to 8 bits (its saved alpha means nothing)
+        (Val::C(x), Val::C(y)) => unpack_color(*x).iter().zip(unpack_color(*y)).take(3).all(|(a, b)| (a - b).abs() < 0.6 / 255.0),
         _ => false,
     }
 }

@@ -1,8 +1,14 @@
 //! Blend modes (Premiere's 27), composited on premultiplied linear-light images.
 //!
 //! Normal is computed in linear light. The other modes are defined on display-encoded values (as
-//! artists expect from every editing app), so their math runs on sRGB-encoded straight colour and
-//! the result is converted back to linear. Formulas follow the W3C Compositing and Blending spec.
+//! artists expect from every editing app), so their math runs on sRGB-encoded straight colour, and,
+//! as in Premiere (with Composite in Linear Color on or off), the result is mixed with the
+//! backdrop by the top layer's alpha on those encoded values too, then converted back to linear.
+//! Formulas follow the W3C Compositing and Blending spec, with Premiere's measured differences:
+//! Darker/Lighter Color compare Rec. 709 luma, the other non-separable modes exact Rec. 601 luma,
+//! Soft Light is Photoshop's (√b), Hard Mix is
+//! `b + s ≥ 1`, 0 ÷ 0 is 0, and Linear Dodge, Linear Light, Subtract and Divide are not clamped
+//! before the mix.
 
 use filmcraft_color::{linear_to_srgb, srgb_to_linear};
 use rayon::prelude::*;
@@ -85,13 +91,26 @@ impl Blend {
     }
 }
 
+/// Hard Mix's tolerance below `b + s = 1`.
+pub const HARD_MIX_SLACK: f32 = 1e-3;
+/// Divide's smallest divisor.
+pub const DIVIDE_FLOOR: f32 = 1e-4;
+/// How near black or white a backdrop counts as it for Color Burn and Color Dodge (an 8-bit
+/// white comes back from linear a hair under 1).
+pub const EDGE_SLACK: f32 = 1e-4;
+
+/// Whether a mode's result goes into the alpha mix unclamped (as Premiere's does).
+pub fn unclamped(mode: Blend) -> bool {
+    matches!(mode, Blend::LinearDodge | Blend::LinearLight | Blend::Subtract | Blend::Divide)
+}
+
 #[inline]
 fn sep(mode: Blend, b: f32, s: f32) -> f32 {
     match mode {
         Blend::Darken => b.min(s),
         Blend::Multiply => b * s,
         Blend::ColorBurn => {
-            if b >= 1.0 {
+            if b >= 1.0 - EDGE_SLACK {
                 1.0
             } else if s <= 0.0 {
                 0.0
@@ -103,7 +122,7 @@ fn sep(mode: Blend, b: f32, s: f32) -> f32 {
         Blend::Lighten => b.max(s),
         Blend::Screen => b + s - b * s,
         Blend::ColorDodge => {
-            if b <= 0.0 {
+            if b <= EDGE_SLACK {
                 0.0
             } else if s >= 1.0 {
                 1.0
@@ -111,7 +130,7 @@ fn sep(mode: Blend, b: f32, s: f32) -> f32 {
                 (b / (1.0 - s)).min(1.0)
             }
         }
-        Blend::LinearDodge => (b + s).min(1.0),
+        Blend::LinearDodge => b + s,
         Blend::Overlay => sep(Blend::HardLight, s, b),
         Blend::HardLight => {
             if s <= 0.5 {
@@ -120,12 +139,12 @@ fn sep(mode: Blend, b: f32, s: f32) -> f32 {
                 sep(Blend::Screen, b, 2.0 * s - 1.0)
             }
         }
+        // Premiere's (and Photoshop's): √b throughout, not the W3C's cubic below ¼
         Blend::SoftLight => {
             if s <= 0.5 {
                 b - (1.0 - 2.0 * s) * b * (1.0 - b)
             } else {
-                let d = if b <= 0.25 { ((16.0 * b - 12.0) * b + 4.0) * b } else { b.sqrt() };
-                b + (2.0 * s - 1.0) * (d - b)
+                b + (2.0 * s - 1.0) * (b.max(0.0).sqrt() - b)
             }
         }
         Blend::VividLight => {
@@ -135,7 +154,7 @@ fn sep(mode: Blend, b: f32, s: f32) -> f32 {
                 sep(Blend::ColorDodge, b, 2.0 * s - 1.0)
             }
         }
-        Blend::LinearLight => (b + 2.0 * s - 1.0).clamp(0.0, 1.0),
+        Blend::LinearLight => b + 2.0 * s - 1.0,
         Blend::PinLight => {
             if s <= 0.5 {
                 b.min(2.0 * s)
@@ -143,8 +162,9 @@ fn sep(mode: Blend, b: f32, s: f32) -> f32 {
                 b.max(2.0 * s - 1.0)
             }
         }
+        // (8-bit inputs summing to exactly 255 are white: allow for the trip through linear)
         Blend::HardMix => {
-            if sep(Blend::VividLight, b, s) >= 0.5 {
+            if b + s >= 1.0 - HARD_MIX_SLACK {
                 1.0
             } else {
                 0.0
@@ -152,21 +172,23 @@ fn sep(mode: Blend, b: f32, s: f32) -> f32 {
         }
         Blend::Difference => (b - s).abs(),
         Blend::Exclusion => b + s - 2.0 * b * s,
-        Blend::Subtract => (b - s).max(0.0),
-        Blend::Divide => {
-            if s <= 0.0 {
-                1.0
-            } else {
-                (b / s).min(1.0)
-            }
-        }
+        Blend::Subtract => b - s,
+        // 0 ÷ 0 is 0, anything else ÷ 0 is far above white
+        Blend::Divide => b / s.max(DIVIDE_FLOOR),
         _ => s,
     }
 }
 
+/// The non-separable modes' luminosity: Rec. 601 luma, exactly (Premiere's; the W3C rounds it to
+/// 0.3, 0.59, 0.11).
 #[inline]
 fn lum(c: [f32; 3]) -> f32 {
-    0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+    0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+}
+/// Rec. 709 luma: what Premiere's Darker and Lighter Color compare.
+#[inline]
+fn luma709(c: [f32; 3]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 fn clip_color(c: [f32; 3]) -> [f32; 3] {
     let l = lum(c);
@@ -213,14 +235,14 @@ pub fn blend_rgb(mode: Blend, b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
         Blend::Color => set_lum(s, lum(b)),
         Blend::Luminosity => set_lum(b, lum(s)),
         Blend::DarkerColor => {
-            if lum(s) < lum(b) {
+            if luma709(s) < luma709(b) {
                 s
             } else {
                 b
             }
         }
         Blend::LighterColor => {
-            if lum(s) > lum(b) {
+            if luma709(s) > luma709(b) {
                 s
             } else {
                 b
@@ -268,11 +290,14 @@ pub fn composite(dst: &mut Image, src: &Image, opacity: f32, mode: Blend) {
             let cs = [linear_to_srgb(sp[0] / sa), linear_to_srgb(sp[1] / sa), linear_to_srgb(sp[2] / sa)];
             let cb = [linear_to_srgb(d[i] / da), linear_to_srgb(d[i + 1] / da), linear_to_srgb(d[i + 2] / da)];
             let bl = blend_rgb(mode, cb, cs);
+            let ao = sa + da - sa * da;
             for c in 0..3 {
-                let mixed = srgb_to_linear(bl[c].clamp(0.0, 1.0));
-                d[i + c] = sp[c] * (1.0 - da) + d[i + c] * (1.0 - sa) + sa * da * mixed;
+                let b = if unclamped(mode) { bl[c] } else { bl[c].clamp(0.0, 1.0) };
+                // source-over of the blended colour, on the encoded straight values
+                let enc = (sa * (1.0 - da) * cs[c] + (1.0 - sa) * da * cb[c] + sa * da * b) / ao;
+                d[i + c] = srgb_to_linear(enc.clamp(0.0, 1.0)) * ao;
             }
-            d[i + 3] = sa + da - sa * da;
+            d[i + 3] = ao;
         }
     });
 }
@@ -299,6 +324,46 @@ mod tests {
         for k in 0..3 {
             assert!((p[k] - base[k]).abs() < 1e-4);
         }
+    }
+
+    /// `top` (8-bit sRGB, straight alpha) over an opaque `bottom` with `mode`, back in 8-bit.
+    fn over8(mode: Blend, bottom: [u8; 3], top: [u8; 3], alpha: f32) -> [i32; 3] {
+        let lin = |c: [u8; 3], a: f32| [0, 1, 2].map(|k| srgb_to_linear(c[k] as f32 / 255.0) * a).into_iter().chain([a]).collect::<Vec<_>>();
+        let b = lin(bottom, 1.0);
+        let t = lin(top, alpha);
+        let mut d = Image::filled(1, 1, [b[0], b[1], b[2], 1.0]);
+        composite(&mut d, &Image::filled(1, 1, [t[0], t[1], t[2], alpha]), 1.0, mode);
+        let p = d.get(0, 0);
+        [0, 1, 2].map(|k| (linear_to_srgb(p[k] / p[3]) * 255.0).round() as i32)
+    }
+
+    /// Pixels Premiere 26.5 made (Round 4 blend kit), to a level.
+    #[test]
+    fn modes_match_premiere_pixels() {
+        let near = |got: [i32; 3], want: [i32; 3], what: &str| {
+            assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 1), "{what}: {got:?}, Premiere {want:?}");
+        };
+        // the blend is mixed with the backdrop by the top's alpha on encoded values
+        near(over8(Blend::Multiply, [71; 3], [0, 54, 54], 0.5), [35, 43, 43], "Multiply at 50 %");
+        near(over8(Blend::LinearBurn, [71; 3], [0, 54, 54], 0.5), [35, 35, 35], "Linear Burn at 50 %");
+        // Linear Dodge, Linear Light, Subtract and Divide go into that mix unclamped
+        near(over8(Blend::LinearLight, [71; 3], [0, 54, 54], 0.5), [0, 0, 0], "Linear Light at 50 %");
+        near(over8(Blend::LinearDodge, [195; 3], [0, 0, 70], 0.5), [195, 195, 230], "Linear Dodge at 50 %");
+        near(over8(Blend::Subtract, [9; 3], [70; 3], 0.5), [0, 0, 0], "Subtract at 50 %");
+        assert!((over8(Blend::Divide, [71; 3], [0, 54, 54], 0.5)[1] - 204).abs() <= 1, "Divide at 50 %");
+        // Darker / Lighter Color compare Rec. 709 luma
+        near(over8(Blend::DarkerColor, [0, 87, 217], [254, 0, 0], 1.0), [254, 0, 0], "Darker Color");
+        near(over8(Blend::LighterColor, [0, 87, 217], [254, 0, 0], 1.0), [0, 87, 217], "Lighter Color");
+        // Hue, Color and Luminosity weigh luminosity by Rec. 601
+        near(over8(Blend::Hue, [0, 68, 217], [255, 0, 0], 1.0), [216, 0, 0], "Hue");
+        near(over8(Blend::Color, [0, 87, 217], [255, 0, 0], 1.0), [254, 0, 0], "Color");
+        near(over8(Blend::Luminosity, [217, 147, 0], [255, 255, 0], 1.0), [255, 224, 159], "Luminosity");
+        // Soft Light lifts the darkest values by √b; white stays white under Color Burn
+        near(over8(Blend::SoftLight, [217, 1, 4], [255; 3], 1.0), [235, 16, 32], "Soft Light");
+        near(over8(Blend::ColorBurn, [255; 3], [0; 3], 0.5), [255; 3], "Color Burn on white");
+        // Hard Mix is white from b + s = 1; 0 ÷ 0 is black, anything else ÷ 0 white
+        near(over8(Blend::HardMix, [205; 3], [50, 49, 51], 1.0), [255, 0, 255], "Hard Mix");
+        near(over8(Blend::Divide, [0, 0, 90], [0, 200, 0], 1.0), [0, 0, 255], "Divide by zero");
     }
 
     #[test]

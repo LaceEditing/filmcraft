@@ -31,7 +31,7 @@ pub const SHAPE_OPTS: &[&str] = &["Rectangle", "Ellipse", "Polygon", "Path"];
 /// A title's Vector Motion (Premiere's transform of all its layers together).
 pub const VECTOR_MOTION: &str = "vector_motion";
 
-/// The transform a title's Vector Motion applies to all its layers at clip time `t` (graphic
+/// The transform a title's Vector Motion applies to all its layers at media time `t` (graphic
 /// pixels → graphic pixels), when it has one that is switched on and not at its defaults.
 pub fn group_transform(effects: &[EffectInstance], t: Tick, canvas: (u32, u32)) -> Option<filmcraft_geom::Affine> {
     let e = effects.iter().find(|e| e.effect == VECTOR_MOTION && e.enabled)?;

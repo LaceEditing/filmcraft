@@ -1,6 +1,7 @@
 //! Keyframed parameters.
 //!
-//! A parameter is a static value or a list of keyframes (clip-relative ticks). Interpolation per
+//! A parameter is a static value or a list of keyframes (at the clip's media time: where its
+//! `source_in` is, so trims leave them in place). Interpolation per
 //! keyframe governs the segment leaving it: Linear, Hold, Bezier (with influence/speed handles),
 //! Auto Bezier, Continuous Bezier, Ease In/Out (Bezier presets) — Premiere's temporal set.
 
@@ -142,7 +143,8 @@ impl Interpolation {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
-    /// Time relative to the start of the track item (clip time).
+    /// Media time (the clip's source time; [`crate::TrackItem::effect_time_at`] gives it for a
+    /// timeline time).
     pub time: Tick,
     pub value: ParamValue,
     /// Interpolation of the segment leaving this keyframe.
@@ -247,7 +249,7 @@ impl Param {
         }
     }
 
-    /// Evaluate at clip time `t`.
+    /// Evaluate at media time `t`.
     pub fn value_at(&self, t: Tick) -> ParamValue {
         let k = &self.keyframes;
         if k.is_empty() {

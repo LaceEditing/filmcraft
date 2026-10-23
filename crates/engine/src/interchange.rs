@@ -464,15 +464,21 @@ pub fn export_prproj(s: &mut Session, p: &Value) -> Result<Value> {
 /// 0,0 in its own titles) and paragraph text by the top-left corner of its box; a FilmCraft text
 /// layer may be placed either way (`top_left_origin`). Layers placed the other way are given to
 /// the writer measured as Premiere measures them, their anchor moved so the text stays where it
-/// is. None: every text layer already is. (Point text measured from its top-left came out one
-/// line high in Premiere.)
+/// is. A paragraph box with no height (FilmCraft's, as tall as its lines) gets the height of its
+/// lines, or Premiere would hide those that do not fit. None: every text layer already is as
+/// Premiere has it. (Point text measured from its top-left came out one line high in Premiere.)
 pub(crate) fn titles_for_premiere(project: &filmcraft_project::Project) -> Option<filmcraft_project::Project> {
     use filmcraft_project::{ParamValue, graphic};
-    let wrong = |e: &filmcraft_project::EffectInstance| {
-        let top_left = matches!(e.params.get("top_left_origin").map(|p| &p.value), Some(ParamValue::Bool(true)));
-        let paragraph = matches!(e.params.get("box_width").map(|p| &p.value), Some(ParamValue::Float(w)) if *w > 0.0);
-        e.effect == graphic::TEXT_LAYER && top_left != paragraph
+    let float = |e: &filmcraft_project::EffectInstance, id: &str| match e.params.get(id).map(|p| &p.value) {
+        Some(ParamValue::Float(v)) => *v,
+        _ => 0.0,
     };
+    let misplaced = |e: &filmcraft_project::EffectInstance| {
+        let top_left = matches!(e.params.get("top_left_origin").map(|p| &p.value), Some(ParamValue::Bool(true)));
+        top_left != (float(e, "box_width") > 0.0)
+    };
+    let no_height = |e: &filmcraft_project::EffectInstance| float(e, "box_width") > 0.0 && float(e, "box_height") <= 0.0;
+    let wrong = |e: &filmcraft_project::EffectInstance| e.effect == graphic::TEXT_LAYER && (misplaced(e) || no_height(e));
     let any =
         project.sequences().filter_map(|i| i.as_sequence()).flat_map(|q| q.all_tracks()).flat_map(|t| t.items.iter()).flat_map(|c| c.effects.iter()).any(wrong);
     if !any {
@@ -487,6 +493,16 @@ pub(crate) fn titles_for_premiere(project: &filmcraft_project::Project) -> Optio
                 for e in c.effects.iter_mut().filter(|e| wrong(e)) {
                     let Some(spec) = graphic::eval_layer(e, filmcraft_time::Tick(0), frame) else { continue };
                     let graphic::LayerContent::Text(tp) = &spec.content else { continue };
+                    if no_height(e) {
+                        // as tall as FilmCraft shows it, aligned to the top as FilmCraft aligns it
+                        let lay = filmcraft_render::graphic_clip::text_layout(tp);
+                        let Some(b) = filmcraft_render::graphic_clip::paragraph_box(tp, &lay) else { continue };
+                        e.params.insert("box_height".into(), filmcraft_project::Param::new(ParamValue::Float(f64::from(b[3] - b[1]))));
+                        e.params.insert("valign".into(), filmcraft_project::Param::new(ParamValue::Choice(0)));
+                    }
+                    if !misplaced(e) {
+                        continue;
+                    }
                     // the top-left origin's offset from the baseline one
                     let (ox, oy) = filmcraft_render::graphic_clip::layer_origin(&graphic::LayerSpec {
                         content: graphic::LayerContent::Text(graphic::TextProps { top_left_origin: true, ..tp.clone() }),

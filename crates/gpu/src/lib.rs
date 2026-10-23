@@ -12,7 +12,8 @@
 //! other 25 modes need the colour under the layer: before such a layer is drawn, the accumulator
 //! region under its quad is copied into a backdrop texture, and the fragment shader composites
 //! with the CPU reference's math (`filmcraft_render::blend::composite`: sRGB-encoded straight
-//! colour, W3C formulas, back to linear) and writes the result. Only those layers pay the copy.
+//! colour, W3C formulas with Premiere's differences, mixed by alpha on the encoded values, back to
+//! linear) and writes the result. Only those layers pay the copy.
 //!
 //! A layer carrying standard effects ([`filmcraft_render::plan::LayerFx`]) goes through the
 //! effect stage ([`fx`]) first: its source is drawn into an `Rgba32Float` working image, the

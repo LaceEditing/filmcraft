@@ -403,9 +403,31 @@ pub fn resolve(family: &str, style: &str) -> Resolved {
             return r;
         }
     }
+    // a missing family is still missing, but laid out with an installed font of the same metrics
+    // when there is one (Arial's lines wrap where Premiere wraps them)
+    if let Some(mut r) = metric_substitutes(family).iter().find_map(|f| resolve_in(f, style)) {
+        r.missing = true;
+        return r;
+    }
     let mut r = resolve_in(DEFAULT_FAMILY, style).unwrap_or(Resolved { face: 0, synth_bold: false, synth_italic: false, missing: true });
     r.missing = !family.is_empty() && !family.eq_ignore_ascii_case(DEFAULT_FAMILY);
     r
+}
+
+/// Openly licensed families drawn to the same metrics (every advance width) as a common
+/// proprietary one, best first.
+pub fn metric_substitutes(family: &str) -> &'static [&'static str] {
+    match family.trim().to_ascii_lowercase().as_str() {
+        "arial" | "helvetica" | "arial mt" => &["Liberation Sans", "Arimo"],
+        "arial narrow" => &["Liberation Sans Narrow"],
+        "times new roman" | "times" => &["Liberation Serif", "Tinos"],
+        "courier new" | "courier" => &["Liberation Mono", "Cousine"],
+        "calibri" => &["Carlito"],
+        "cambria" => &["Caladea"],
+        "georgia" => &["Gelasio"],
+        "segoe ui" => &["Selawik"],
+        _ => &[],
+    }
 }
 
 fn resolve_in(family: &str, style: &str) -> Option<Resolved> {
@@ -533,6 +555,29 @@ mod tests {
         let r = resolve("No Such Font Family 123", "Regular");
         assert_eq!(face(r.face).info.family, "Inter");
         assert!(r.missing);
+    }
+
+    /// A missing Arial is laid out with an installed font of Arial's metrics (and still reported
+    /// missing); with none installed, Inter.
+    #[test]
+    fn missing_arial_uses_a_metric_compatible_font() {
+        assert_eq!(metric_substitutes(" Arial "), ["Liberation Sans", "Arimo"]);
+        assert!(metric_substitutes("Inter").is_empty());
+        let r = resolve("Arial", "Bold");
+        let f = face(r.face);
+        if f.info.family.eq_ignore_ascii_case("Arial") {
+            assert!(!r.missing, "Arial is installed here");
+            return;
+        }
+        assert!(r.missing);
+        let installed = all_faces().iter().any(|x| metric_substitutes("Arial").iter().any(|s| x.info.family.eq_ignore_ascii_case(s)));
+        if installed {
+            assert!(metric_substitutes("Arial").iter().any(|s| f.info.family.eq_ignore_ascii_case(s)), "{}", f.info.family);
+            assert!(f.info.weight >= 600, "the bold face: {}", f.info.style);
+        } else {
+            assert_eq!(f.info.family, "Inter");
+        }
+        assert_eq!(postscript_name("Arial", "Bold"), None, "a substitute never names itself as Arial");
     }
 
     /// Native: the system scan reads name tables only and resolves families installed there.

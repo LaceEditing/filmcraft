@@ -209,10 +209,15 @@ fn adjustment_region(seq: &Sequence, item: &TrackItem, project: &Project, mt: Ti
         && m.c.abs() < 1e-12
         && m.e.abs() < 1e-9
         && m.f.abs() < 1e-9;
-    if full {
+    let crop = motion_crop(item, mt);
+    if full && crop.is_none() {
         return None;
     }
-    Some(Image::filled(fw, fh, [1.0; 4]).transformed(w, h, &m))
+    let mut cover = Image::filled(fw, fh, [1.0; 4]);
+    if let Some(c) = crop {
+        apply_crop(&mut cover, c);
+    }
+    Some(cover.transformed(w, h, &m))
 }
 
 /// Rendered captions of the visible caption tracks at `t` for a `w`×`h` output.
@@ -226,6 +231,34 @@ pub fn caption_overlays(seq: &Sequence, t: Tick, w: usize, h: usize) -> Vec<film
 fn with_opacity(mut img: Image, op: f32) -> Image {
     img.scale_alpha(op);
     img
+}
+
+/// Motion ▸ Crop at media time `mt`: the fractions of the source cut from its left, top, right and
+/// bottom. None: nothing is cropped.
+pub fn motion_crop(item: &TrackItem, mt: Tick) -> Option<[f32; 4]> {
+    let e = item.effect("motion").filter(|e| e.enabled)?;
+    let c = ["crop_left", "crop_top", "crop_right", "crop_bottom"].map(|id| e.param(id).map_or(0.0, |p| (p.f64_at(mt) / 100.0).clamp(0.0, 1.0) as f32));
+    c.iter().any(|v| *v > 1e-6).then_some(c)
+}
+
+/// Cut a crop (see [`motion_crop`]) out of an image of the source: what lies outside goes
+/// transparent, edge pixels by how much of them is left.
+pub fn apply_crop(img: &mut Image, crop: [f32; 4]) {
+    let (w, h) = (img.w as f32, img.h as f32);
+    let (x0, y0, x1, y1) = (crop[0] * w, crop[1] * h, (1.0 - crop[2]) * w, (1.0 - crop[3]) * h);
+    // the share of pixel i (spanning i..i+1) inside lo..hi
+    let cover = |i: usize, lo: f32, hi: f32| ((i as f32 + 1.0).min(hi) - (i as f32).max(lo)).clamp(0.0, 1.0);
+    let cols: Vec<f32> = (0..img.w).map(|x| cover(x, x0, x1)).collect();
+    let row_len = img.w * 4;
+    for (y, row) in img.px.chunks_mut(row_len.max(1)).enumerate() {
+        let cy = cover(y, y0, y1);
+        for (px, cx) in row.chunks_mut(4).zip(&cols) {
+            let k = cy * cx;
+            if k < 1.0 {
+                px.iter_mut().for_each(|v| *v *= k);
+            }
+        }
+    }
 }
 
 pub(crate) fn opacity_blend(item: &TrackItem, mt: Tick) -> (f32, Blend) {
@@ -303,7 +336,8 @@ pub(crate) fn item_layer(
     let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
     let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
     let pi = project.item(item.item)?;
-    if matches!(pi.kind, ItemKind::Graphic { .. }) && !(item.has_opacity_masks() || opts.effects && item.has_standard_effects()) {
+    let crop = motion_crop(item, mt);
+    if matches!(pi.kind, ItemKind::Graphic { .. }) && crop.is_none() && !(item.has_opacity_masks() || opts.effects && item.has_standard_effects()) {
         // vectors straight to the output: no resampling, crisp at any Motion scale
         let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion);
         let mut canvas = Image::new(w, h);
@@ -335,6 +369,10 @@ pub(crate) fn item_layer(
         }
     }
     mask::apply_opacity_masks(&mut layer, item, mt, px_scale);
+    // (Motion follows the standard effects: its crop cuts their result)
+    if let Some(c) = crop {
+        apply_crop(&mut layer, c);
+    }
     let placed = if layer.w == w
         && layer.h == h
         && (m.a - 1.0).abs() < 1e-9

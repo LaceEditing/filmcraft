@@ -243,8 +243,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let Some(master) = self.ix.follow(item, &["MasterClip"]) else { return };
         let markers = self.master_markers(master);
         let clips = self.ix.list(master, &["Clips"], "Clip");
-        // the item's label (the Project panel's): its master clip's
-        let label = clips.iter().find_map(|c| clip_label(*c));
+        // the item's label: the Project panel's, else its master clip's
+        let label = project_item_label(item).or_else(|| clips.iter().find_map(|c| clip_label(*c)));
         for clip in clips {
             if let Some(seq) = prproj_graph::clip_sequence(&self.ix, clip) {
                 if let Some(uid) = seq.attribute("ObjectUID") {
@@ -682,7 +682,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         {
             ti.link = Some(*g);
         }
-        let ctx = Ctx { source_in, speed: ti.speed, frame, src: self.source_frame(target).unwrap_or(frame) };
+        let ctx = Ctx { speed: ti.speed, frame, src: self.source_frame(target).unwrap_or(frame) };
         if let Some(chain) = self.ix.follow(item, &["ClipTrackItem", "ComponentOwner", "Components"]) {
             self.components(&mut ti, chain, &ctx);
         }
@@ -930,7 +930,20 @@ pub(crate) fn rate_of(ticks_per_frame: i64) -> Option<FrameRate> {
 /// Premiere's label of a clip object (`Clip ▸ Node ▸ Properties ▸ asl.clip.label.name`: a
 /// `BE.Prefs.LabelColors.N` index into its sixteen labels, in the order of [`Label::ALL`]).
 pub(crate) fn clip_label(clip: Node<'_, '_>) -> Option<Label> {
-    let name = path_text(clip, &["Clip", "Node", "Properties", "asl.clip.label.name"])?;
+    label_named(path_text(clip, &["Clip", "Node", "Properties", "asl.clip.label.name"])?)
+}
+
+/// The label Premiere's Project panel shows for a `ClipProjectItem` (its Label column,
+/// `ProjectItem ▸ Node ▸ Properties ▸ Column.PropertyText.Label`), which can differ from its
+/// master clip's.
+pub(crate) fn project_item_label(item: Node<'_, '_>) -> Option<Label> {
+    label_named(path_text(item, &["ProjectItem", "Node", "Properties", PROJECT_LABEL_COLUMN])?)
+}
+
+/// The Project panel's Label column in a `ClipProjectItem`'s properties.
+pub(crate) const PROJECT_LABEL_COLUMN: &str = "Column.PropertyText.Label";
+
+fn label_named(name: &str) -> Option<Label> {
     let n: usize = name.trim().strip_prefix("BE.Prefs.LabelColors.")?.parse().ok()?;
     Label::ALL.get(n).copied()
 }
