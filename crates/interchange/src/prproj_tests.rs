@@ -74,7 +74,7 @@ pub(crate) fn doc() -> String {
     <Component><Params><Param Index="0" ObjectRef="46"/><Param Index="1" ObjectRef="45"/><Param Index="2" ObjectRef="47"/></Params><DisplayName>Motion</DisplayName></Component>
     <MatchName>AE.ADBE Motion</MatchName>
   </VideoFilterComponent>
-  <VideoComponentParam ObjectID="45"><Name>Scale</Name><StartKeyframe>-91445760000000000,100,0,0,0,0,0,0</StartKeyframe><Keyframes>{s10},100,0,0,0,0.1,1.5,0.1;{s12},120,0,0,1.5,0.1,0,0.1;</Keyframes></VideoComponentParam>
+  <VideoComponentParam ObjectID="45"><Name>Scale</Name><IsTimeVarying>true</IsTimeVarying><StartKeyframe>-91445760000000000,100,0,0,0,0,0,0</StartKeyframe><Keyframes>{s10},100,0,0,0,0.1,1.5,0.1;{s12},120,0,0,1.5,0.1,0,0.1;</Keyframes></VideoComponentParam>
   <PointComponentParam ObjectID="46"><Name>Position</Name><StartKeyframe>-91445760000000000,0.25:0.5,0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe></PointComponentParam>
   <VideoComponentParam ObjectID="47"><Name> </Name><StartKeyframe>-91445760000000000,false,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoFilterComponent ObjectID="48"><Component><Params/><DisplayName>RSMB Pro</DisplayName></Component><MatchName>RE:Vision RSMB Pro</MatchName></VideoFilterComponent>
@@ -92,7 +92,7 @@ pub(crate) fn doc() -> String {
   <VideoComponentParam ObjectID="102"><Name>Map White To</Name><StartKeyframe>-91445760000000000,18374966857753992192,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoComponentParam ObjectID="103"><Name>Amount to Tint</Name><StartKeyframe>-91445760000000000,100.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoFilterComponent ObjectID="56"><Component><Params><Param Index="0" ObjectRef="57"/><Param Index="1" ObjectRef="58"/><Param Index="2" ObjectRef="59"/></Params><ID>2</ID><DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName></VideoFilterComponent>
-  <VideoComponentParam ObjectID="57"><Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>{s20},0,5,0,0,0.33333333333333331,0,0.33333333333333331;{s22},40,5,2,0,0.25,0,0.5;</Keyframes></VideoComponentParam>
+  <VideoComponentParam ObjectID="57"><Name>Blurriness</Name><IsTimeVarying>true</IsTimeVarying><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>{s20},0,5,0,0,0.33333333333333331,0,0.33333333333333331;{s22},40,5,2,0,0.25,0,0.5;</Keyframes></VideoComponentParam>
   <VideoComponentParam ObjectID="58"><Name>Blur Dimensions</Name><StartKeyframe>-91445760000000000,1,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoComponentParam ObjectID="59"><Name>Repeat Edge Pixels</Name><StartKeyframe>-91445760000000000,true,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoFilterComponent ObjectID="54"><Component><Params><Param Index="0" ObjectRef="55"/></Params><DisplayName>Opacity</DisplayName></Component><MatchName>AE.ADBE Opacity</MatchName></VideoFilterComponent>
@@ -252,6 +252,36 @@ fn imports_bins_media_sequences_clips_and_effects() {
     assert_eq!(seq_item.metadata.get(META_SEQUENCE).map(String::as_str), Some("seq1"));
     assert!(seq_item.metadata.contains_key(META_FINGERPRINT));
     assert_eq!(media.metadata.get(META_MEDIA).map(String::as_str), Some("media1"));
+}
+
+/// A parameter whose stopwatch Premiere turned off keeps its keyframes in the file but plays its
+/// static value (one user's project had 17 of them, animating in FilmCraft only); audio
+/// parameters never write the flag, and their keyframes always play.
+#[test]
+fn keyframes_of_a_stopped_stopwatch_do_not_play() {
+    let on = doc();
+    let flag = "<Name>Scale</Name><IsTimeVarying>true</IsTimeVarying>";
+    assert!(on.contains(flag));
+    for (what, off) in
+        [("absent", on.replace(flag, "<Name>Scale</Name>")), ("false", on.replace(flag, "<Name>Scale</Name><IsTimeVarying>false</IsTimeVarying>"))]
+    {
+        let (imp, _) = import(off.as_bytes(), Some("/edits/show"));
+        let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+        let scale = seq.video_tracks[0].items[0].effect("motion").and_then(|e| e.params.get("scale")).unwrap();
+        assert!(scale.keyframes.is_empty(), "IsTimeVarying {what}: {:?}", scale.keyframes);
+        assert_eq!(scale.value.as_f64(), Some(100.0), "IsTimeVarying {what}: the StartKeyframe value");
+    }
+    // the clip's Volume Level with keyframes and no flag, as Premiere writes it: it animates
+    let at = on.find("<Name>Level</Name>").unwrap();
+    let end = at + on[at..].find("</StartKeyframe>").unwrap() + "</StartKeyframe>".len();
+    let keys = format!("<Keyframes>{},0.17782794100389229,0,0,0,0,0,0;{},0.017782794100389229,0,0,0,0,0,0;</Keyframes>", 10 * S, 12 * S);
+    let keyed = format!("{}{keys}{}", &on[..end], &on[end..]);
+    let (imp, _) = import(keyed.as_bytes(), Some("/edits/show"));
+    let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+    let level = seq.audio_tracks[0].items[0].effect("volume").and_then(|e| e.params.get("level")).unwrap();
+    let db: Vec<f64> = level.keyframes.iter().filter_map(|k| k.value.as_f64()).collect();
+    assert_eq!(db.len(), 2, "{:?}", level.keyframes);
+    assert!(db[0].abs() < 1e-6 && (db[1] + 20.0).abs() < 1e-6, "{db:?}");
 }
 
 #[test]
@@ -580,8 +610,8 @@ fn the_current_gaussian_blur_amount_comes_in() {
             r#"<DisplayName>Gaussian Blur</DisplayName></Component><MatchName>AE.Impact_Blur_FX</MatchName>"#,
         )
         .replace(
-            r#"<Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>"#,
-            r#"<Name>Amount</Name><StartKeyframe>-91445760000000000,20.,0,0,0,0,0,0</StartKeyframe><Keyframes>"#,
+            r#"<Name>Blurriness</Name><IsTimeVarying>true</IsTimeVarying><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>"#,
+            r#"<Name>Amount</Name><IsTimeVarying>true</IsTimeVarying><StartKeyframe>-91445760000000000,20.,0,0,0,0,0,0</StartKeyframe><Keyframes>"#,
         );
     assert!(doc.contains("AE.Impact_Blur_FX") && doc.contains("<Name>Amount</Name>"));
     let (imp, report) = import(doc.as_bytes(), Some("/edits/show"));

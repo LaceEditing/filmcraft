@@ -61,7 +61,7 @@
     <Component><Params><Param Index="0" ObjectRef="46"/><Param Index="1" ObjectRef="45"/><Param Index="2" ObjectRef="47"/></Params><DisplayName>Motion</DisplayName></Component>
     <MatchName>AE.ADBE Motion</MatchName>
   </VideoFilterComponent>
-  <VideoComponentParam ObjectID="45"><Name>Scale</Name><StartKeyframe>-91445760000000000,100,0,0,0,0,0,0</StartKeyframe><Keyframes>2540160000000,100,0,0,0,0.1,1.5,0.1;3048192000000,120,0,0,1.5,0.1,0,0.1;</Keyframes></VideoComponentParam>
+  <VideoComponentParam ObjectID="45"><Name>Scale</Name><IsTimeVarying>true</IsTimeVarying><StartKeyframe>-91445760000000000,100,0,0,0,0,0,0</StartKeyframe><Keyframes>2540160000000,100,0,0,0,0.1,1.5,0.1;3048192000000,120,0,0,1.5,0.1,0,0.1;</Keyframes></VideoComponentParam>
   <PointComponentParam ObjectID="46"><Name>Position</Name><StartKeyframe>-91445760000000000,0.25:0.5,0,0,0,0,0,0,5,4,0,0,0,0</StartKeyframe></PointComponentParam>
   <VideoComponentParam ObjectID="47"><Name> </Name><StartKeyframe>-91445760000000000,false,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoFilterComponent ObjectID="48"><Component><Params/><DisplayName>RSMB Pro</DisplayName></Component><MatchName>RE:Vision RSMB Pro</MatchName></VideoFilterComponent>
@@ -79,7 +79,7 @@
   <VideoComponentParam ObjectID="102"><Name>Map White To</Name><StartKeyframe>-91445760000000000,18374966857753992192,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoComponentParam ObjectID="103"><Name>Amount to Tint</Name><StartKeyframe>-91445760000000000,100.,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoFilterComponent ObjectID="56"><Component><Params><Param Index="0" ObjectRef="57"/><Param Index="1" ObjectRef="58"/><Param Index="2" ObjectRef="59"/></Params><ID>2</ID><DisplayName>Gaussian Blur (Legacy)</DisplayName></Component><MatchName>AE.ADBE Gaussian Blur</MatchName></VideoFilterComponent>
-  <VideoComponentParam ObjectID="57"><Name>Blurriness</Name><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>5080320000000,0,5,0,0,0.33333333333333331,0,0.33333333333333331;5588352000000,40,5,2,0,0.25,0,0.5;</Keyframes></VideoComponentParam>
+  <VideoComponentParam ObjectID="57"><Name>Blurriness</Name><IsTimeVarying>true</IsTimeVarying><StartKeyframe>-91445760000000000,0,0,0,0,0,0,0</StartKeyframe><Keyframes>5080320000000,0,5,0,0,0.33333333333333331,0,0.33333333333333331;5588352000000,40,5,2,0,0.25,0,0.5;</Keyframes></VideoComponentParam>
   <VideoComponentParam ObjectID="58"><Name>Blur Dimensions</Name><StartKeyframe>-91445760000000000,1,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoComponentParam ObjectID="59"><Name>Repeat Edge Pixels</Name><StartKeyframe>-91445760000000000,true,0,0,0,0,0,0</StartKeyframe></VideoComponentParam>
   <VideoFilterComponent ObjectID="54"><Component><Params><Param Index="0" ObjectRef="55"/></Params><DisplayName>Opacity</DisplayName></Component><MatchName>AE.ADBE Opacity</MatchName></VideoFilterComponent>

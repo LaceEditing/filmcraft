@@ -622,7 +622,12 @@ pub(crate) fn start_value<'a>(p: Node<'a, '_>) -> Option<&'a str> {
 /// A Premiere parameter in Premiere's terms.
 pub(crate) fn decode(p: Node<'_, '_>, conv: Conv) -> Option<Canon> {
     let mut keys = Vec::new();
-    if let Some(text) = child_text(p, "Keyframes") {
+    // A video parameter's keyframes play only while its stopwatch is on (`IsTimeVarying` true):
+    // with the stopwatch off Premiere keeps the keys in the file but plays the static value.
+    // Audio parameters never write the flag, and their keyframes always play.
+    let audio = p.tag_name().name().starts_with("Audio");
+    let animated = audio || child_text(p, "IsTimeVarying").is_some_and(|v| v.trim() == "true");
+    if animated && let Some(text) = child_text(p, "Keyframes") {
         for raw in text.split(';').take(MAX_KEYS) {
             let f: Vec<&str> = raw.split(',').collect();
             let (Some(t), Some(v)) = (f.first().and_then(|t| t.trim().parse::<i64>().ok()), f.get(1).and_then(|v| parse_val(v, conv))) else { continue };
