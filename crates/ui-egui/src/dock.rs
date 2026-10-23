@@ -189,6 +189,11 @@ pub const WORKSPACES_FILE: &str = "workspaces.json";
 pub struct WorkspacePrefs {
     pub saved: Vec<SavedWorkspace>,
     pub current: String,
+    /// Each workspace as it was last left, where that differs from its saved layout. Premiere keeps
+    /// a workspace's changes across switches and launches until Reset to Saved Layout or Save
+    /// Changes to this Workspace.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub live: Vec<SavedWorkspace>,
 }
 
 /// A named layout. `layout` is a [`DockNode`] kept as JSON, so one unreadable entry (a panel a
@@ -260,17 +265,58 @@ pub fn saved_layout(prefs: &WorkspacePrefs, name: &str) -> DockNode {
 }
 
 pub fn saved_docking(prefs: &WorkspacePrefs, name: &str) -> Layout {
-    let saved = prefs.saved.iter().find(|saved| saved.name == name).and_then(|saved| {
-        let mut layout = Layout {
-            root: serde_json::from_value(saved.layout.clone()).ok()?,
-            floating: if saved.floating.is_null() { vec![] } else { serde_json::from_value(saved.floating.clone()).ok()? },
-        };
-        if layout.floating.is_empty() {
-            migrate_legacy_effects(&mut layout.root);
+    prefs.saved.iter().find(|saved| saved.name == name).and_then(decode).unwrap_or_else(|| Layout { root: workspace(name), floating: vec![] })
+}
+
+/// The arrangement a workspace opens with: as it was last left, else its saved layout.
+pub fn live_docking(prefs: &WorkspacePrefs, name: &str) -> Layout {
+    prefs.live.iter().find(|live| live.name == name).and_then(decode).unwrap_or_else(|| saved_docking(prefs, name))
+}
+
+/// Remember `layout` as how `name` was left; forgotten when it is the saved layout. Whether
+/// `prefs` changed.
+pub fn remember_live(prefs: &mut WorkspacePrefs, name: &str, layout: &Layout) -> Result<bool, String> {
+    if *layout == saved_docking(prefs, name) {
+        return Ok(forget_live(prefs, name));
+    }
+    let entry = encode(name, layout)?;
+    match prefs.live.iter_mut().find(|live| live.name == name) {
+        Some(live) if *live == entry => Ok(false),
+        Some(live) => {
+            *live = entry;
+            Ok(true)
         }
-        layout.validate().ok().map(|()| layout)
-    });
-    saved.unwrap_or_else(|| Layout { root: workspace(name), floating: vec![] })
+        None => {
+            prefs.live.push(entry);
+            Ok(true)
+        }
+    }
+}
+
+/// Forget how `name` was left (it opens with its saved layout). Whether `prefs` changed.
+pub fn forget_live(prefs: &mut WorkspacePrefs, name: &str) -> bool {
+    let before = prefs.live.len();
+    prefs.live.retain(|live| live.name != name);
+    prefs.live.len() != before
+}
+
+/// A layout as kept in the workspaces file.
+pub fn encode(name: &str, layout: &Layout) -> Result<SavedWorkspace, String> {
+    layout.validate()?;
+    let floating = if layout.floating.is_empty() { serde_json::Value::Null } else { serde_json::to_value(&layout.floating).map_err(|e| e.to_string())? };
+    Ok(SavedWorkspace { name: name.to_string(), layout: serde_json::to_value(&layout.root).map_err(|e| e.to_string())?, floating })
+}
+
+/// A layout from the workspaces file, if it reads and holds every panel once.
+fn decode(saved: &SavedWorkspace) -> Option<Layout> {
+    let mut layout = Layout {
+        root: serde_json::from_value(saved.layout.clone()).ok()?,
+        floating: if saved.floating.is_null() { vec![] } else { serde_json::from_value(saved.floating.clone()).ok()? },
+    };
+    if layout.floating.is_empty() {
+        migrate_legacy_effects(&mut layout.root);
+    }
+    layout.validate().ok().map(|()| layout)
 }
 
 /// Older Effects workspaces stored the same Effect Controls panel twice: selected beside

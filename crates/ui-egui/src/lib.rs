@@ -451,6 +451,8 @@ pub struct FilmcraftApp {
     /// Settings ▸ Appearance ▸ UI Scale last applied, with the system scale it was applied for.
     applied_ui_scale: Option<(Option<f32>, f32)>,
     workspace_restored: bool,
+    /// When the panel arrangement was last compared with the remembered one (input time, s).
+    layout_checked_at: f64,
     /// Window ▸ Workspaces: saved layouts ([`dock::WORKSPACES_FILE`] in the data directory).
     pub workspaces: dock::WorkspacePrefs,
     /// Workspace names and the current one, as last handed to the native menu.
@@ -710,6 +712,7 @@ impl FilmcraftApp {
             applied_prefs: None,
             applied_ui_scale: None,
             workspace_restored: false,
+            layout_checked_at: 0.0,
             workspaces,
             menu_workspaces: Default::default(),
         }
@@ -885,10 +888,10 @@ impl FilmcraftApp {
             self.ui.status = note;
         }
         if prev.is_none() && !self.workspace_restored {
-            // reopen the workspace in use when the app last closed
+            // reopen the workspace in use when the app last closed, as it was left
             self.workspace_restored = true;
             if let Some(w) = dock::find(&self.workspaces, &self.workspaces.current) {
-                self.set_workspace(&w);
+                self.open_workspace(&w);
             }
         }
         self.applied_prefs = Some(p);
@@ -961,9 +964,37 @@ impl FilmcraftApp {
         }
     }
 
+    /// Switch to workspace `name`: the one being left keeps its arrangement (as in Premiere), and
+    /// `name` opens as it was last left.
     pub fn set_workspace(&mut self, name: &str) {
+        if self.workspace_restored && self.ui.workspace != name {
+            self.remember_layout();
+        }
+        self.open_workspace(name);
+    }
+
+    /// Keep the current arrangement as how the current workspace was left
+    /// ([`dock::WorkspacePrefs::live`]), writing the workspaces file when it changed.
+    pub fn remember_layout(&mut self) {
+        let layout = dock::Layout { root: self.ui.dock.clone(), floating: self.ui.floating.clone() };
+        let mut next = self.workspaces.clone();
+        match dock::remember_live(&mut next, &self.ui.workspace, &layout) {
+            Ok(true) => {
+                if let Err(e) = self.set_workspaces(next) {
+                    self.ui.status = e;
+                }
+            }
+            Ok(false) => {}
+            // a layout that doesn't validate (mid-change) is simply not remembered
+            Err(_) => {}
+        }
+    }
+
+    /// Show workspace `name` as it was last left, without remembering the arrangement being
+    /// replaced (launch, and a deleted workspace).
+    pub(crate) fn open_workspace(&mut self, name: &str) {
         self.ui.workspace = name.to_string();
-        let layout = dock::saved_docking(&self.workspaces, name);
+        let layout = dock::live_docking(&self.workspaces, name);
         self.ui.dock = layout.root;
         self.ui.floating = layout.floating;
         self.pending_panel_raise = None;
@@ -2474,10 +2505,20 @@ impl eframe::App for FilmcraftApp {
         let settled = !std::mem::take(&mut self.monitor_inexact) && self.timeline_still > 0;
         self.issue_screenshots(ctx, settled);
         self.collect_screenshots(ctx);
+        // the arrangement of the workspace in use is kept for the next launch (checked every
+        // couple of seconds; written only when it changed)
+        let now = ctx.input(|i| i.time);
+        if self.workspace_restored && (now - self.layout_checked_at).abs() >= 2.0 {
+            self.layout_checked_at = now;
+            self.remember_layout();
+        }
         self.sections.record("logic", t_logic.elapsed().as_secs_f64() * 1e3);
     }
 
     fn on_exit(&mut self) {
+        if self.workspace_restored {
+            self.remember_layout();
+        }
         // the drop listener uses the window's connection: it stops before the window goes
         self.file_drop_listener = None;
         // Flush the recovery journal and stop the auto-save worker; a session with nothing unsaved

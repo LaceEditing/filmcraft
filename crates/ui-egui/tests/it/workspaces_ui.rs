@@ -234,6 +234,50 @@ fn save_switch_reset_rename_delete_and_restart() {
     let _ = std::fs::remove_dir_all(&data);
 }
 
+/// As in Premiere, a workspace keeps the changes made to it (closed or moved panels) when another
+/// workspace is shown and across launches, until Reset to Saved Layout or Save Changes.
+#[test]
+fn workspace_changes_are_kept_across_switches_and_launches_until_reset() {
+    let data = data_dir("live");
+    let mut d = Driver::launch(&data);
+    assert!(d.shows(PanelKind::Metadata));
+    d.ok("ui.panel.close", json!({"panel": "Metadata"}));
+    d.ok("ui.set", json!({"workspace": "Color"}));
+    assert!(d.shows(PanelKind::LumetriColor));
+    d.ok("ui.panel.close", json!({"panel": "LumetriColor"}));
+    d.ok("ui.set", json!({"workspace": "Editing"}));
+    assert!(!d.shows(PanelKind::Metadata), "Editing comes back as it was left");
+    let live = saved_file(&data)["live"].clone();
+    let names: Vec<&str> = live.as_array().map(|a| a.iter().filter_map(|w| w["name"].as_str()).collect()).unwrap_or_default();
+    assert!(names.contains(&"Editing") && names.contains(&"Color"), "both workspaces' changes are kept: {live}");
+    assert_eq!(saved_file(&data)["saved"], json!([]), "nothing was saved as a layout");
+    drop(d);
+
+    // the next launch: the workspace in use and the other one as they were left
+    let mut d = Driver::launch(&data);
+    assert_eq!(d.workspace(), "Editing");
+    assert!(!d.shows(PanelKind::Metadata));
+    d.ok("ui.set", json!({"workspace": "Color"}));
+    assert!(!d.shows(PanelKind::LumetriColor));
+
+    // Reset to Saved Layout drops the changes for good
+    d.menu("window.workspace.reset", json!({}));
+    assert!(d.shows(PanelKind::LumetriColor));
+    d.ok("ui.set", json!({"workspace": "Editing"}));
+    d.ok("ui.set", json!({"workspace": "Color"}));
+    assert!(d.shows(PanelKind::LumetriColor), "a reset workspace stays reset");
+
+    // Save Changes makes the kept arrangement the saved layout
+    d.ok("ui.set", json!({"workspace": "Editing"}));
+    d.menu("window.workspace.saveChanges", json!({}));
+    let file = saved_file(&data);
+    assert_eq!(file["saved"][0]["name"], "Editing");
+    assert!(file["live"].as_array().is_none_or(|a| a.iter().all(|w| w["name"] != "Editing")), "nothing left to keep for Editing: {file}");
+    d.menu("window.workspace.reset", json!({}));
+    assert!(!d.shows(PanelKind::Metadata), "the saved layout is the one without Metadata");
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 #[test]
 fn save_rename_and_delete_through_the_dialogs() {
     let data = data_dir("dialogs");

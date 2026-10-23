@@ -22,9 +22,12 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
     let arg = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
     let r = match ws {
         "reset" => {
+            // back to the saved layout: the changes kept since are dropped
             let n = app.ui.workspace.clone();
+            let mut next = app.workspaces.clone();
+            let reset = if dock::forget_live(&mut next, &n) { app.set_workspaces(next) } else { Ok(()) };
             app.set_workspace(&n);
-            Ok(json!({"workspace": n}))
+            reset.map(|()| json!({"workspace": n}))
         }
         "saveChanges" => {
             let n = app.ui.workspace.clone();
@@ -68,6 +71,8 @@ fn save(app: &mut FilmcraftApp, name: &str) -> Result<(), String> {
         }
         None => saved.push(dock::SavedWorkspace { name: name.to_string(), layout, floating }),
     }
+    // what was kept of it is now its saved layout
+    dock::forget_live(&mut next, name);
     next.current = name.to_string();
     app.set_workspaces(next)
 }
@@ -103,7 +108,7 @@ fn rename(app: &mut FilmcraftApp, from: &str, to: &str) -> Result<Value, String>
     }
     let to = new_name(app, to)?;
     let mut next = app.workspaces.clone();
-    for s in next.saved.iter_mut().filter(|s| s.name == from) {
+    for s in next.saved.iter_mut().chain(next.live.iter_mut()).filter(|s| s.name == from) {
         s.name = to.clone();
     }
     if next.current == from {
@@ -124,9 +129,11 @@ fn delete(app: &mut FilmcraftApp, name: &str) -> Result<Value, String> {
     if next.saved.len() == before {
         return Err(if is_builtin(name) { format!("`{name}` is a built-in workspace and can't be deleted") } else { format!("unknown workspace `{name}`") });
     }
+    dock::forget_live(&mut next, name);
     app.set_workspaces(next)?;
     if app.ui.workspace == name {
-        app.set_workspace(if is_builtin(name) { name } else { "Editing" });
+        // (not set_workspace: the deleted workspace's arrangement is not kept)
+        app.open_workspace(if is_builtin(name) { name } else { "Editing" });
     }
     Ok(if is_builtin(name) { json!({"restored": name}) } else { json!({"deleted": name}) })
 }
