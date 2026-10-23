@@ -642,6 +642,33 @@ fn motion_crop_round_trips() {
     assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
 }
 
+/// Clip ▸ Video Options ▸ Scale to Frame Size (`ScaleToFramePolicy` 1 on the track item's clip,
+/// Round 5 B7) comes in, and goes back out when switched on or off in FilmCraft.
+#[test]
+fn scale_to_frame_size_round_trips() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    assert!(!p.sequence(sid).unwrap().video_tracks[0].items[0].scale_to_frame);
+    p.sequence_mut(sid).unwrap().video_tracks[0].items[0].scale_to_frame = true;
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    assert_eq!(text.matches("</Clip><ScaleToFramePolicy>1</ScaleToFramePolicy></VideoClip>").count(), 1, "{report}");
+    let back = read(&out);
+    let v1 = &back.sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[0];
+    assert!(v1.items[0].scale_to_frame && !v1.items[1].scale_to_frame);
+    // unchanged: the same document; switched off: the setting goes
+    let (imp2, _) = import(text.as_bytes(), None);
+    let (again, _) = export(&imp2.project, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&again).unwrap().0).unwrap(), text);
+    let mut p2 = imp2.project;
+    let sid2 = seq_id(&p2);
+    p2.sequence_mut(sid2).unwrap().video_tracks[0].items[0].scale_to_frame = false;
+    let (off, _) = export(&p2, text.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&off).unwrap().0).unwrap(), plain);
+}
+
 /// A Custom Fade's Fade Shape (Effect Controls: Linear or Cosine) is saved as `FadeShapeType` 0
 /// for Linear and nothing for Cosine; it comes in, stays on an unchanged save, and goes back out
 /// before the `FadeShapeValue` as Premiere writes it.

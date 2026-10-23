@@ -723,6 +723,11 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         if kind == TrackKind::Audio {
             ti.gain_db = clip_gain_db(clip);
         }
+        // Clip ▸ Video Options ▸ Scale to Frame Size (Round 5 B7: `ScaleToFramePolicy` 1 on the
+        // track item's clip)
+        if kind == TrackKind::Video && child_text(clip, "ScaleToFramePolicy").map(str::trim) == Some("1") {
+            ti.scale_to_frame = true;
+        }
         if child_text(clip, "FrameHold") == Some(FRAME_HOLD_AT)
             && let Some(at) = time(child_text(clip, "FrameHoldStart"))
         {

@@ -1948,6 +1948,15 @@ impl<'a, 'i> Writer<'a, 'i> {
                     }
                 }
             }
+            // Clip ▸ Video Options ▸ Scale to Frame Size: `ScaleToFramePolicy` 1 on the clip
+            let policy = child(clip, "ScaleToFramePolicy");
+            if c.scale_to_frame != policy.and_then(|n| n.text()).is_some_and(|t| t.trim() == "1") {
+                match (c.scale_to_frame, policy) {
+                    (true, _) => self.set_child(clip_inst, clip, "ScaleToFramePolicy", "1"),
+                    (false, Some(n)) => self.remove(clip_inst, n),
+                    (false, None) => {}
+                }
+            }
         }
         // Clip ▸ Audio Gain: a linear `Gain` on the clip (Premiere writes none at 0 dB)
         if kind == TrackKind::Audio {
