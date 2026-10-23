@@ -8,7 +8,8 @@
 //! Darker/Lighter Color compare Rec. 709 luma, the other non-separable modes exact Rec. 601 luma,
 //! Soft Light is Photoshop's (√b), Hard Mix is
 //! `b + s ≥ 1`, 0 ÷ 0 is 0, and Linear Dodge, Linear Light, Subtract and Divide are not clamped
-//! before the mix.
+//! before the mix. Where nothing is under a layer in one of those modes (every mode but Normal and
+//! Dissolve), Premiere draws the layer as it is, ignoring its opacity.
 
 use filmcraft_color::{linear_to_srgb, srgb_to_linear};
 use rayon::prelude::*;
@@ -281,6 +282,17 @@ pub fn composite_at(dst: &mut Image, src: &Image, x0: usize, y0: usize, opacity:
         for rx in 0..cw {
             let x = x0 + rx;
             let (i, j) = (x * 4, rx * 4);
+            let da = d[i + 3];
+            // a blended layer with nothing under it is drawn as it is, at full opacity: Premiere
+            // 26.5 draws a picture alone on V1 in Color or Multiply at 100, 50 and 0 % opaque and
+            // unchanged (Round 5 A4 probe; Normal at 50 % is half transparent, at 0 % not drawn)
+            if mode.reads_destination() && da <= 0.0 {
+                let k = 1.0 - s[j + 3];
+                for c in 0..4 {
+                    d[i + c] = s[j + c] + d[i + c] * k;
+                }
+                continue;
+            }
             let mut sp = [s[j] * opacity, s[j + 1] * opacity, s[j + 2] * opacity, s[j + 3] * opacity];
             let sa = sp[3];
             if sa <= 0.0 {
@@ -292,8 +304,7 @@ pub fn composite_at(dst: &mut Image, src: &Image, x0: usize, y0: usize, opacity:
                 }
                 sp = [sp[0] / sa, sp[1] / sa, sp[2] / sa, 1.0];
             }
-            let da = d[i + 3];
-            if mode == Blend::Normal || mode == Blend::Dissolve || da <= 0.0 {
+            if mode == Blend::Normal || mode == Blend::Dissolve {
                 let k = 1.0 - sp[3];
                 for c in 0..4 {
                     d[i + c] = sp[c] + d[i + c] * k;
@@ -378,6 +389,29 @@ mod tests {
         // Hard Mix is white from b + s = 1; 0 ÷ 0 is black, anything else ÷ 0 white
         near(over8(Blend::HardMix, [205; 3], [50, 49, 51], 1.0), [255, 0, 255], "Hard Mix");
         near(over8(Blend::Divide, [0, 0, 90], [0, 200, 0], 1.0), [0, 0, 255], "Divide by zero");
+    }
+
+    /// Premiere draws a layer in a blend mode with nothing under it as it is, whatever its opacity
+    /// (Round 5 A4 probe: chart.png alone on V1 in Color and Multiply at 100, 50 and 0 %); in
+    /// Normal its opacity applies.
+    #[test]
+    fn a_blended_layer_over_nothing_is_drawn_as_it_is() {
+        let top = [0.2, 0.3, 0.4, 1.0];
+        for mode in Blend::ALL.into_iter().filter(|m| m.reads_destination()) {
+            for op in [1.0, 0.5, 0.0] {
+                let mut d = Image::new(2, 1);
+                d.px[3] = 1.0;
+                composite(&mut d, &Image::filled(2, 1, top), op, mode);
+                assert_eq!(d.get(1, 0), top, "{mode:?} at {op}");
+                // over something it blends at its opacity: at 0 % the backdrop shows
+                if op == 0.0 {
+                    assert_eq!(d.get(0, 0), [0.0, 0.0, 0.0, 1.0], "{mode:?} at {op}");
+                }
+            }
+        }
+        let mut d = Image::new(1, 1);
+        composite(&mut d, &Image::filled(1, 1, top), 0.5, Blend::Normal);
+        assert_eq!(d.get(0, 0), [0.1, 0.15, 0.2, 0.5]);
     }
 
     #[test]

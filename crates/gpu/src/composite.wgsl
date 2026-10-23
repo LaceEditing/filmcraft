@@ -203,8 +203,8 @@ fn sample(p: vec2<f32>) -> vec4<f32> {
     return vec4(lin * a, a);
 }
 
-// The layer's premultiplied linear colour at this pixel, opacity applied.
-fn layer_color(sp: vec2<f32>) -> vec4<f32> {
+// The layer's premultiplied linear colour at this pixel, before its opacity.
+fn layer_raw(sp: vec2<f32>) -> vec4<f32> {
     let n = max(u32(u.p0.z), 1u);
     let fp = u.p2.w;
     var acc = vec4(0.0);
@@ -214,7 +214,12 @@ fn layer_color(sp: vec2<f32>) -> vec4<f32> {
             acc += sample(sp + off * fp);
         }
     }
-    return acc / f32(n * n) * u.p0.x;
+    return acc / f32(n * n);
+}
+
+// The layer's premultiplied linear colour at this pixel, opacity applied.
+fn layer_color(sp: vec2<f32>) -> vec4<f32> {
+    return layer_raw(sp) * u.p0.x;
 }
 
 // ---- Dissolve: the CPU's 64-bit pixel hash (`blend::hash2`), on 32-bit halves (lo, hi).
@@ -376,15 +381,20 @@ fn fs_fx_source(in: VOut) -> @location(0) vec4<f32> {
 // Blend modes that need the destination: written without fixed-function blending.
 @fragment
 fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
-    let sp = layer_color(in.sp);
-    let sa = sp.a;
-    if sa <= 0.0 {
+    let raw = layer_raw(in.sp);
+    if raw.a <= 0.0 {
         discard;
     }
     let d = textureLoad(backdrop, vec2<i32>(in.pos.xy), 0);
     let da = d.a;
+    // with nothing under it the layer is drawn as it is, at full opacity (as Premiere draws it)
     if da <= 0.0 {
-        return sp + d * (1.0 - sa);
+        return raw + d * (1.0 - raw.a);
+    }
+    let sp = raw * u.p0.x;
+    let sa = sp.a;
+    if sa <= 0.0 {
+        discard;
     }
     let cs = linear_to_srgb(sp.rgb / sa);
     let cb = linear_to_srgb(d.rgb / da);

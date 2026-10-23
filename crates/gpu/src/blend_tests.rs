@@ -250,7 +250,8 @@ fn gpu_blend_edge_cases_match_cpu() {
     let (back, src) = (make(true), make(false));
     let mut c = GpuCompositor::new(&dev, &q);
     for mode in Blend::ALL {
-        for opacity in [1.0f32, 0.5] {
+        // (at 0 % only the pixels with nothing under them show the layer: as it is)
+        for opacity in [1.0f32, 0.5, 0.0] {
             let plan = FramePlan::Layers {
                 width: n,
                 height: n,
