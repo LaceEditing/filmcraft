@@ -3,14 +3,11 @@
 //! apply the Export effects (image, name and timecode overlays, video limiter) and convert to the
 //! encoder's input (straight sRGB RGBA8, or encoded R'G'B' floats for HDR).
 //!
-//! With a registered plan renderer (the GPU compositor: the desktop app and the CLI register it),
-//! SDR frames rendered at the output size without Export overlays are planned
-//! ([`filmcraft_render::plan::plan_frame`]) and composited on the GPU; they match the CPU's
-//! pictures within one code value. Everything else, and any frame the GPU cannot take, is
-//! rendered on the CPU. `FILMCRAFT_NO_GPU_RENDER` in the environment turns the GPU path off.
+//! With Export ▸ GPU rendering on ([`GpuRendering::Auto`]) and a registered frame renderer (the
+//! GPU compositor), frames are composited on the GPU; any frame it declines is rendered on the
+//! CPU. `FILMCRAFT_NO_GPU_RENDER` in the environment turns the GPU path off whatever the setting.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use filmcraft_geom::Vec2;
 use filmcraft_project::{ItemId, Project};
@@ -19,7 +16,7 @@ use filmcraft_time::FrameRate;
 use rayon::prelude::*;
 
 use crate::settings::{ExportEffects, Placement, Scaling, TextOverlay};
-use crate::{ExportError, ExportSettings, Result};
+use crate::{ExportError, ExportSettings, FrameRenderer, GpuRendering, Result, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
 
 /// Where the rendered picture lands in the output frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -56,9 +53,74 @@ impl Geometry {
     }
 }
 
+/// GPU renderers shared by the export workers: a worker takes a free one for a frame and puts it
+/// back (a single renderer behind a mutex made the workers queue, GPU export ~20 % slower than CPU).
+struct RendererPool {
+    /// Initial capacity, also the maximum number of frame tasks admitted at once.
+    capacity: usize,
+    renderers: std::sync::Mutex<Vec<Box<dyn FrameRenderer>>>,
+    available: std::sync::Condvar,
+    /// A renderer panicked: the pool is retired and the rest of the export renders on the CPU.
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl RendererPool {
+    /// `None` for an empty list (a pool nobody could take from).
+    fn new(renderers: Vec<Box<dyn FrameRenderer>>) -> Option<Self> {
+        (!renderers.is_empty()).then(|| Self {
+            capacity: renderers.len(),
+            renderers: std::sync::Mutex::new(renderers),
+            available: std::sync::Condvar::new(),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Run `f` with a free renderer. Frame batches must respect `Pipeline::render_batch_limit`:
+    /// a renderer can run nested Rayon work, which may steal another frame on the same thread.
+    /// Admitting more frame tasks than renderers could then deadlock this condition variable
+    /// against the suspended outer frame's renderer. `None` once a renderer has
+    /// panicked: the panicking renderer is dropped (its state can't be trusted) and so are the
+    /// others as they come back, so the caller falls back to the CPU for the rest of the export.
+    fn with<R>(&self, f: impl FnOnce(&mut dyn FrameRenderer) -> R) -> Option<R> {
+        use std::sync::atomic::Ordering;
+        let mut free = self.renderers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut r = loop {
+            if self.failed.load(Ordering::SeqCst) {
+                return None;
+            }
+            match free.pop() {
+                Some(r) => break r,
+                None => free = self.available.wait(free).unwrap_or_else(std::sync::PoisonError::into_inner),
+            }
+        };
+        drop(free);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut *r)));
+        let mut free = self.renderers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if res.is_err() {
+            // (the panic hook has logged the panic itself)
+            self.failed.store(true, Ordering::SeqCst);
+            free.clear();
+            drop(free);
+            drop(r);
+        } else if self.failed.load(Ordering::SeqCst) {
+            drop(free);
+            drop(r);
+        } else {
+            free.push(r);
+            drop(free);
+        }
+        // waiters re-check `failed` (or take the renderer that came back)
+        self.available.notify_all();
+        res.ok()
+    }
+}
+
 /// The immutable part of an export: everything needed to produce one output frame.
 pub(crate) struct Pipeline {
     pub project: Arc<Project>,
+    /// The registered frame renderers (GPU compositors) when the setting allows and factories
+    /// provide them; pooled because `frame` runs on several export threads at once.
+    renderer: Option<RendererPool>,
     pub seq: ItemId,
     /// Output frame rate (frame `f` is at `rate.tick_of(f)`).
     pub rate: FrameRate,
@@ -68,28 +130,58 @@ pub(crate) struct Pipeline {
     geom: Geometry,
     opts: RenderOptions,
     pub hdr_out: bool,
+    /// Keep straight alpha in the RGBA8 output instead of flattening over black.
+    alpha: bool,
     out_tf: Option<filmcraft_color::OutputTransform>,
     effects: ExportEffects,
     overlay: Option<Image>,
     start_tc: i64,
     drop_frame: bool,
-    /// The GPU compositor for this export (None: every frame on the CPU).
-    gpu: Option<Mutex<Box<dyn filmcraft_render::plan::PlanRenderer>>>,
+    /// Free the pool's float images when the export ends: a standalone export, not one part of a
+    /// batch (`ExportSettings::part_of_batch`).
+    trim_pool: bool,
 }
 
-static GPU_FRAMES: AtomicU64 = AtomicU64::new(0);
-static CPU_FRAMES: AtomicU64 = AtomicU64::new(0);
-
-/// Export frames composited on the GPU and on the CPU since the process started (statistics).
-pub fn composited_frames() -> (u64, u64) {
-    (GPU_FRAMES.load(Ordering::Relaxed), CPU_FRAMES.load(Ordering::Relaxed))
+impl Drop for Pipeline {
+    /// The export is over, however it ended (done, failed, cancelled, dropped half way). The float
+    /// images its frames left on the `filmcraft_frame::pool` float shelf are the size of its
+    /// frames, which nothing else asks for, so free them instead of holding up to 320 MiB idle. A
+    /// job still rendering at that moment allocates a few images again; the pool is only a cache.
+    /// Parts of a larger job (render-preview segments, proxies) keep them for the next part.
+    fn drop(&mut self) {
+        if self.trim_pool {
+            filmcraft_frame::pool::trim_f32();
+        }
+    }
 }
 
 impl Pipeline {
+    /// Bound outer frame tasks before spawning them, not inside a Rayon job. A renderer can
+    /// invoke nested parallel decoding/conversion; those joins may steal another frame task.
+    /// With at most one active batch and no more tasks than the initial renderer capacity,
+    /// every stolen frame can acquire a renderer without waiting for an ancestor to return it.
+    /// Keep the immutable capacity even after a failed renderer retires the pool.
+    pub(crate) fn render_batch_limit(&self, requested: i64) -> i64 {
+        let requested = requested.max(1);
+        self.renderer.as_ref().map_or(requested, |pool| requested.min(i64::try_from(pool.capacity).unwrap_or(i64::MAX)))
+    }
+
     pub fn new(project: Arc<Project>, seq: ItemId, settings: &ExportSettings, hdr_out: bool) -> Result<Self> {
         let q = project.sequence(seq).ok_or(ExportError::NoSequence)?;
+        q.settings.validate().map_err(ExportError::Unsupported)?;
+        settings.validate()?;
         let r = settings.resolve(q.settings.width, q.settings.height, q.settings.frame_rate, q.settings.sample_rate);
+        filmcraft_project::validate_frame_size(r.width, r.height).map_err(ExportError::Unsupported)?;
         let geom = Geometry::new(settings, q.settings.width, q.settings.height, r.width, r.height);
+        if let Some((w, h)) = geom.content {
+            let w = u32::try_from(w).map_err(|_| ExportError::Unsupported("scaled picture width is too large".into()))?;
+            let h = u32::try_from(h).map_err(|_| ExportError::Unsupported("scaled picture height is too large".into()))?;
+            filmcraft_project::validate_frame_size(w, h).map_err(ExportError::Unsupported)?;
+        }
+        let (w, h) = filmcraft_render::output_size(q, geom.render_scale);
+        let w = u32::try_from(w).map_err(|_| ExportError::Unsupported("rendered picture width is too large".into()))?;
+        let h = u32::try_from(h).map_err(|_| ExportError::Unsupported("rendered picture height is too large".into()))?;
+        filmcraft_project::validate_frame_size(w, h).map_err(ExportError::Unsupported)?;
         let pipe = q.settings.color;
         let out_tf = hdr_out.then(|| filmcraft_color::OutputTransform::new(&pipe, pipe.working.output_space()));
         let opts = RenderOptions { scale: geom.render_scale, captions: settings.burn_captions, working_output: hdr_out, ..Default::default() };
@@ -99,17 +191,30 @@ impl Pipeline {
         } else {
             None
         };
-        let direct = geom.content.is_none() && geom.offset == (0, 0);
-        let overlays = overlay.is_some() || effects.name_overlay.enabled || effects.timecode_overlay.enabled;
-        let gpu = (!hdr_out && direct && !overlays && std::env::var_os("FILMCRAFT_NO_GPU_RENDER").is_none())
-            .then(filmcraft_render::plan::plan_renderer)
-            .flatten()
-            .map(Mutex::new);
+        // Export ▸ GPU rendering, unless `FILMCRAFT_NO_GPU_RENDER` in the environment turns the GPU
+        // path off for every export
+        let renderer = if settings.gpu_rendering == GpuRendering::Off || std::env::var_os("FILMCRAFT_NO_GPU_RENDER").is_some() {
+            None
+        } else {
+            // Four renderers: as fast as one per worker (measured on 16 threads, where more only
+            // contend for memory bandwidth in the read-back), with a quarter of the GPU memory.
+            let count = rayon::current_num_threads().clamp(2, 4);
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                if let Some(r) = build_frame_renderer() {
+                    list.push(r);
+                } else {
+                    break;
+                }
+            }
+            RendererPool::new(list)
+        };
         Ok(Pipeline {
-            gpu,
+            renderer,
             seq_rate: q.settings.frame_rate,
             start_tc: q.start_timecode,
             drop_frame: q.settings.drop_frame,
+            trim_pool: !settings.part_of_batch,
             project: project.clone(),
             seq,
             rate: r.rate,
@@ -118,6 +223,7 @@ impl Pipeline {
             geom,
             opts,
             hdr_out,
+            alpha: settings.keeps_alpha(),
             out_tf,
             effects,
             overlay,
@@ -128,15 +234,35 @@ impl Pipeline {
     /// R'G'B' floats (3 per pixel).
     pub fn frame(&self, f: i64, sources: &dyn SourceProvider) -> (Vec<u8>, Vec<f32>) {
         let t = self.rate.tick_of(f);
-        if let Some(mut rgba) = self.gpu_frame(t, sources) {
-            let lim = &self.effects.video_limiter;
-            if lim.enabled {
-                limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
+        // The registered GPU renderer goes first; `None` (no adapter, a plan the GPU cannot
+        // draw, any internal error) falls back to the CPU reference renderer below. A frame the
+        // planner hands back as one CPU image anyway (an adjustment layer, a complex transition,
+        // HDR) does not take a pooled renderer: it would render on the CPU inside the pool, as
+        // many frames at a time as there are renderers instead of one per export thread.
+        let pool = self.renderer.as_ref().filter(|_| !filmcraft_render::plan::is_cpu_frame(&self.project, self.seq, t));
+        let gpu = match pool {
+            Some(pool) => {
+                let asked = web_time::Instant::now();
+                pool.with(|r| {
+                    crate::note_lock_wait(asked.elapsed());
+                    r.render(&self.project, self.seq, t, self.opts, sources)
+                })
+                .flatten()
             }
-            return (rgba, Vec::new());
-        }
-        CPU_FRAMES.fetch_add(1, Ordering::Relaxed);
-        let img = filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources);
+            None => None,
+        };
+        let img = match gpu {
+            Some(img) => {
+                note_gpu_frame();
+                img
+            }
+            None => {
+                if self.renderer.is_some() {
+                    note_gpu_fallback();
+                }
+                filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources)
+            }
+        };
         let mut img = self.place(img);
         self.overlays(&mut img, t);
         let lim = &self.effects.video_limiter;
@@ -150,37 +276,17 @@ impl Pipeline {
             if lim.enabled {
                 limit_f32(&mut out, lim.min_percent, lim.max_percent);
             }
+            // the float image is not needed any more: its buffer serves the next frame's layers
+            filmcraft_frame::pool::recycle_f32(img.px);
             return (Vec::new(), out);
         }
-        let mut rgba = img.over_black_rgba8();
+        let mut rgba = if self.alpha { img.to_rgba8() } else { img.over_black_rgba8() };
+        // the float image is not needed any more: its buffer serves the next frame's layers
+        filmcraft_frame::pool::recycle_f32(img.px);
         if lim.enabled {
             limit_rgba8(&mut rgba, lim.min_percent, lim.max_percent);
         }
         (rgba, Vec::new())
-    }
-
-    /// The frame composited on the GPU, when this export has a renderer and the plan is the
-    /// output size (None: render it on the CPU).
-    fn gpu_frame(&self, t: filmcraft_time::Tick, sources: &dyn SourceProvider) -> Option<Vec<u8>> {
-        let gpu = self.gpu.as_ref()?;
-        let plan = filmcraft_render::plan::plan_frame(&self.project, self.seq, t, self.opts, sources);
-        let size = match &plan {
-            filmcraft_render::plan::FramePlan::Layers { width, height, .. } => (*width, *height),
-            // the CPU already rendered this one: no GPU work needed
-            filmcraft_render::plan::FramePlan::Image(img) => {
-                let fits = (img.w, img.h) == (self.w as usize, self.h as usize);
-                if fits {
-                    CPU_FRAMES.fetch_add(1, Ordering::Relaxed);
-                }
-                return fits.then(|| img.over_black_rgba8());
-            }
-        };
-        if size != (self.w as usize, self.h as usize) {
-            return None;
-        }
-        let rgba = gpu.lock().unwrap_or_else(|e| e.into_inner()).render_rgba8(&plan).filter(|px| px.len() == size.0 * size.1 * 4)?;
-        GPU_FRAMES.fetch_add(1, Ordering::Relaxed);
-        Some(rgba)
     }
 
     /// Fit the rendered picture into the output frame.

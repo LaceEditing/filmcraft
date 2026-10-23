@@ -196,6 +196,7 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
     let mut submixes = 0usize;
     for it in work.items.values_mut() {
         let ItemKind::Sequence(seq) = &mut it.kind else { continue };
+        let seq = std::sync::Arc::make_mut(seq);
         captions += seq.caption_tracks.len();
         submixes += seq.submix_tracks.len();
         for t in seq.all_tracks_mut() {
@@ -745,7 +746,7 @@ impl<'p> Seed<'p> {
             if let ItemKind::Media(m) = &it.kind
                 && let MediaRef::File { path } = &m.media
             {
-                let ch = m.info.audio.as_ref().map(|a| a.channels).unwrap_or(0);
+                let ch = m.info.audio().map(|a| a.channels).unwrap_or(0);
                 if ch > 2 && !channels_noted {
                     self.report.warn("audio with more than two channels was written as stereo (its first two channels)");
                     channels_noted = true;
@@ -767,9 +768,13 @@ impl<'p> Seed<'p> {
                         hdr: None,
                     });
                 }
-                if audio && info.audio.as_ref().is_none_or(|a| a.channels == 0) && info.kind != MediaKind::Still {
+                if audio && info.audio().is_none_or(|a| a.channels == 0) && info.kind != MediaKind::Still {
                     let sample_rate = first.as_ref().map(|s| s.sample_rate).filter(|r| *r > 0).unwrap_or(48_000);
-                    info.audio = Some(filmcraft_media::AudioStreamInfo { sample_rate, channels: 2, codec: String::new(), bits_per_sample: None });
+                    let stream = filmcraft_media::AudioStreamInfo { sample_rate, channels: 2, codec: String::new(), bits_per_sample: None };
+                    match info.audio_streams.first_mut() {
+                        Some(first) => *first = stream,
+                        None => info.audio_streams.push(stream),
+                    }
                 }
                 self.media(it.id, &it.name, path, &info, &m.markers, rate);
             }
@@ -1024,7 +1029,7 @@ impl<'p> Seed<'p> {
         let still = info.kind == MediaKind::Still;
         let file = crate::common::file_name(path).to_string();
         let video_rate = info.video.as_ref().map(|v| if still { seq_rate } else { v.frame_rate }).map(|r| r.frame_duration().0);
-        let audio = info.audio.as_ref().filter(|a| a.channels > 0 && !still);
+        let audio = info.audio().filter(|a| a.channels > 0 && !still);
         let sample = audio.map(|a| sample_ticks(a.sample_rate));
         let mono = audio.is_some_and(|a| a.channels == 1);
         let length = if still { STILL_DURATION } else { info.duration.0.max(0) };

@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use filmcraft_codecs::hw::NalStreamInfo;
+use filmcraft_codecs::hw::StreamInfo;
 use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
 use filmcraft_isobmff::SampleEntry;
 
@@ -21,13 +21,16 @@ const LOG_MAX_SAMPLES: usize = 600;
 const LOG_MAX_BYTES: usize = 256 << 20;
 /// Presentation times remembered as returned (older ones are forgotten first).
 const EMITTED_MAX: usize = 4096;
+/// Pictures held while software replays a hardware run.  The replay log is bounded by bytes and
+/// samples, but an invalid stream can still make one sample produce many decoded pictures.
+const REPLAY_OUTPUT_MAX: usize = 4096;
 
 /// A hardware decoder with a transparent software fallback.
 pub struct HybridDecoder {
     hw: Option<Box<dyn VideoDecoder>>,
     sw: Option<Box<dyn VideoDecoder>>,
     entry: SampleEntry,
-    info: NalStreamInfo,
+    info: StreamInfo,
     draft: bool,
     /// Samples (and pts) since the last restart point; `None` once the bound was passed.
     log: Option<Vec<(Vec<u8>, i64)>>,
@@ -42,7 +45,8 @@ pub struct HybridDecoder {
 
 impl HybridDecoder {
     /// Wrap `hw`, a decoder for `entry` (whose stream is described by `info`).
-    pub fn new(hw: Box<dyn VideoDecoder>, entry: SampleEntry, info: NalStreamInfo) -> Self {
+    pub fn new(hw: Box<dyn VideoDecoder>, entry: SampleEntry, info: impl Into<StreamInfo>) -> Self {
+        let info = info.into();
         filmcraft_codecs::hw::note_hw_session();
         Self {
             hw: Some(hw),
@@ -67,7 +71,7 @@ impl HybridDecoder {
         if self.info.is_irap(sample) {
             // An HEVC CRA keeps the previous restart point: replaying from the CRA itself would
             // treat it as a first picture and drop its RASL pictures, which the hardware decodes.
-            let cra = self.info.codec == filmcraft_codecs::hw::NalCodec::Hevc && self.info.nal_types(sample).contains(&21);
+            let cra = self.info.keeps_previous_restart(sample);
             match self.log.as_mut() {
                 Some(log) if cra => {
                     log.drain(..self.last_irap.min(log.len()));
@@ -98,13 +102,20 @@ impl HybridDecoder {
         }
     }
 
-    /// In-band parameter sets that differ from the sample entry's (the hardware session was set
-    /// up from those).
+    /// Retain software replay output without letting a corrupt access unit turn the bounded
+    /// sample replay into an unbounded frame queue.
+    fn retain_replay(frames: &mut Vec<DecodedFrame>, mut out: Vec<DecodedFrame>) -> Result<()> {
+        if frames.len().saturating_add(out.len()) > REPLAY_OUTPUT_MAX {
+            return Err(CodecError::Decode("software fallback replay produced too many frames".into()));
+        }
+        frames.append(&mut out);
+        Ok(())
+    }
+
+    /// In-band parameter sets (sequence header, key frame format) that differ from the sample
+    /// entry's (the hardware session was set up from those).
     fn parameter_sets_changed(&self, sample: &[u8]) -> bool {
-        self.info
-            .nals(sample)
-            .into_iter()
-            .any(|n| n.first().is_some_and(|&h| self.info.is_parameter_set(self.info.nal_type(h))) && !self.info.parameter_sets.iter().any(|p| p == n))
+        self.info.parameters_changed(sample)
     }
 
     /// Software output after a fallback: pictures already returned are dropped, carried hardware
@@ -131,7 +142,10 @@ impl HybridDecoder {
     }
 
     /// Switch to the software decoder after `err`, replaying the log (which ends with the sample
-    /// that failed).
+    /// that failed). The replay goes on past samples the software decoder rejects, as decoding in
+    /// software from the restart point would: one that the hardware had already decoded is logged
+    /// (its call returned long ago), and if the failed sample itself is rejected its error is this
+    /// call's, while the pictures replayed before it are kept for the next output.
     fn fall_back(&mut self, err: CodecError) -> Result<Vec<DecodedFrame>> {
         let Some(mut hw) = self.hw.take() else { return Err(err) };
         log::warn!("{} failed ({err}); continuing with the software decoder", hw.name());
@@ -151,12 +165,28 @@ impl HybridDecoder {
             return Err(CodecError::Decode(format!("{err} (continuing in software after the next seek)")));
         };
         let mut frames = Vec::new();
-        for (s, p) in &log {
+        let mut rejected = None;
+        let last = log.len().saturating_sub(1);
+        for (i, (s, p)) in log.iter().enumerate() {
             let Some(sw) = self.sw.as_mut() else { break };
-            frames.extend(sw.decode(s, *p)?);
+            match sw.decode(s, *p) {
+                Ok(out) => Self::retain_replay(&mut frames, out)?,
+                Err(e) if i == last => rejected = Some(e),
+                Err(e) => log::warn!("software replay after the hardware decoder failed: {e}"),
+            }
         }
         self.log = Some(log);
-        Ok(self.merge(frames))
+        match rejected {
+            None => Ok(self.merge(frames)),
+            Some(e) => {
+                for f in frames {
+                    if !self.emitted.contains(&f.pts) {
+                        self.carry.insert(f.pts, f);
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -231,5 +261,26 @@ impl VideoDecoder for HybridDecoder {
         if let Some(sw) = self.sw.as_mut() {
             sw.set_draft(on);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use filmcraft_frame::VideoFrame;
+
+    use super::*;
+
+    fn frame(pts: i64) -> DecodedFrame {
+        DecodedFrame { pts, frame: VideoFrame::rgba8(1, 1, vec![0, 0, 0, 255]), draft: false }
+    }
+
+    #[test]
+    fn replay_output_has_a_hard_limit() {
+        let mut retained = Vec::new();
+        HybridDecoder::retain_replay(&mut retained, (0..REPLAY_OUTPUT_MAX as i64).map(frame).collect()).unwrap();
+
+        let err = HybridDecoder::retain_replay(&mut retained, vec![frame(REPLAY_OUTPUT_MAX as i64)]).unwrap_err();
+        assert!(err.to_string().contains("too many frames"));
+        assert_eq!(retained.len(), REPLAY_OUTPUT_MAX);
     }
 }

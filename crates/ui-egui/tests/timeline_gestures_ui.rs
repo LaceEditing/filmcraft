@@ -382,14 +382,15 @@ fn rubber_bands_draw_fades_on_clips() {
     let del = centre(&mut d, &format!("timeline.clip.{}.band.kf.0.delete", c.0));
     d.click(del.0, del.1, json!({}));
     assert_eq!(param(&d, c, "opacity", "opacity").keyframes.len(), 1);
-    // C's sound: its Volume line dragged down lowers its level
-    let band = rect(&mut d, &format!("timeline.clip.{}.band", audio_c.0));
+    // C's sound: its Volume line (#223, `timeline.clip.<id>.volume`, a point on the line) dragged
+    // down lowers its level
+    let clip = rect(&mut d, &format!("timeline.clip.{}", audio_c.0));
+    let line = rect(&mut d, &format!("timeline.clip.{}.volume", audio_c.0));
     let level0 = param(&d, audio_c, "volume", "level").value.as_f64().unwrap();
-    // (the line: where the level sits in the band, on the fader's taper)
-    let y_line = band[1] + band[3] * (1.0 - f64::from(filmcraft_ui_egui::panels::mixer::db_to_pos(level0)));
-    d.ok("ui.move", json!({"x": d.x(120.0), "y": y_line}));
+    let (x, y_line) = (line[0] + line[2] / 2.0, line[1] + line[3] / 2.0);
+    d.ok("ui.move", json!({"x": x, "y": y_line}));
     d.frames(2);
-    d.drag((d.x(120.0), y_line), (d.x(120.0), y_line + band[3] * 0.3), json!({}));
+    d.drag((x, y_line), (x, y_line + clip[3] * 0.3), json!({}));
     let level1 = param(&d, audio_c, "volume", "level").value.as_f64().unwrap();
     assert!(level1 < level0 - 3.0, "{level0} → {level1}");
 }
@@ -597,16 +598,22 @@ fn copy_and_paste_keys_work_across_sequences() {
     let y = d.y(a);
     d.click(d.x(24.0), y, json!({}));
     assert!(d.selected().contains(&a));
-    // the window's Copy event enters through the input hook, as it does in the app
+    // the window's Copy event enters through the input hook, as it does in the app: with Cmd/Ctrl
+    // held (a Copy event without it is the keyboard's own Copy key, #199)
+    let held = |d: &mut Driver, m: egui::Modifiers| d.harness.input_mut().events.push(egui::Event::ModifiersChanged(m));
+    held(&mut d, egui::Modifiers::COMMAND);
     d.harness.input_mut().events.push(egui::Event::Copy);
     d.frames(3);
+    held(&mut d, egui::Modifiers::NONE);
     assert_eq!(d.app().session.state.clipboard.len(), 2, "picture and sound copied");
     // a second sequence: paste at its start
     d.exec("file.newSequence", json!({"name": "Other", "video": 2, "audio": 2}));
     d.ok("ui.set", json!({"focused": "Timeline"}));
     d.exec("playhead.set", json!({"seconds": 0}));
+    held(&mut d, egui::Modifiers::COMMAND);
     d.harness.input_mut().events.push(egui::Event::Paste(String::new()));
     d.frames(3);
+    held(&mut d, egui::Modifiers::NONE);
     let app = d.app();
     let active = app.session.state.active_sequence.unwrap();
     assert_eq!(app.session.project.item(active).unwrap().name, "Other");

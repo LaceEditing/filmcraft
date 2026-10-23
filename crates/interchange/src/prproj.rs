@@ -610,9 +610,12 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let transitions = self.ix.list(track, &["ClipTrack", "TransitionItems", "TrackItems"], "TrackItem");
         for item in items {
             if let Some(clip) = self.clip(item, kind, frame) {
-                let placed = self.b.place(seq, kind, ti, clip);
-                if placed != ti {
-                    self.report.warn("overlapping clips on one track; the later one was moved to a new track");
+                match self.b.place(seq, kind, ti, clip) {
+                    Some(placed) if placed != ti => self.report.warn("overlapping clips on one track; the later one was moved to a new track"),
+                    Some(_) => {}
+                    None => {
+                        self.report.warn(format!("{kind:?} track exceeds the {}-track import limit; a clip was skipped", crate::common::MAX_IMPORTED_TRACKS))
+                    }
                 }
             }
         }
@@ -984,7 +987,8 @@ pub(crate) fn clip_gain_db(clip: Node<'_, '_>) -> f64 {
 #[path = "prproj_tests.rs"]
 pub(crate) mod tests;
 
-/// The interchange tests' document (see [`crate::prproj_test_document`]).
+/// The interchange tests' document (see [`crate::prproj_test_document`]), with `\n` line ends
+/// whatever the checkout turned them into (Git's `core.autocrlf` writes CRLF on Windows).
 pub(crate) fn test_document() -> String {
-    include_str!("prproj_test_document.xml").to_string()
+    include_str!("prproj_test_document.xml").replace("\r\n", "\n")
 }

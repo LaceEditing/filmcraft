@@ -128,7 +128,9 @@ pub(crate) fn wheel(app: &mut FilmcraftApp, ui: &egui::Ui, lane: &Lane, clip: Cl
     };
     if (factor - 1.0).abs() > 1e-6 {
         let at = lane.tl_at(p.x).0 as f64;
-        let ns = (span * factor).clamp(lane.fd.0 as f64 * 4.0, (lane.end - lane.start).0.max(1) as f64);
+        // at least four frames, unless the clip is shorter (clamp would panic with min > max)
+        let whole = (lane.end - lane.start).0.max(1) as f64;
+        let ns = (span * factor).max(lane.fd.0 as f64 * 4.0).min(whole);
         t0 = at - (at - t0) * ns / span;
         span = ns;
         changed = true;
@@ -147,8 +149,9 @@ pub(crate) fn wheel(app: &mut FilmcraftApp, ui: &egui::Ui, lane: &Lane, clip: Cl
 /// Show `span` ticks of the clip from `t0` (kept inside the clip).
 fn set_view(app: &mut FilmcraftApp, lane: &Lane, clip: ClipId, t0: f64, span: f64) {
     let whole = (lane.end - lane.start).0.max(1) as f64;
-    let span = span.clamp(lane.fd.0 as f64 * 4.0, whole);
-    let t0 = t0.clamp(lane.start.0 as f64, lane.end.0 as f64 - span);
+    // at least four frames, unless the clip is shorter (clamp would panic with min > max)
+    let span = span.max(lane.fd.0 as f64 * 4.0).min(whole);
+    let t0 = t0.min(lane.end.0 as f64 - span).max(lane.start.0 as f64);
     let (a, b) = (t0.round() as i64, (t0 + span).round() as i64);
     app.ui.ec_view = if a <= lane.start.0 && b >= lane.end.0 { None } else { Some(EcView { clip: clip.0, start: a, end: b }) };
 }
@@ -214,10 +217,16 @@ struct LaneDrag {
     start_x: f32,
     /// Timeline ticks moved so far.
     applied: i64,
+    /// Media ticks the selection's times moved so far (Escape puts them back).
+    applied_media: i64,
     /// How far they may go (timeline ticks): not past a neighbour, not out of the clip.
     lo: i64,
     hi: i64,
 }
+
+/// Shift snaps a dragged keyframe to the playhead or to another keyframe of the clip within this
+/// many screen points, as Premiere does.
+const SNAP_PX: f64 = 8.0;
 
 fn lane_drag_id(clip: ClipId) -> egui::Id {
     egui::Id::new(("ec-lane-drag", clip.0))
@@ -232,43 +241,100 @@ pub(crate) fn start_lane_drag(ui: &egui::Ui, clip: ClipId) {
 }
 
 /// Run the lane drag: started this frame (bounds computed from the selection), moved as the
-/// pointer goes (whole frames), ended when the button is released.
+/// pointer goes (whole frames), ended when the button is released. Shift snaps the dragged
+/// keyframes to the playhead or to the clip's other keyframes; Escape ends the drag with the
+/// keyframes back where they were (the app takes back the press's edits, #580).
 pub(crate) fn run_lane_drag(app: &mut FilmcraftApp, ui: &egui::Ui, it: &TrackItem, lane: &Lane, actions: &mut Vec<(String, Value)>) {
     let id = lane_drag_id(it.id);
     if let Some(x) = ui.data_mut(|d| d.remove_temp::<f32>(id.with("start"))) {
         let (lo, hi) = lane_bounds(app, it, lane);
-        ui.data_mut(|d| d.insert_temp(id, LaneDrag { clip: it.id.0, start_x: x, applied: 0, lo, hi }));
+        ui.data_mut(|d| d.insert_temp(id, LaneDrag { clip: it.id.0, start_x: x, applied: 0, applied_media: 0, lo, hi }));
     }
     let Some(mut drag) = ui.data(|d| d.get_temp::<LaneDrag>(id)) else { return };
-    let (down, px, shift) = ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos().map(|p| p.x), i.modifiers.shift));
-    if !down {
+    let (down, px, shift, escape) =
+        ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos().map(|p| p.x), i.modifiers.shift, i.key_pressed(egui::Key::Escape)));
+    if !down || escape {
         ui.data_mut(|d| d.remove::<LaneDrag>(id));
+        if down && escape {
+            for s in app.ui.kf_selected.iter_mut().filter(|s| s.clip == drag.clip) {
+                s.time -= drag.applied_media;
+            }
+        }
         return;
     }
     let Some(px) = px else { return };
     let mut want = lane.frames((px - drag.start_x) as f64 * lane.ticks_per_px());
-    // Shift: snap the dragged keyframes' first one to the playhead (as Premiere)
-    if shift && let Some(first) = app.ui.kf_selected.iter().filter(|s| s.clip == drag.clip).map(|s| lane.tl_of(Tick(s.time)).0).min() {
-        let ph = app.session.playhead().0;
-        if (first + want - ph).abs() as f64 <= 8.0 * lane.ticks_per_px() {
-            want = ph - first;
-        }
+    let bounded = |w: i64| if drag.lo <= drag.hi { w.clamp(drag.lo, drag.hi) } else { 0 };
+    // Shift: the nearest of the dragged keyframes and the playhead or another keyframe of the clip
+    if shift && let Some((delta, x)) = snap(app, it, lane, &drag, want) {
+        want = delta;
+        let guide = Rect::from_min_max(pos2(x - 1.0, lane.rect.min.y), pos2(x + 1.0, lane.rect.max.y));
+        ui.painter().with_clip_rect(lane.rect.expand(1.0)).rect_filled(guide, 0.0, app.tokens.accent);
+        app.auto.add("effectControls.snapTarget", guide, "snap");
     }
-    let want = if drag.lo <= drag.hi { want.clamp(drag.lo, drag.hi) } else { 0 };
+    let want = bounded(want);
     let delta = want - drag.applied;
     if delta == 0 {
         return;
     }
-    let by_media = (delta as f64 * it.speed.abs()).round() as i64;
-    let keys: Vec<Value> = app.ui.kf_selected.iter().filter(|s| s.clip == drag.clip).map(KfSel::key_json).collect();
+    // media ticks, as effects.moveKeyframes turns the timeline delta into them (backwards when reversed)
+    let by_media = (delta as f64 * it.speed.abs() * if it.reverse { -1.0 } else { 1.0 }).round() as i64;
+    let keys: Vec<Value> = app
+        .ui
+        .kf_selected
+        .iter()
+        .filter(|s| s.clip == drag.clip)
+        .map(|s| {
+            let mut k = json!({"clip": s.clip, "effect": s.effect, "param": s.param, "time": s.time});
+            if let Some(m) = s.mask {
+                k["mask"] = json!(m);
+            }
+            k
+        })
+        .collect();
     if by_media != 0 && !keys.is_empty() {
-        actions.push(("effects.moveKeyframes".into(), json!({"clip": drag.clip, "keys": keys, "by": by_media})));
+        actions.push(("effects.moveKeyframes".into(), json!({"keyframes": keys, "delta": delta})));
         for s in app.ui.kf_selected.iter_mut().filter(|s| s.clip == drag.clip) {
             s.time += by_media;
         }
+        drag.applied_media += by_media;
     }
     drag.applied = want;
     ui.data_mut(|d| d.insert_temp(id, drag));
+}
+
+/// Shift-drag snapping: where the dragged keyframes go (timeline ticks from where the drag began)
+/// so that one of them sits on the playhead or on another keyframe of the clip, the target within
+/// [`SNAP_PX`] screen points of where `want` puts it, and the guide's x. None: nothing that near.
+fn snap(app: &FilmcraftApp, it: &TrackItem, lane: &Lane, drag: &LaneDrag, want: i64) -> Option<(i64, f32)> {
+    let sel: Vec<&KfSel> = app.ui.kf_selected.iter().filter(|s| s.clip == drag.clip).collect();
+    // where the dragged keyframes were when the drag began
+    let from: Vec<i64> = sel.iter().map(|s| lane.tl_of(Tick(s.time)).0 - drag.applied).collect();
+    let mut targets = vec![app.session.playhead().0];
+    for (effect, e) in it.effects.iter().enumerate() {
+        let params = e.params.iter().map(|(p, v)| (None, p.as_str(), v));
+        let masks = e
+            .masks
+            .iter()
+            .enumerate()
+            .flat_map(|(m, mask)| filmcraft_project::mask::MASK_PARAMS.iter().filter_map(move |p| mask.param(p).map(|v| (Some(m), *p, v))));
+        for (mask, param, p) in params.chain(masks) {
+            let moving = |t: Tick| sel.iter().any(|s| s.effect == effect && s.mask == mask && s.param == param && s.time == t.0);
+            targets.extend(p.keyframes.iter().filter(|k| !moving(k.time)).map(|k| lane.tl_of(k.time).0));
+        }
+    }
+    let px = lane.ticks_per_px().max(1e-9);
+    let mut best: Option<(f64, i64, i64)> = None;
+    for f in &from {
+        for t in &targets {
+            let delta = t - f;
+            let off = ((delta - want) as f64 / px).abs();
+            if off <= SNAP_PX && drag.lo <= delta && delta <= drag.hi && best.is_none_or(|b| off < b.0) {
+                best = Some((off, delta, *t));
+            }
+        }
+    }
+    best.map(|(_, delta, t)| (delta, lane.x(Tick(t))))
 }
 
 /// How far the selected keyframes of `it` may move (timeline ticks): each stays a frame short of
@@ -513,10 +579,18 @@ pub(crate) fn graph_rows(
                 }
             }
         }
+        // a right-click opens the lane keyframe's menu (interpolation, Copy, Clear, #962), for the
+        // selected keyframes of the clip when this one is among them
+        let me = KfSel { clip: clip.0, effect: idx, param: pd.id.to_string(), mask, time: k.time.0 };
+        let menu_keys: Vec<Value> = if app.ui.kf_selected.contains(&me) {
+            app.ui.kf_selected.iter().filter(|s| s.clip == clip.0).map(KfSel::key_json).collect()
+        } else {
+            vec![me.key_json()]
+        };
         for (c, v) in vals.iter().enumerate() {
             let kp = pos2(x, y_of(*v));
             let r = Rect::from_center_size(kp, vec2(12.0, 12.0));
-            let resp = ui.interact(r, egui::Id::new(("ec-graph-key", &gkey, k.time.0, c)), Sense::drag());
+            let resp = ui.interact(r, egui::Id::new(("ec-graph-key", &gkey, k.time.0, c)), Sense::click_and_drag());
             let hot = resp.hovered() || dragging.as_ref().is_some_and(|g| g.cur == k.time.0 && g.comp == c && g.handle.is_none());
             let col = if point { COMP_COLORS[c] } else { Color32::from_rgb(0xe0, 0xe0, 0xe0) };
             p.circle_filled(kp, if hot { 5.5 } else { 4.5 }, if hot { Color32::WHITE } else { col });
@@ -526,7 +600,8 @@ pub(crate) fn graph_rows(
                 "{}  ·  {v:.dec$}",
                 filmcraft_time::format_time(lane.tl_of(k.time), rate, false, filmcraft_time::TimeDisplay::Timecode, 48000)
             ));
-            if resp.drag_started() {
+            resp.context_menu(|ui| crate::panels::effect_controls::keyframe_menu(app, ui, clip.0, &menu_keys, actions));
+            if resp.drag_started_by(egui::PointerButton::Primary) {
                 started = Some(GraphDrag {
                     start: ui.input(|i| i.pointer.press_origin()).unwrap_or(kp),
                     mt0: k.time.0,
@@ -588,8 +663,10 @@ pub(crate) fn graph_rows(
                 }
             }
             let dt_media = ((lane.frames(d.x as f64 * lane.ticks_per_px()) as f64) * it.speed.abs()).round() as i64;
-            let want_t = (g.mt0 + dt_media).clamp(g.lo + fd_media, g.hi - fd_media);
-            let want_t = if g.lo + fd_media > g.hi - fd_media { g.cur } else { want_t };
+            // between the neighbouring keyframes, a frame off each; no room: it stays (Ord::clamp
+            // panics with min > max)
+            let (lo, hi) = (g.lo.saturating_add(fd_media), g.hi.saturating_sub(fd_media));
+            let want_t = if lo > hi { g.cur } else { g.mt0.saturating_add(dt_media).clamp(lo, hi) };
             let mut vals = g.v0.clone();
             let nv = g.v0.get(g.comp).copied().unwrap_or(0.0) - d.y as f64 * g.upp;
             let nv = match pd.kind {

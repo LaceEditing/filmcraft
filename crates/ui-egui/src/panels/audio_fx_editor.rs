@@ -60,6 +60,8 @@ pub enum FxTarget {
 const BG: Color32 = Color32::from_gray(0x23);
 const TITLE_BG: Color32 = Color32::from_gray(0x2e);
 const LINE: Color32 = Color32::from_gray(0x3c);
+const GRID: Color32 = Color32::from_gray(0x2c);
+const AXIS: Color32 = Color32::from_gray(0x48);
 const LABEL: Color32 = Color32::from_gray(0xcc);
 const DIM: Color32 = Color32::from_gray(0x80);
 const KNOB: Color32 = Color32::from_gray(0xb8);
@@ -234,6 +236,19 @@ impl Ed<'_> {
         // keep showing the new value until the project catches up this frame
         self.drafts.insert(pid.to_string(), v);
     }
+    /// The end of a drag of `pids`: commit their drafts, or drop them when Escape ended the drag
+    /// (egui ends a drag on Escape, #580).
+    fn release(&mut self, ui: &egui::Ui, pids: &[&str]) {
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        for pid in pids {
+            if escape {
+                self.drafts.remove(*pid);
+            } else {
+                let v = self.v(pid);
+                self.commit(pid, v);
+            }
+        }
+    }
     fn auto(&mut self, id: String, r: Rect, label: &str) {
         self.autos.push((id, r, label.to_string()));
     }
@@ -276,8 +291,7 @@ impl Ed<'_> {
             }
         }
         if resp.drag_stopped() {
-            let c = self.v(pid);
-            self.commit(pid, c);
+            self.release(ui, &[pid]);
         }
     }
 
@@ -308,8 +322,7 @@ impl Ed<'_> {
             self.drafts.insert(pid.to_string(), self.value_of_u(pid, nu));
         }
         if resp.drag_stopped() {
-            let nv = self.v(pid);
-            self.commit(pid, nv);
+            self.release(ui, &[pid]);
         }
         // (egui counts a click elsewhere just before as the first of three)
         if resp.double_clicked() || resp.triple_clicked() {
@@ -377,7 +390,9 @@ impl Ed<'_> {
             let u = (pos.x - track.min.x) / track.width().max(1.0);
             self.drafts.insert(pid.to_string(), self.value_of_u(pid, u));
         }
-        if resp.drag_stopped() || resp.clicked() {
+        if resp.drag_stopped() {
+            self.release(ui, &[pid]);
+        } else if resp.clicked() {
             let nv = self.v(pid);
             self.commit(pid, nv);
         }
@@ -552,8 +567,8 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             close.push(target);
             continue;
         }
-        let name = res.inst.def().map(|d| d.name).unwrap_or("Effect");
-        let kind = if matches!(target, FxTarget::Clip { .. }) { "Clip Fx Editor" } else { "Track Fx Editor" };
+        let name = res.inst.def().map_or(tl!("Effect"), |d| crate::i18n::t(d.name));
+        let kind = if matches!(target, FxTarget::Clip { .. }) { tl!("Clip Fx Editor") } else { tl!("Track Fx Editor") };
         let title = format!("{kind} - {name}: {}", res.place);
         let k = key(&target);
         let drafts_id = egui::Id::new(("fx-editor-drafts", &k));
@@ -667,7 +682,7 @@ fn title_bar(ui: &mut egui::Ui, ed: &mut Ed, title: &str, closed: &mut bool) {
     let clip = ui.painter().with_clip_rect(Rect::from_min_max(r.min, pos2(r.max.x - 40.0, r.max.y)));
     clip.text(pos2(r.min.x + 12.0, r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(14.0), Color32::from_gray(0xe6));
     let xr = Rect::from_min_max(pos2(r.max.x - 36.0, r.min.y + 4.0), pos2(r.max.x - 6.0, r.max.y - 4.0));
-    let resp = ui.interact(xr, egui::Id::new(("fx-editor-close", ed.target.clone())), Sense::click()).on_hover_text("Close");
+    let resp = ui.interact(xr, egui::Id::new(("fx-editor-close", ed.target.clone())), Sense::click()).on_hover_text(tl!("Close"));
     if resp.hovered() {
         ui.painter().rect_filled(xr, 2.0, RED);
     }
@@ -902,7 +917,7 @@ fn dynamics(ui: &mut egui::Ui, ed: &mut Ed) {
             ui.painter().line_segment([pos2(r.min.x + 8.0, r.center().y), pos2(r.max.x - 8.0, r.center().y)], Stroke::new(1.0, LINE));
             ed.title(ui, Some("lim_on"), "Limiter");
             limit_light(ui, ed, m[3]);
-            ed.knobs(ui, &[("lim_threshold", "Threshold"), ("lim_release", "Release")]);
+            ed.knobs(ui, &[("lim_threshold", tl!("Threshold")), ("lim_release", tl!("Release"))]);
             ed.knobs(ui, &[("output", "Output")]);
             ui.horizontal(|ui| {
                 ui.add_space(22.0);
@@ -1047,7 +1062,7 @@ fn response_plot(ui: &mut egui::Ui, ed: &mut Ed, size: egui::Vec2, range: f64) -
     p.rect_filled(r, 2.0, Color32::from_gray(0x16));
     for f in [50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0] {
         let x = x_of(f, r);
-        p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.0, Color32::from_gray(0x2c)));
+        p.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(1.0, GRID));
         let label = if f >= 1000.0 { format!("{}k", f / 1000.0) } else { format!("{f}") };
         p.text(pos2(x + 2.0, r.max.y - 2.0), Align2::LEFT_BOTTOM, label, Tokens::ui(9.5), DIM);
     }
@@ -1055,7 +1070,7 @@ fn response_plot(ui: &mut egui::Ui, ed: &mut Ed, size: egui::Vec2, range: f64) -
     let mut d = -range;
     while d <= range + 1e-9 {
         let y = y_of(d, r, range);
-        let col = if d.abs() < 1e-9 { Color32::from_gray(0x48) } else { Color32::from_gray(0x2c) };
+        let col = if d.abs() < 1e-9 { AXIS } else { GRID };
         p.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], Stroke::new(1.0, col));
         p.text(pos2(r.min.x + 2.0, y - 1.0), Align2::LEFT_BOTTOM, format!("{d:+.0}"), Tokens::ui(9.5), DIM);
         d += step;
@@ -1173,12 +1188,8 @@ fn parametric(ui: &mut egui::Ui, ed: &mut Ed) {
             ui.ctx().request_repaint();
         }
         if resp.drag_stopped() {
-            let fv = ed.v(&f_id);
-            ed.commit(&f_id, fv);
-            if kind != PeqKind::Pass {
-                let gv = ed.v(&g_id);
-                ed.commit(&g_id, gv);
-            }
+            let pids = if kind != PeqKind::Pass { vec![f_id.as_str(), g_id.as_str()] } else { vec![f_id.as_str()] };
+            ed.release(ui, &pids);
             ui.ctx().request_repaint();
         }
     }
@@ -1238,7 +1249,7 @@ fn parametric(ui: &mut egui::Ui, ed: &mut Ed) {
         }
     });
     ui.add_space(4.0);
-    ed.slider_row(ui, "master_gain", "Gain");
+    ed.slider_row(ui, "master_gain", tl!("Gain"));
     ui.ctx().data_mut(|d| {
         d.insert_temp(grab_id, grab);
         match &selected {
@@ -1436,14 +1447,13 @@ fn graphic(ui: &mut egui::Ui, ed: &mut Ed) {
             ed.drafts.insert(pid.clone(), (db * 2.0).round() / 2.0);
         }
         if resp.drag_stopped() {
-            let nv = ed.v(&pid);
-            ed.commit(&pid, nv);
+            ed.release(ui, &[pid.as_str()]);
         }
         if resp.double_clicked() {
             ed.commit(&pid, 0.0);
         }
     }
-    ed.slider_row(ui, "gain", "Master Gain");
+    ed.slider_row(ui, "gain", tl!("Master Gain"));
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         let r = ui.button("Reset Bands");
@@ -1468,10 +1478,10 @@ fn transfer_plot(ui: &mut egui::Ui, ed: &mut Ed, size: f32, band: usize, auto: S
     let lo = -60.0;
     let map = |x: f64, y: f64| pos2(r.min.x + ((x - lo) / -lo) as f32 * r.width(), r.max.y - (((y - lo) / -lo).clamp(-0.05, 1.05)) as f32 * r.height());
     for d in [-48.0, -36.0, -24.0, -12.0] {
-        p.line_segment([map(d, lo), map(d, 0.0)], Stroke::new(1.0, Color32::from_gray(0x2c)));
-        p.line_segment([map(lo, d), map(0.0, d)], Stroke::new(1.0, Color32::from_gray(0x2c)));
+        p.line_segment([map(d, lo), map(d, 0.0)], Stroke::new(1.0, GRID));
+        p.line_segment([map(lo, d), map(0.0, d)], Stroke::new(1.0, GRID));
     }
-    p.line_segment([map(lo, lo), map(0.0, 0.0)], Stroke::new(1.0, Color32::from_gray(0x44)));
+    p.line_segment([map(lo, lo), map(0.0, 0.0)], Stroke::new(1.0, AXIS));
     if let Some(dsp) = filmcraft_render::audio_fx::configured(&ed.preview(), ed.mt, 48000) {
         let pts: Vec<Pos2> = (0..=120)
             .filter_map(|i| {
@@ -1481,8 +1491,8 @@ fn transfer_plot(ui: &mut egui::Ui, ed: &mut Ed, size: f32, band: usize, auto: S
             .collect();
         p.add(egui::Shape::line(pts, Stroke::new(1.6, AMBER)));
     }
-    p.text(r.left_top() + vec2(3.0, 2.0), Align2::LEFT_TOP, "out", Tokens::ui(9.0), DIM);
-    p.text(r.right_bottom() - vec2(3.0, 2.0), Align2::RIGHT_BOTTOM, "in", Tokens::ui(9.0), DIM);
+    p.text(r.left_top() + vec2(3.0, 2.0), Align2::LEFT_TOP, tl!("out"), Tokens::ui(9.0), DIM);
+    p.text(r.right_bottom() - vec2(3.0, 2.0), Align2::RIGHT_BOTTOM, tl!("in"), Tokens::ui(9.0), DIM);
     ed.auto(auto, r, "Transfer curve");
 }
 
@@ -1500,7 +1510,7 @@ fn multiband(ui: &mut egui::Ui, ed: &mut Ed) {
     for b in 0..4 {
         let br = Rect::from_min_max(pos2(edges[b], r.min.y), pos2(edges[b + 1], r.max.y));
         ui.painter().rect_filled(br.shrink2(vec2(0.0, 8.0)), 0.0, cols[b].gamma_multiply(0.35));
-        ui.painter().text(br.center(), Align2::CENTER_CENTER, format!("Band {}", b + 1), Tokens::ui(10.5), LABEL);
+        ui.painter().text(br.center(), Align2::CENTER_CENTER, tlf!("Band {n}", n = b + 1), Tokens::ui(10.5), LABEL);
     }
     for (k, pid) in ["xo1", "xo2", "xo3"].iter().enumerate() {
         let x = edges[k + 1];
@@ -1516,8 +1526,7 @@ fn multiband(ui: &mut egui::Ui, ed: &mut Ed) {
             ed.drafts.insert(pid.to_string(), fx_of(pos.x, r).clamp(lo, hi).round());
         }
         if resp.drag_stopped() {
-            let v = ed.v(pid);
-            ed.commit(pid, v);
+            ed.release(ui, &[pid]);
         }
     }
     ui.add_space(8.0);
@@ -1525,7 +1534,7 @@ fn multiband(ui: &mut egui::Ui, ed: &mut Ed) {
         for b in 1..=4 {
             ui.vertical(|ui| {
                 ui.set_width(2.0 * ed.cell.x);
-                ui.vertical_centered(|ui| ui.label(egui::RichText::new(format!("Band {b}")).color(LABEL).size(14.0)));
+                ui.vertical_centered(|ui| ui.label(egui::RichText::new(tlf!("Band {n}", n = b)).color(LABEL).size(14.0)));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add_space(ed.cell.x - 55.0);
@@ -1534,30 +1543,30 @@ fn multiband(ui: &mut egui::Ui, ed: &mut Ed) {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    ed.check(ui, &format!("b{b}_solo"), "Solo", false);
+                    ed.check(ui, &format!("b{b}_solo"), tl!("Solo"), false);
                     ui.add_space(8.0);
-                    ed.check(ui, &format!("b{b}_bypass"), "Bypass", false);
+                    ed.check(ui, &format!("b{b}_bypass"), tl!("Bypass"), false);
                 });
                 let k = |p: &str| format!("b{b}_{p}");
                 let (th, ra, at, re, ga) = (k("threshold"), k("ratio"), k("attack"), k("release"), k("gain"));
-                ed.knobs(ui, &[(&th, "Threshold"), (&ra, "Ratio")]);
-                ed.knobs(ui, &[(&at, "Attack"), (&re, "Release")]);
-                ed.knobs(ui, &[(&ga, "Gain")]);
+                ed.knobs(ui, &[(&th, tl!("Threshold")), (&ra, tl!("Ratio"))]);
+                ed.knobs(ui, &[(&at, tl!("Attack")), (&re, tl!("Release"))]);
+                ed.knobs(ui, &[(&ga, tl!("Gain"))]);
             });
         }
     });
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
     ui.painter().line_segment([pos2(r.min.x, r.center().y), pos2(r.max.x, r.center().y)], Stroke::new(1.0, LINE));
     ui.horizontal_top(|ui| {
-        ed.knobs(ui, &[("output", "Output")]);
+        ed.knobs(ui, &[("output", tl!("Output"))]);
         ui.add_space(2.0 * ed.cell.x);
         ui.vertical(|ui| {
             ui.add_space(6.0);
-            ed.check(ui, "lim_on", "Limiter", true);
+            ed.check(ui, "lim_on", tl!("Limiter"), true);
             ui.add_space(8.0);
-            ed.check(ui, "link", "Link Channels", false);
+            ed.check(ui, "link", tl!("Link Channels"), false);
         });
         ui.add_space(20.0);
-        ed.knobs(ui, &[("lim_threshold", "Threshold"), ("lim_release", "Release")]);
+        ed.knobs(ui, &[("lim_threshold", tl!("Threshold")), ("lim_release", tl!("Release"))]);
     });
 }

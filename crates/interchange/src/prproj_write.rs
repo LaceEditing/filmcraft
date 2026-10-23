@@ -699,7 +699,7 @@ fn asset_model<'a, 'i>(ix: &Index<'a, 'i>, root: Node<'a, 'i>, project: &Project
     }
     let info = &m.info;
     let ext = ext_of(project, item);
-    let channels = info.audio.as_ref().map(|a| a.channels);
+    let channels = info.audio().map(|a| a.channels);
     let still = info.kind == filmcraft_media::MediaKind::Still;
     if !still && info.duration.0 <= 0 {
         return None;
@@ -715,7 +715,7 @@ fn asset_model<'a, 'i>(ix: &Index<'a, 'i>, root: Node<'a, 'i>, project: &Project
         }
         let has_v = child(media, "VideoStream").is_some();
         let has_a = child(media, "AudioStream").is_some();
-        if has_v != info.video.is_some() || (has_a != info.audio.is_some() && !still) {
+        if has_v != info.video.is_some() || (has_a != info.audio().is_some() && !still) {
             continue;
         }
         let ch = ix
@@ -2520,7 +2520,7 @@ impl<'a, 'i> Writer<'a, 'i> {
             .map(|v| v.frame_rate)
             .filter(|r| r.num > 0 && r.den > 0)
             .map(|r| (prproj_graph::TICKS_PER_SECOND as i128 * r.den as i128 / r.num as i128) as i64);
-        let audio_rate = info.audio.as_ref().map(|a| a.sample_rate).filter(|r| *r > 0).map(|r| prproj_graph::TICKS_PER_SECOND / r as i64);
+        let audio_rate = info.audio().map(|a| a.sample_rate).filter(|r| *r > 0).map(|r| prproj_graph::TICKS_PER_SECOND / r as i64);
         let mut asset = Asset { master_uid: String::new(), item_uid: String::new(), name: name.clone(), video: None, audio: None };
         let objects: Vec<(Node<'a, 'i>, usize)> =
             copies.iter().filter_map(|(k, i)| self.ix.ids.get(k).or_else(|| self.ix.uids.get(k)).map(|n| (*n, *i))).collect();

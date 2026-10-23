@@ -267,6 +267,22 @@ fn timestamps() {
     assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (2023, 11, 14, 22, 13, 20));
     let t = Timestamp::from_unix(951_782_400); // 2000-02-29
     assert_eq!((t.year, t.month, t.day), (2000, 2, 29));
+    // Years far outside chrono's own range are preserved with month/day/time intact and only the
+    // year clamped to the MXF `u16`, exactly as the old hand-rolled conversion did (not collapsed
+    // to the epoch — reviewer FredApps). `10_000_000_000_000` s → 318857-05-20 17:46:40.
+    let t = Timestamp::from_unix(10_000_000_000_000);
+    assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (65535, 5, 20, 17, 46, 40));
+    // Year 10000 (just past chrono's range) still fits the u16 field.
+    let t = Timestamp::from_unix(253_402_300_800);
+    assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (10000, 1, 1, 0, 0, 0));
+    // A negative year clamps to 0 but keeps its month/day/time.
+    let t = Timestamp::from_unix(-10_000_000_000_000);
+    assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (0, 8, 13, 6, 13, 20));
+    // The `i64` extremes the old code accepted.
+    let t = Timestamp::from_unix(i64::MAX);
+    assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (65535, 12, 4, 15, 30, 7));
+    let t = Timestamp::from_unix(i64::MIN);
+    assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (0, 1, 27, 8, 29, 52));
 }
 
 #[test]
@@ -315,4 +331,27 @@ fn truncated_and_mutated_files_never_panic() {
             }
         }
     }
+}
+
+/// #210 review: a whole-clip read of long stereo PCM (more samples than the old fixed
+/// 16 777 216-sample request cap, about 175 s at 48 kHz) must work; only reads far past the stored
+/// essence are refused.
+#[test]
+fn long_pcm_reads_backed_by_the_file_are_not_capped() {
+    let frames = 200 * 48_000;
+    let samples: Vec<i32> = (0..frames * 2).map(|k| (k % 60_000) as i32 - 30_000).collect();
+    let opts = OpAtomPcm { sample_rate: 48_000, bits: 16, channels: 2, edit_rate: None, ids: PackageIds::from_seed("long", "Long"), timecode: None };
+    let f = write_opatom_pcm(&opts, &samples).unwrap();
+    let m = open(&f).unwrap();
+    assert_eq!(m.tracks[0].stored_sample_frames(), frames as u64);
+    // a little past the end is zero padding, as before
+    let pcm = m.read_pcm(&f, 0, 0, frames + 10).unwrap();
+    assert_eq!((pcm.len(), pcm[0].len()), (2, frames + 10));
+    for k in [0, 1, frames / 2, frames - 1] {
+        assert_eq!(pcm[0][k], samples[2 * k] as f32 / 32768.0, "frame {k}");
+        assert_eq!(pcm[1][k], samples[2 * k + 1] as f32 / 32768.0, "frame {k}");
+    }
+    assert_eq!(pcm[0][frames..], [0.0; 10]);
+    // a request that is mostly not backed by data is refused before allocating
+    assert!(m.read_pcm(&f, 0, 0, frames + (1 << 24)).is_err());
 }

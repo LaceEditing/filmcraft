@@ -7,10 +7,15 @@
 //! Everything goes through `effects.setParam` / `effects.addKeyframe` / `effects.setKeyframe` /
 //! `effects.deleteKeyframe`. Timeline ▸ settings ▸ Show Video / Audio Keyframes hide them.
 //!
+//! Presses on the line go through the Timeline's own hit-testing ([`on_line`], as the audio
+//! clips' Volume line does), so a click there still selects the clip (Alt: one side of a link),
+//! a right-click opens the clip menu and an Alt-drag copies the clip; only a plain drag, or a
+//! ⌘-click / Pen click, is the band's.
+//!
 //! Automation ids: `timeline.clip.<id>.band` (the clip's band) and
 //! `timeline.clip.<id>.band.kf.<n>` (its diamonds, in time order).
 
-use egui::{Color32, CursorIcon, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Color32, CursorIcon, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use filmcraft_project::{ClipId, Param, ParamValue, Sequence, TrackItem, TrackKind};
 use filmcraft_time::Tick;
 use serde_json::{Value, json};
@@ -18,7 +23,6 @@ use serde_json::{Value, json};
 use super::timeline::{Drag, Layout};
 use crate::FilmcraftApp;
 use crate::icons::{self, Icon};
-use crate::state::Tool;
 
 /// The parameter a clip's band shows: (effect, param).
 fn target(kind: TrackKind) -> (&'static str, &'static str) {
@@ -53,6 +57,67 @@ fn timeline_of(it: &TrackItem, mt: Tick) -> Tick {
 /// The band's area of a clip: below its name band.
 fn band_rect(body: Rect) -> Rect {
     Rect::from_min_max(pos2(body.min.x, body.min.y + 17.0), pos2(body.max.x, body.max.y - 3.0))
+}
+
+/// The value a clip's band shows: its effect's parameter (the default when unset), None when the
+/// effect is missing or off.
+fn shown_param(it: &TrackItem, kind: TrackKind) -> Option<Param> {
+    let (effect, pid) = target(kind);
+    let e = it.effect(effect).filter(|e| e.enabled)?;
+    Some(e.param(pid).cloned().unwrap_or_else(|| Param::new(ParamValue::Float(if kind == TrackKind::Video { 100.0 } else { 0.0 }))))
+}
+
+/// Whether `pos` is on `clip`'s Opacity line, within 4 px (video clips; the Timeline asks for
+/// [`super::timeline_hit::Grab::Opacity`]). Not on a locked track or a track too low to show it.
+pub fn on_line(seq: &Sequence, layout: &Layout, clip: ClipId, pos: Pos2) -> bool {
+    let Some((tid, it)) = seq.find_item(clip) else { return false };
+    let Some(r) = layout.rows.iter().find(|r| r.track == tid && !r.lane) else { return false };
+    if r.kind != TrackKind::Video || r.rect.height() < 30.0 || seq.track(tid).is_none_or(|t| t.locked) {
+        return false;
+    }
+    let (x0, x1) = (layout.x_of(it.start), layout.x_of(it.end()));
+    if x1 - x0 < 6.0 || it.duration <= Tick::ZERO {
+        return false;
+    }
+    let b = band_rect(Rect::from_min_max(pos2(x0, r.rect.min.y + 1.0), pos2(x1, r.rect.max.y - 1.0)));
+    let vis = b.intersect(layout.content);
+    if vis.height() < 6.0 || vis.width() < 2.0 || !vis.contains(pos) {
+        return false;
+    }
+    let Some(p) = shown_param(it, TrackKind::Video) else { return false };
+    let v = p.f64_at(it.source_time_at(layout.tick_at(pos.x).clamp(it.start, it.end() - Tick(1))));
+    (pos.y - (b.max.y - norm(TrackKind::Video, v) * b.height())).abs() <= 4.0
+}
+
+/// A press on `clip`'s Opacity line at `at` that became a drag: the keyframes either side of the
+/// grabbed point (or the static value) follow the pointer until the button comes up.
+pub fn start_line_drag(ctx: &egui::Context, seq: &Sequence, layout: &Layout, clip: ClipId, at: Pos2) {
+    let Some((_, it)) = seq.find_item(clip) else { return };
+    let Some(base) = shown_param(it, TrackKind::Video) else { return };
+    if it.duration <= Tick::ZERO {
+        return;
+    }
+    let mt = it.source_time_at(layout.tick_at(at.x).clamp(it.start, it.end() - Tick(1)));
+    let right = base.keyframes.iter().position(|k| k.time > mt);
+    let left = match right {
+        Some(0) => None,
+        Some(r) => Some(r - 1),
+        None => base.keyframes.len().checked_sub(1),
+    };
+    ctx.data_mut(|m| m.insert_temp(drag_id(), BandDrag::Line { clip, left, right, from_y: at.y }));
+}
+
+/// The Pen tool or a ⌘-click on `clip`'s Opacity line at `x`: a keyframe there.
+pub fn add_keyframe(app: &mut FilmcraftApp, seq: &Sequence, layout: &Layout, clip: ClipId, x: f32) {
+    let Some((_, it)) = seq.find_item(clip) else { return };
+    if it.duration <= Tick::ZERO {
+        return;
+    }
+    let (effect, pid) = target(TrackKind::Video);
+    let t = layout.tick_at(x).clamp(it.start, it.end() - Tick(1));
+    if let Err(e) = app.session.execute("effects.addKeyframe", json!({"clip": clip.0, "effect": effect, "param": pid, "time": t.0})) {
+        app.ui.status = e.to_string();
+    }
 }
 
 /// A drag on a band in progress.
@@ -101,13 +166,10 @@ fn previewed(p: &Param, kind: TrackKind, drag: BandDrag, key_to: Option<(Tick, f
 /// interaction, so they sit on top of it).
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &Layout, vclip: Rect, aclip: Rect) {
     // (not while the timeline drags something of its own)
-    if app.tl.drag.as_ref().is_some_and(|d| !matches!(d, Drag::Scrub)) {
+    if app.tl.drag.as_ref().is_some_and(|d| !matches!(d, Drag::Scrub { .. })) {
         return;
     }
     let pointer = ui.input(|i| i.pointer.interact_pos());
-    let hover = ui.input(|i| i.pointer.hover_pos());
-    let adding = app.ui.tool == Tool::Pen || ui.input(|i| i.modifiers.command);
-    let selection_tool = matches!(app.ui.tool, Tool::Selection | Tool::Pen);
     let mut drag: Option<BandDrag> = ui.data(|d| d.get_temp(drag_id()));
     let mut acts: Vec<(&str, Value)> = Vec::new();
     let visible = (layout.tick_at(layout.content.min.x - 2.0), layout.tick_at(layout.content.max.x + 2.0));
@@ -176,7 +238,6 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             );
             // keyframes
             let keys: Vec<(usize, Tick, f64)> = base.keyframes.iter().enumerate().map(|(i, k)| (i, k.time, k.value.as_f64().unwrap_or(0.0))).collect();
-            let mut on_key = false;
             for (i, mt, v) in keys {
                 let (mt, v) = match (mine, key_to) {
                     (Some(BandDrag::Key { index, .. }), Some(to)) if index == i => to,
@@ -197,7 +258,6 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 let hr = Rect::from_center_size(c, vec2(11.0, 11.0));
                 let resp = ui.interact(hr, egui::Id::new(("band-kf", it.id.0, i)), Sense::click_and_drag());
                 let hot = resp.hovered() || matches!(mine, Some(BandDrag::Key { index, .. }) if index == i);
-                on_key |= resp.hovered();
                 icons::paint(
                     &paint,
                     Rect::from_center_size(c, vec2(9.0, 9.0)),
@@ -240,36 +300,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     }
                 });
             }
-            // the line under the pointer: ⌘-click / Pen adds a keyframe there, a drag moves it
-            let near = hover.filter(|h| vis.contains(*h) && (h.y - line_at(h.x)).abs() <= 4.0 && !on_key);
-            let held = matches!(mine, Some(BandDrag::Line { .. }));
-            if let Some(h) = near.or(if held { pointer } else { None })
-                && selection_tool
-            {
-                let grab = Rect::from_center_size(pos2(h.x, if held { h.y } else { line_at(h.x) }), vec2(14.0, 10.0));
-                // (a plain click on the line still selects the clip, as in Premiere: only a drag,
-                // or a ⌘-click / Pen click, is the band's)
-                let sense = if adding { Sense::click() } else { Sense::drag() };
-                let resp = ui.interact(grab, egui::Id::new(("band-line", it.id.0)), sense);
-                ui.ctx().set_cursor_icon(if adding { CursorIcon::Crosshair } else { CursorIcon::ResizeVertical });
-                if adding && resp.clicked() {
-                    let t = layout.tick_at(h.x).clamp(it.start, it.end() - Tick(1));
-                    acts.push(("effects.addKeyframe", json!({"clip": it.id.0, "effect": effect, "param": pid, "time": t.0})));
-                } else if !adding && resp.drag_started() {
-                    let mt = it.source_time_at(layout.tick_at(h.x).clamp(it.start, it.end() - Tick(1)));
-                    let right = base.keyframes.iter().position(|k| k.time > mt);
-                    let left = match right {
-                        Some(0) => None,
-                        Some(r) => Some(r - 1),
-                        None => base.keyframes.len().checked_sub(1),
-                    };
-                    let d = BandDrag::Line { clip: it.id, left, right, from_y: h.y };
-                    drag = Some(d);
-                    ui.data_mut(|m| m.insert_temp(drag_id(), d));
-                }
-                if resp.drag_stopped()
-                    && let Some(BandDrag::Line { left, right, .. }) = mine
-                {
+            // the line being dragged (the Timeline started it, see `on_line`): it follows the
+            // pointer, and the button coming up sets the value
+            if let Some(BandDrag::Line { left, right, .. }) = mine {
+                ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+                if pointer.is_some() && ui.input(|i| i.pointer.any_released() || !i.pointer.any_down()) {
                     if base.keyframes.is_empty() {
                         let v = p.value.as_f64().unwrap_or(0.0);
                         acts.push(("effects.setParam", json!({"clip": it.id.0, "effect": effect, "param": pid, "value": v})));
@@ -283,8 +318,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                         }
                     }
                     ui.data_mut(|d| d.remove::<BandDrag>(drag_id()));
-                }
-                if held {
+                } else {
                     let v = left_or_static(&p, mine).unwrap_or(0.0);
                     let label = if r.kind == TrackKind::Video { format!("Opacity {v:.1} %") } else { format!("Volume {v:.2} dB") };
                     egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new("band-line-tip"), egui::PopupAnchor::Pointer).show(|ui| {

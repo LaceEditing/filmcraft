@@ -484,4 +484,25 @@ mod tests {
         assert!(fx.response_db(50.0).unwrap() < -40.0, "band 1 off, 24 dB/Oct high-pass at 200 Hz");
         assert!((fx.response_db(2000.0).unwrap() + 6.0).abs() < 0.2, "master gain");
     }
+
+    #[test]
+    fn parametric_eq_applies_every_control() {
+        let def = filmcraft_project::find_effect("parametric_eq").unwrap();
+        let resp = |id: &str, v: filmcraft_project::ParamValue, extra: Option<(&str, filmcraft_project::ParamValue)>| {
+            let mut inst = def.instance();
+            inst.param_mut(id).unwrap().value = v;
+            if let Some((k, x)) = extra {
+                inst.param_mut(k).unwrap().value = x;
+            }
+            configured(&inst, Tick::ZERO, 48000).unwrap().response_db(1000.0).unwrap()
+        };
+        use filmcraft_project::ParamValue::{Bool, Float};
+        assert!((resp("master_gain", Float(-30.0), None) + 30.0).abs() < 1.0);
+        for b in ["b1", "b2", "b4", "b5"] {
+            let g = resp(&format!("{b}_gain"), Float(-24.0), Some((&format!("{b}_freq"), Float(1000.0))));
+            assert!((g + 24.0).abs() < 1.0, "{b}: {g}");
+        }
+        assert!(resp("hp_on", Bool(true), Some(("hp_freq", Float(10000.0)))) < -20.0);
+        assert!(resp("lp_on", Bool(true), Some(("lp_freq", Float(100.0)))) < -20.0);
+    }
 }

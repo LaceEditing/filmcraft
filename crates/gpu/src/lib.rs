@@ -42,13 +42,15 @@ use rayon::prelude::*;
 use filmcraft_color::{Matrix, Range, Transfer};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use filmcraft_render::Blend;
-use filmcraft_render::plan::{FramePlan, PlanGroup, PlanLayer};
+use filmcraft_render::plan::{FramePlan, PlanGroup, PlanLayer, PlanStep};
 
+pub mod adapter;
+pub mod export_renderer;
 pub mod fx;
-#[cfg(all(feature = "headless", not(target_arch = "wasm32")))]
-pub mod headless;
 pub mod lut;
 pub mod mask;
+mod transition;
+pub use export_renderer::ExportRenderer;
 pub use lut::GpuLut;
 pub use mask::GpuMask;
 
@@ -97,12 +99,17 @@ pub struct GpuCompositor {
     group_targets: Vec<Option<Target>>,
     groups_used: usize,
     output: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
+    accum_readback_buf: Option<(wgpu::Buffer, u64)>,
     uploads: HashMap<(usize, u32, u32), Uploaded>,
     clock: u64,
     dummy: wgpu::TextureView,
     /// The effect stage (None on devices without compute shaders or storage textures: layers
     /// with effects are then rendered on the CPU here).
     fx: Option<fx::FxStage>,
+    transition: transition::PushStage,
+    transition_inputs: [Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>; 2],
+    pub gpu_transitions: u64,
+    pub cpu_transitions: u64,
     /// Total bytes uploaded (stats).
     pub uploaded_bytes: u64,
 }
@@ -150,6 +157,46 @@ pub fn f32_to_f16(v: f32) -> u16 {
     h as u16
 }
 
+/// IEEE half → f32 (the inverse of [`f32_to_f16`]), for reading `Rgba16Float` textures back.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x03ff) as u32;
+    let bits = match exp {
+        0 => {
+            if mant == 0 {
+                sign
+            } else {
+                // Half subnormal: value = mant × 2⁻²⁴ = (1 + frac) × 2^(b−24) with b the mantissa's
+                // highest set bit — renormalise into an f32.
+                let b = 31 - mant.leading_zeros();
+                let frac = (mant ^ (1 << b)) << (23 - b);
+                sign | ((103 + b) << 23) | frac
+            }
+        }
+        0x1f => sign | 0x7f80_0000 | (mant << 13),
+        _ => sign | ((exp + 112) << 23) | (mant << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// [`f16_to_f32`] with a branch-light path for normal numbers and zeros (the bulk of read-back
+/// data); subnormals, infinities and NaNs take the general path. Same result for every input.
+#[inline(always)]
+pub fn f16_to_f32_fast(h: u16) -> f32 {
+    let u = u32::from(h);
+    let sign = (u & 0x8000) << 16;
+    let abs = u & 0x7fff;
+    if (0x0400..0x7c00).contains(&abs) {
+        // rebias the exponent (127 - 15 = 112) and widen the mantissa
+        f32::from_bits(sign | ((abs + (112 << 10)) << 13))
+    } else if abs == 0 {
+        f32::from_bits(sign)
+    } else {
+        f16_to_f32(h)
+    }
+}
+
 /// Half-float texel data for one frame (one byte vector per plane), converted off the UI thread.
 /// 8-bit frames need no conversion and have none.
 #[derive(Clone, Debug, Default)]
@@ -171,12 +218,14 @@ pub struct PreparedPlan {
     /// The layers of each group layer ([`PlanLayer::group`]), index-aligned with `layers`.
     groups: Vec<Option<PreparedPlan>>,
     image: Option<Prepared>,
+    children: Vec<PreparedPlan>,
 }
 
 impl PreparedPlan {
     pub fn bytes(&self) -> usize {
         self.layers.iter().flatten().chain(&self.image).map(Prepared::bytes).sum::<usize>()
             + self.groups.iter().flatten().map(PreparedPlan::bytes).sum::<usize>()
+            + self.children.iter().map(Self::bytes).sum::<usize>()
     }
 }
 
@@ -257,6 +306,16 @@ pub fn prepare(plan: &FramePlan) -> PreparedPlan {
     match plan {
         FramePlan::Layers { layers, .. } => prepare_layers(layers),
         FramePlan::Image(img) => PreparedPlan { image: Some(Prepared { planes: vec![f32_to_f16_bytes(&img.px)] }), ..Default::default() },
+        FramePlan::Composite { steps, .. } => PreparedPlan {
+            children: steps
+                .iter()
+                .flat_map(|s| match s {
+                    PlanStep::Layers(layers) => vec![prepare_layers(layers)],
+                    PlanStep::Transition { inputs, .. } => inputs.iter().map(|ls| prepare_layers(ls)).collect(),
+                })
+                .collect(),
+            ..Default::default()
+        },
     }
 }
 
@@ -264,7 +323,7 @@ fn prepare_layers(layers: &[PlanLayer]) -> PreparedPlan {
     PreparedPlan {
         layers: layers.iter().map(|l| if l.group.is_some() { None } else { prepare_frame(&l.frame) }).collect(),
         groups: layers.iter().map(|l| l.group.as_deref().map(|g: &PlanGroup| prepare_layers(&g.layers))).collect(),
-        image: None,
+        ..Default::default()
     }
 }
 
@@ -381,7 +440,7 @@ impl GpuCompositor {
             view_formats: &[],
         });
         let dummy = dummy_tex.create_view(&Default::default());
-        let fx = fx::FxStage::supported(device).then(|| fx::FxStage::new(device, &shader, &layer_bgl));
+        let fx = fx::FxStage::supported(device).then(|| fx_stage(device, &shader, &layer_bgl)).flatten();
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -397,10 +456,15 @@ impl GpuCompositor {
             group_targets: Vec::new(),
             groups_used: 0,
             output: None,
+            accum_readback_buf: None,
             uploads: HashMap::new(),
             clock: 0,
             dummy,
             fx,
+            transition: transition::PushStage::new(device),
+            transition_inputs: [None, None],
+            gpu_transitions: 0,
+            cpu_transitions: 0,
             uploaded_bytes: 0,
         }
     }
@@ -577,15 +641,29 @@ impl GpuCompositor {
     /// The source description of an uploaded frame.
     fn src_info(&self, f: &VideoFrame, key: (usize, u32, u32)) -> Option<SrcInfo> {
         let up = self.uploads.get(&key)?;
-        Some(SrcInfo { kind: up.kind, code_scale: up.code_scale, alpha: up.alpha_scale, chroma: up.chroma, size: (f.width, f.height), color: f.color })
+        let code_levels = match &f.data {
+            PixelData::Yuv8 { .. } => 256.0,
+            PixelData::Yuv16 { bits, .. } => (*bits as f32).exp2(),
+            _ => 1.0,
+        };
+        Some(SrcInfo {
+            kind: up.kind,
+            code_scale: up.code_scale,
+            code_levels,
+            alpha: up.alpha_scale,
+            chroma: up.chroma,
+            size: (f.width, f.height),
+            color: f.color,
+            input: None,
+        })
     }
 
-    fn uniforms(src: &SrcInfo, m: &filmcraft_geom::Affine, opacity: f32, blend: Blend, out: (u32, u32)) -> [f32; 28] {
+    fn uniforms(src: &SrcInfo, m: &filmcraft_geom::Affine, opacity: f32, blend: Blend, out: (u32, u32)) -> [f32; UNIFORM_FLOATS] {
         let (kr, kb) = src.color.matrix.kr_kb();
-        let bits_scale = src.code_scale / 255.0; // code units relative to 8-bit
+        let bits_scale = src.code_levels / 256.0; // 2^(bits - 8), independent of texture encoding
         let (yo, ys, co, cs) = match (src.color.range, src.kind) {
             (Range::Limited, 2) => (16.0 * bits_scale, 219.0 * bits_scale, 128.0 * bits_scale, 224.0 * bits_scale),
-            (Range::Full, 2) => (0.0, src.code_scale - 1.0, src.code_scale / 2.0, src.code_scale - 1.0),
+            (Range::Full, 2) => (0.0, src.code_levels - 1.0, src.code_levels / 2.0, src.code_levels - 1.0),
             _ => (0.0, 1.0, 0.0, 1.0),
         };
         let transfer = match src.color.transfer {
@@ -600,7 +678,31 @@ impl GpuCompositor {
         let footprint = (1.0 / sx.min(sy).max(1e-6)) as f32;
         let taps = if footprint > 1.25 { footprint.ceil().min(4.0) } else { 1.0 };
         let _ = Matrix::Bt709;
-        [
+        // colour management (q0..q5), stage by stage as `InputTransform::apply`
+        let q = src.input.map_or([0.0; 24], |p| {
+            let curve = match p.curve {
+                filmcraft_color::GpuCurve::Sdr => 0.0,
+                filmcraft_color::GpuCurve::Linear => 1.0,
+                filmcraft_color::GpuCurve::Pq => 2.0,
+                filmcraft_color::GpuCurve::Hlg => 3.0,
+            };
+            let (hl, hk) = p.hlg.unwrap_or(([0.0; 3], 0.0));
+            let mx = p.matrix.unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+            let (sp, dp) = p.tone.unwrap_or((0.0, 0.0));
+            let dl = p.desaturate.unwrap_or([0.0; 3]);
+            let on = |b: bool| if b { 1.0 } else { 0.0 };
+            #[rustfmt::skip]
+            let q = [
+                1.0, curve, hk, filmcraft_color::REFERENCE_WHITE_NITS as f32,
+                hl[0], hl[1], hl[2], on(p.matrix.is_some()),
+                mx[0][0], mx[0][1], mx[0][2], on(p.tone.is_some()),
+                mx[1][0], mx[1][1], mx[1][2], sp,
+                mx[2][0], mx[2][1], mx[2][2], dp,
+                dl[0], dl[1], dl[2], on(p.desaturate.is_some()),
+            ];
+            q
+        });
+        let base = [
             m.a as f32,
             m.b as f32,
             m.c as f32,
@@ -629,10 +731,14 @@ impl GpuCompositor {
             src.alpha,
             0.0,
             0.0,
-        ]
+        ];
+        let mut u = [0.0; UNIFORM_FLOATS];
+        u[..28].copy_from_slice(&base);
+        u[28..].copy_from_slice(&q);
+        u
     }
 
-    fn uniform_buffer(&self, u: &[f32; 28]) -> wgpu::Buffer {
+    fn uniform_buffer(&self, u: &[f32; UNIFORM_FLOATS]) -> wgpu::Buffer {
         let bytes: Vec<u8> = u.iter().flat_map(|v| v.to_le_bytes()).collect();
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("layer-u"),
@@ -652,6 +758,13 @@ impl GpuCompositor {
     /// [`composite`](Self::composite) with texel conversions already done by [`prepare`] (the
     /// result is identical; only the upload work on this thread differs).
     pub fn composite_prepared(&mut self, plan: &FramePlan, prep: Option<&PreparedPlan>) -> (wgpu::TextureView, (u32, u32)) {
+        self.begin_targets();
+        let out = self.render_plan(plan, prep, true, true);
+        self.end_targets();
+        out
+    }
+
+    fn render_plan(&mut self, plan: &FramePlan, prep: Option<&PreparedPlan>, clear: bool, resolve: bool) -> (wgpu::TextureView, (u32, u32)) {
         let owned;
         let (w, h, layers): (u32, u32, &[PlanLayer]) = match plan {
             FramePlan::Layers { width, height, layers } => (*width as u32, *height as u32, layers.as_slice()),
@@ -669,6 +782,7 @@ impl GpuCompositor {
                 owned = [PlanLayer::new(Arc::new(frame), filmcraft_geom::Affine::IDENTITY, 1.0, Blend::Normal)];
                 (img.w as u32, img.h as u32, &owned[..])
             }
+            FramePlan::Composite { width, height, steps } => return self.composite_steps(*width, *height, steps, prep),
         };
         let (w, h) = (w.max(1), h.max(1));
         let accum_view = Self::target(&self.device, &mut self.accum, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_SRC);
@@ -677,30 +791,23 @@ impl GpuCompositor {
         if let Some(f) = self.fx.as_mut() {
             f.begin_frame();
         }
-        self.groups_used = 0;
-        self.backdrops_used.clear();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("filmcraft-composite") });
         if let Some(accum_tex) = &accum_tex {
             let src = match plan {
                 FramePlan::Image(_) => Prep::Image(prep),
-                FramePlan::Layers { .. } => Prep::Layers(prep),
+                FramePlan::Layers { .. } | FramePlan::Composite { .. } => Prep::Layers(prep),
             };
-            self.draw_layers(&mut enc, accum_tex, &accum_view, (w, h), layers, src, 0);
+            self.draw_layers(&mut enc, accum_tex, &accum_view, (w, h), layers, src, 0, clear);
         }
         if let Some(f) = self.fx.as_mut() {
             f.end_frame();
         }
-        // textures of groups and backdrops no longer drawn are released
-        self.group_targets.truncate(self.groups_used);
-        let used = std::mem::take(&mut self.backdrops_used);
-        self.backdrops.retain(|k, _| used.contains(k));
-        self.backdrops_used = used;
         let final_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("final"),
             layout: &self.final_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&accum_view) }],
         });
-        {
+        if resolve {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("resolve"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -719,13 +826,65 @@ impl GpuCompositor {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([enc.finish()]);
-        (out_view, (w, h))
+        (if resolve { out_view } else { accum_view }, (w, h))
     }
 
-    /// Record `layers` composited over transparent into `target` (an accumulator of `w`×`h`):
-    /// effect stages right before their layers, a backdrop copy before each layer that reads the
-    /// destination, and every group's own layers composited into a group texture first
-    /// (recursively, recorded before this target's passes), which its layer then draws.
+    fn composite_steps(&mut self, width: usize, height: usize, steps: &[PlanStep], prep: Option<&PreparedPlan>) -> (wgpu::TextureView, (u32, u32)) {
+        if steps.iter().any(|s| matches!(s, PlanStep::Transition { effect, .. } if effect.effect != "push")) {
+            self.cpu_transitions += 1;
+            let plan = FramePlan::Composite { width, height, steps: steps.to_vec() };
+            return self.render_plan(&FramePlan::Image(filmcraft_render::plan::execute_cpu(&plan)), None, true, true);
+        }
+        let empty = FramePlan::Layers { width, height, layers: Vec::new() };
+        let (canvas, dims) = self.render_plan(&empty, None, true, false);
+        let mut children = prep.map(|p| p.children.iter());
+        for step in steps {
+            match step {
+                PlanStep::Layers(layers) => {
+                    let p = children.as_mut().and_then(Iterator::next);
+                    self.render_plan(&FramePlan::Layers { width, height, layers: layers.clone() }, p, false, false);
+                }
+                PlanStep::Transition { inputs, effect, progress, .. } => {
+                    let mut views = [self.dummy.clone(), self.dummy.clone()];
+                    for (index, layers) in inputs.iter().enumerate() {
+                        let p = children.as_mut().and_then(Iterator::next);
+                        // Isolate each clip; queued draws keep the parent accumulator and blend order.
+                        std::mem::swap(&mut self.accum, &mut self.transition_inputs[index]);
+                        let (view, _) = self.render_plan(&FramePlan::Layers { width, height, layers: layers.clone() }, p, true, false);
+                        std::mem::swap(&mut self.accum, &mut self.transition_inputs[index]);
+                        views[index] = view;
+                    }
+                    self.transition.draw(&self.device, &self.queue, &canvas, [&views[0], &views[1]], dims, effect, *progress);
+                    self.gpu_transitions += 1;
+                }
+            }
+        }
+        self.render_plan(&empty, None, false, true)
+    }
+
+    /// Export rendering: `plan` composited into the linear float accumulator and read back as
+    /// premultiplied RGBA f32 (the sRGB resolve is skipped). None for a plan the export path does
+    /// not run on the GPU (transitions: the caller renders those on the CPU) or a failed read-back.
+    pub fn render_export_prepared(&mut self, plan: &FramePlan, prep: Option<&PreparedPlan>) -> Option<(u32, u32, Vec<f32>)> {
+        if matches!(plan, FramePlan::Composite { .. }) {
+            return None;
+        }
+        let t = std::time::Instant::now();
+        self.begin_targets();
+        self.render_plan(plan, prep, true, false);
+        self.end_targets();
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("filmcraft-composite-export") });
+        let size = self.copy_accumulator(&mut enc)?;
+        self.queue.submit([enc.finish()]);
+        export_renderer::timing::add_submit(t.elapsed());
+        self.map_accumulator(size)
+    }
+
+    /// Record `layers` composited into `target` (an accumulator of `w`×`h`; cleared to transparent
+    /// first when `clear`, else drawn over what it holds): effect stages right before their layers,
+    /// a backdrop copy before each layer that reads the destination, and every group's own layers
+    /// composited into a group texture first (recursively, recorded before this target's passes),
+    /// which its layer then draws.
     #[allow(clippy::too_many_arguments)]
     fn draw_layers(
         &mut self,
@@ -736,6 +895,7 @@ impl GpuCompositor {
         layers: &[PlanLayer],
         prep: Prep,
         depth: u32,
+        clear: bool,
     ) {
         let backdrop = if layers.iter().any(|l| l.blend.reads_destination()) { Some(self.backdrop(w, h)) } else { None };
         // Layers whose effects the GPU stage can't run (no stage on this device, or a working image
@@ -756,7 +916,7 @@ impl GpuCompositor {
                 if self.fx.is_some() && lfx.size.0.max(lfx.size.1) <= max_side {
                     return None;
                 }
-                let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
+                let img = filmcraft_render::plan::effect_image_with(&l.frame, lfx, l.input.as_deref());
                 Some(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend))
             })
             .collect();
@@ -784,9 +944,9 @@ impl GpuCompositor {
                 // the nested sequence's picture: its layers composited into a texture of its own
                 let size = l.size();
                 let (gtex, gview) = self.group_target(size);
-                self.draw_layers(enc, &gtex, &gview, size, &g.layers, prep.group(i), depth + 1);
+                self.draw_layers(enc, &gtex, &gview, size, &g.layers, prep.group(i), depth + 1, true);
                 jobs.push(None);
-                let s = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: size, size, color: l.frame.color };
+                let s = SrcInfo { kind: 1, code_scale: 1.0, code_levels: 1.0, alpha: 0.0, chroma: size, size, color: l.frame.color, input: None };
                 (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [gview, self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
             } else {
                 let k = k.unwrap_or_default();
@@ -794,18 +954,24 @@ impl GpuCompositor {
                 let src = self.src_info(&l.frame, k).unwrap_or(SrcInfo {
                     kind: 1,
                     code_scale: 1.0,
+                    code_levels: 1.0,
                     alpha: 0.0,
                     chroma: (1, 1),
                     size: (l.frame.width, l.frame.height),
                     color: l.frame.color,
+                    input: None,
                 });
+                // HDR / wide-gamut Y'CbCr: the planner's input transform, in the shader (#965)
+                let src = SrcInfo { input: l.input.as_ref().filter(|_| src.kind == 2).and_then(|t| t.gpu_params()), ..src };
                 let views = self.uploads.get(&k).map_or_else(|| std::array::from_fn(|_| self.dummy.clone()), |up| up.views.clone());
                 let job = match &l.fx {
                     Some(lfx) => {
                         // the source drawn onto the working image (box-decimated by n, as the CPU decodes)
                         let n = lfx.decimation.max(1) as f64;
-                        let su =
+                        let mut su =
                             Self::uniforms(&src, &filmcraft_geom::Affine::scale(1.0 / n, 1.0 / n), 1.0, Blend::Normal, (lfx.size.0.max(1), lfx.size.1.max(1)));
+                        // Effect sources use the working pixel center, avoiding interpolated vertex coordinates.
+                        su[26] = n as f32;
                         let sbuf = self.uniform_buffer(&su);
                         let sbg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("fx-source"),
@@ -828,7 +994,16 @@ impl GpuCompositor {
                 // what the layer draws: the effect result (linear premultiplied RGBA) or the frame
                 let drawn = match &job {
                     Some(j) => {
-                        let s = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color };
+                        let s = SrcInfo {
+                            kind: 1,
+                            code_scale: 1.0,
+                            code_levels: 1.0,
+                            alpha: 0.0,
+                            chroma: l.size(),
+                            size: l.size(),
+                            color: l.frame.color,
+                            input: None,
+                        };
                         (
                             Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)),
                             [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()],
@@ -872,7 +1047,7 @@ impl GpuCompositor {
         // Runs of fixed-function layers draw in one pass. A layer that reads the destination
         // ends it, copies the accumulator under its quad into the backdrop and draws on its own.
         let backdrop_tex = backdrop.as_ref().map(|b| b.0.clone());
-        let mut cleared = false;
+        let mut cleared = !clear;
         let mut i = 0;
         while i < bind_groups.len() || !cleared {
             // a layer's effects run right before it is drawn (pooled working textures are reused
@@ -915,6 +1090,20 @@ impl GpuCompositor {
         }
     }
 
+    /// Start a frame's count of the group textures and backdrops it uses.
+    fn begin_targets(&mut self) {
+        self.groups_used = 0;
+        self.backdrops_used.clear();
+    }
+
+    /// Release the group textures and backdrops the frame just composited did not use.
+    fn end_targets(&mut self) {
+        self.group_targets.truncate(self.groups_used);
+        let used = std::mem::take(&mut self.backdrops_used);
+        self.backdrops.retain(|k, _| used.contains(k));
+        self.backdrops_used = used;
+    }
+
     /// The next group texture of this frame (an accumulator a nested sequence is composited
     /// into), reused across frames while the size stays.
     fn group_target(&mut self, (w, h): (u32, u32)) -> (wgpu::Texture, wgpu::TextureView) {
@@ -944,7 +1133,9 @@ impl GpuCompositor {
         let views = self.uploads.get(&key)?.views.clone();
         let n = fx.decimation.max(1) as f64;
         let (w, h) = (fx.size.0.max(1), fx.size.1.max(1));
-        let su = Self::uniforms(&src, &filmcraft_geom::Affine::scale(1.0 / n, 1.0 / n), 1.0, Blend::Normal, (w, h));
+        let mut su = Self::uniforms(&src, &filmcraft_geom::Affine::scale(1.0 / n, 1.0 / n), 1.0, Blend::Normal, (w, h));
+        // Same integer source-grid mapping as the composited effect path.
+        su[26] = n as f32;
         let sbuf = self.uniform_buffer(&su);
         let sbg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fx-source"),
@@ -981,7 +1172,7 @@ impl GpuCompositor {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        wait_mapped(&self.device)?;
         rx.recv().ok()?.ok()?;
         let data = slice.get_mapped_range().ok()?;
         let mut out = Vec::with_capacity((w * h * 4) as usize);
@@ -992,6 +1183,77 @@ impl GpuCompositor {
         drop(data);
         buf.unmap();
         Some((w, h, out))
+    }
+
+    /// Read the **linear float accumulator** back as premultiplied RGBA f32 (export rendering):
+    /// the display texture this crate's [`read_output`](Self::read_output) resolves is sRGB 8-bit
+    /// and would clip the working-space data HDR exports need. The accumulator must have been
+    /// composited first ([`composite`](Self::composite) / [`composite_prepared`](Self::composite_prepared)).
+    pub fn read_accumulator(&mut self) -> Option<(u32, u32, Vec<f32>)> {
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let size = self.copy_accumulator(&mut enc)?;
+        self.queue.submit([enc.finish()]);
+        self.map_accumulator(size)
+    }
+
+    /// Record a copy of the accumulator into the staging buffer (grown when too small, reused
+    /// otherwise); returns its width, height and row pitch in bytes.
+    fn copy_accumulator(&mut self, enc: &mut wgpu::CommandEncoder) -> Option<(u32, u32, u32)> {
+        let (_, _, (w, h)) = self.accum.as_ref()?;
+        let (w, h) = (*w, *h);
+        let row = w.checked_mul(8)?.div_ceil(256).checked_mul(256)?;
+        let needed = u64::from(row) * u64::from(h);
+        if self.accum_readback_buf.as_ref().is_none_or(|(_, size)| *size < needed) {
+            let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("accum-readback"),
+                size: needed,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            self.accum_readback_buf = Some((b, needed));
+        }
+        let (tex, _, _) = self.accum.as_ref()?;
+        let (buf, _) = self.accum_readback_buf.as_ref()?;
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        Some((w, h, row))
+    }
+
+    /// Wait for the staging buffer filled by [`copy_accumulator`](Self::copy_accumulator) and
+    /// convert its half floats to f32.
+    fn map_accumulator(&self, (w, h, row): (u32, u32, u32)) -> Option<(u32, u32, Vec<f32>)> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let t = std::time::Instant::now();
+        let (buf, _) = self.accum_readback_buf.as_ref()?;
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        wait_mapped(&self.device)?;
+        rx.recv().ok()?.ok()?;
+        export_renderer::timing::add_map_wait(t.elapsed());
+        let t = std::time::Instant::now();
+        let (width, row) = (w as usize, row as usize);
+        let mut out = filmcraft_frame::pool::take_f32_overwritten(width.checked_mul(h as usize)?.checked_mul(4)?);
+        let data = slice.get_mapped_range().ok()?;
+        // every row must be there: the pooled output holds stale values until written
+        let converted = out.chunks_exact_mut(width * 4).enumerate().all(|(y, dst)| {
+            let Some(src) = data.get(y * row..y * row + width * 8) else { return false };
+            for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+                *d = f16_to_f32_fast(u16::from_le_bytes(*s));
+            }
+            true
+        });
+        drop(data);
+        buf.unmap();
+        export_renderer::timing::add_convert(t.elapsed());
+        converted.then_some((w, h, out))
     }
 
     /// Read the output back as RGBA8 (tests / screenshots / thumbnails).
@@ -1016,7 +1278,7 @@ impl GpuCompositor {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        wait_mapped(&self.device)?;
         rx.recv().ok()?.ok()?;
         let data = slice.get_mapped_range().ok()?;
         let mut out = Vec::with_capacity((w * h * 4) as usize);
@@ -1029,16 +1291,73 @@ impl GpuCompositor {
     }
 }
 
-/// What a layer's shader samples: the texture kind (0 RGBA8 sRGB, 1 linear premultiplied RGBA
-/// float, 2 YUV planes), code scale, chroma plane size, picture size and colour description.
+/// Wait for the last submission and its `map_async` callbacks.
+///
+/// Export readback used `PollType::wait_indefinitely`. On radv that can never return after a
+/// failed hardware-encode attempt (#1058), so the export never finishes. Eight seconds is longer
+/// than a healthy map; a timeout returns `None` and the CPU renderer takes the frame.
+fn wait_mapped(device: &wgpu::Device) -> Option<()> {
+    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(8)) }).ok().map(|_| ())
+}
+
+/// Shader source: kind (0 RGBA8 sRGB, 1 linear premultiplied RGBA, 2 YUV), sampling scales, dimensions, color.
 struct SrcInfo {
     kind: u32,
+    /// Texture sample -> code units: 255 for R8Unorm, 2^bits for R16Float.
     code_scale: f32,
+    /// YUV quantization levels: 2^bits; R8Unorm's decoding scale is one less.
+    code_levels: f32,
     /// Alpha texture sample → alpha (0: the frame has no alpha plane).
     alpha: f32,
     chroma: (u32, u32),
     size: (u32, u32),
     color: filmcraft_color::ColorInfo,
+    /// Colour management beyond the default decode (a Y'CbCr layer's [`PlanLayer::input`]).
+    input: Option<filmcraft_color::GpuInputParams>,
+}
+
+/// Floats in a layer's uniform block (`U` in `composite.wgsl`: 13 vec4).
+const UNIFORM_FLOATS: usize = 52;
+
+/// Poll a future once: wgpu's native error scopes resolve immediately. `None` if it is still
+/// pending (then the caller assumes the worst).
+/// The effect stage, or None when its pipelines fail on this device. They can be invalid on a
+/// device that passes the limits check (Rgba32Float is not renderable everywhere, e.g. software
+/// Vulkan/GL: a validation error), and the driver's shader compiler can fail on the large effect
+/// shader (D3D12's FXC sporadically aborts with "compilation aborted unexpectedly": an internal
+/// error, which is retried once). Either error would panic, so both are captured: without the
+/// stage, effects render on the CPU.
+fn fx_stage(device: &wgpu::Device, shader: &wgpu::ShaderModule, layer_bgl: &wgpu::BindGroupLayout) -> Option<fx::FxStage> {
+    for attempt in 0..2 {
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let stage = fx::FxStage::new(device, shader, layer_bgl);
+        // (scopes pop in reverse order)
+        let internal = poll_now(internal.pop());
+        let validation = poll_now(validation.pop());
+        match (validation, internal) {
+            (Some(None), Some(None)) => return Some(stage),
+            (Some(Some(e)), _) => {
+                log::warn!("GPU effects unavailable on this device, rendering them on the CPU: {e}");
+                return None;
+            }
+            (_, Some(Some(e))) if attempt == 0 => log::warn!("GPU effect shaders failed to compile, retrying: {e}"),
+            (_, Some(Some(e))) => {
+                log::warn!("GPU effect shaders failed to compile, rendering effects on the CPU: {e}");
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn poll_now<F: std::future::Future>(f: F) -> Option<F::Output> {
+    let mut f = std::pin::pin!(f);
+    match f.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(v) => Some(v),
+        std::task::Poll::Pending => None,
+    }
 }
 
 /// A render pass drawing into the accumulator.

@@ -81,7 +81,7 @@ pub enum RcKind {
     Qp(u8),
     Crf(f32),
     Abr { kbps: u32 },
-    TwoPass { kbps: u32, plan: Vec<f64>, planned_bits: Vec<f64> },
+    TwoPass { kbps: u32, plan: Vec<f64>, planned_bits: Vec<f64>, planned_total: f64, remaining_bits: Vec<f64> },
 }
 
 pub struct RateControl {
@@ -101,7 +101,11 @@ pub struct RateControl {
     model_done: f64,
     inflight: std::collections::VecDeque<f64>,
     last_q: f64,
+    /// Virtual history for 1-pass ABR: (frame count, complexity of one virtual frame), fixed at the first frame.
     prior: Option<(f64, f64)>,
+    /// Sum and count of the rate-model terms (`coef · cplx^QCOMP / type_factor`) of the coded P and B frames.
+    inter_s: f64,
+    inter_n: u64,
 }
 
 impl RateControl {
@@ -124,6 +128,8 @@ impl RateControl {
             inflight: std::collections::VecDeque::new(),
             last_q: 0.0,
             prior: None,
+            inter_s: 0.0,
+            inter_n: 0,
         }
     }
 
@@ -147,8 +153,15 @@ impl RateControl {
             }
         }
         let plan = qs((0.5 * (lo + hi)).exp());
-        let planned_bits = stats.frames.iter().zip(&plan).map(|(f, &q)| f.bits as f64 * f.qscale / q).collect();
-        RcKind::TwoPass { kbps, plan, planned_bits }
+        let planned_bits: Vec<f64> = stats.frames.iter().zip(&plan).map(|(f, &q)| f.bits as f64 * f.qscale / q).collect();
+        let planned_total = planned_bits.iter().sum();
+        // `remaining_bits[i]` is the inclusive suffix for frame `i`; retain an
+        // empty suffix so callers can index it without a special case.
+        let mut remaining_bits = vec![0.0; planned_bits.len() + 1];
+        for i in (0..planned_bits.len()).rev() {
+            remaining_bits[i] = remaining_bits[i + 1] + planned_bits[i];
+        }
+        RcKind::TwoPass { kbps, plan, planned_bits, planned_total, remaining_bits }
     }
 
     /// Choose the frame QP (fractional) for frame `index` (display order) of `t` with lookahead complexity `cplx`.
@@ -173,16 +186,16 @@ impl RateControl {
                 let bpf = *kbps as f64 * 1000.0 / self.fps;
                 // rate factor so that past frames at this rf would have hit the target
                 let s_here = self.coef[ti] * cplx.powf(QCOMP) / type_factor(t);
-                // Virtual history of one second of P frames (inter cost ~ 40% of the first frame's) so the first
-                // I frame gets a realistic share of the budget instead of a single frame's worth.
-                let (fps, coef1) = (self.fps, self.coef[1]);
-                let (pn0, ps0) = *self.prior.get_or_insert_with(|| {
-                    let n = fps.max(1.0);
-                    let c0 = if t == SliceType::I { 0.4 * cplx } else { cplx };
-                    (n, n * coef1 * c0.powf(QCOMP))
-                });
+                // Virtual history of one second of inter frames so the first I frame gets a realistic share of the
+                // budget instead of a single frame's worth. A virtual frame costs what the P and B frames coded so far
+                // cost on average; before the first of them, a P frame of 40% of the first frame's complexity under
+                // the current model. Re-estimated every frame: the initial guess of `coef` can be several times off,
+                // and a history frozen at that guess starves the opening second of bits.
+                let fps = self.fps;
+                let (pn0, c0) = *self.prior.get_or_insert_with(|| (fps.max(1.0), if t == SliceType::I { 0.4 * cplx } else { cplx }));
+                let per_frame = if self.inter_n > 0 { self.inter_s / self.inter_n as f64 } else { self.coef[1] * c0.powf(QCOMP) };
                 let fade = (1.0 - self.frames as f64 / pn0).max(0.0);
-                let (pn, ps) = (pn0 * fade, ps0 * fade);
+                let (pn, ps) = (pn0 * fade, pn0 * fade * per_frame);
                 let s = self.sum_s + s_here + ps;
                 let wanted = bpf * (self.frames as f64 + 1.0 + pn);
                 let mut rf = s / wanted;
@@ -192,17 +205,17 @@ impl RateControl {
                 let q = rf * cplx.powf(1.0 - QCOMP) * type_factor(t);
                 qscale2qp(q)
             }
-            RcKind::TwoPass { kbps, plan, planned_bits } => {
+            RcKind::TwoPass { kbps, plan, planned_bits, planned_total, remaining_bits } => {
                 // Closed-loop second pass: `m` measures how far real frame sizes deviate from the first-pass model
                 // (bits ∝ 1/qscale) at the qscales actually used; the remaining plan is rescaled so its predicted
                 // size fits the remaining budget.
                 let i = index_in_coding_order.min(plan.len().saturating_sub(1));
                 let bpf = *kbps as f64 * 1000.0 / self.fps;
-                let target_total: f64 = planned_bits.iter().sum();
+                let target_total = *planned_total;
                 let smooth = 0.5 * bpf * self.fps.max(1.0);
                 let m = ((self.total_bits + smooth) / (self.model_done + smooth)).clamp(0.3, 3.0);
                 let inflight: f64 = self.inflight.iter().sum();
-                let remaining_plan: f64 = planned_bits[i..].iter().sum();
+                let remaining_plan = remaining_bits[i];
                 let remaining_budget = (target_total - self.total_bits - m * inflight).max(0.05 * remaining_plan.max(1.0));
                 let f = (m * remaining_plan / remaining_budget).clamp(0.25, 4.0);
                 let q = plan[i] * f;
@@ -242,7 +255,12 @@ impl RateControl {
                 self.coef[k] = self.coef[ti] * [1.2, 1.0, 0.85][k] / [1.2, 1.0, 0.85][ti];
             }
         }
-        self.sum_s += self.coef[ti] * cplx.powf(QCOMP) / type_factor(t);
+        let s_frame = self.coef[ti] * cplx.powf(QCOMP) / type_factor(t);
+        self.sum_s += s_frame;
+        if t != SliceType::I {
+            self.inter_s += s_frame;
+            self.inter_n += 1;
+        }
         self.total_bits += bits as f64;
         if let Some(p) = self.inflight.pop_front() {
             self.model_done += p;
@@ -258,5 +276,33 @@ impl RateControl {
 
     pub fn record_pass1(&mut self, t: SliceType, qp: f64, cplx: f64, bits: u64) {
         self.pass1.push(FrameStat { slice_type: t, qscale: qp2qscale(qp), bits, cplx });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_pass_plan_caches_total_and_inclusive_suffixes() {
+        let stats = PassStats {
+            fps: 24.0,
+            frames: vec![
+                FrameStat { slice_type: SliceType::I, qscale: 1.0, bits: 2_000, cplx: 20.0 },
+                FrameStat { slice_type: SliceType::P, qscale: 1.5, bits: 1_000, cplx: 10.0 },
+                FrameStat { slice_type: SliceType::B, qscale: 2.0, bits: 500, cplx: 5.0 },
+            ],
+        };
+
+        let RcKind::TwoPass { planned_bits, planned_total, remaining_bits, .. } = RateControl::plan_two_pass(&stats, 1_000) else {
+            panic!("two-pass planning must return a two-pass rate-control plan");
+        };
+
+        assert_eq!(remaining_bits.len(), planned_bits.len() + 1);
+        assert!((planned_total - planned_bits.iter().sum::<f64>()).abs() < f64::EPSILON);
+        for i in 0..planned_bits.len() {
+            assert!((remaining_bits[i] - planned_bits[i..].iter().sum::<f64>()).abs() < f64::EPSILON);
+        }
+        assert_eq!(remaining_bits[planned_bits.len()], 0.0);
     }
 }

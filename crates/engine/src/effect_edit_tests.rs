@@ -55,6 +55,11 @@ fn key(effect: usize, t: Tick) -> Value {
     json!({"effect": effect, "param": "scale", "mediaTime": t.0})
 }
 
+/// A keyframe as `effects.moveKeyframes` names it (its clip, and its media time as `time`).
+fn moving(c: ClipId, effect: usize, t: Tick) -> Value {
+    json!({"clip": c.0, "effect": effect, "param": "scale", "time": t.0})
+}
+
 #[test]
 fn several_keyframes_delete_move_and_interpolate_in_one_step_each() {
     let (mut s, clips) = demo();
@@ -64,13 +69,14 @@ fn several_keyframes_delete_move_and_interpolate_in_one_step_each() {
     assert_eq!(scale_keys(&s, c).len(), 3, "{:?}", scale_keys(&s, c));
     let undo_before = s.history.undo.len();
 
-    // move the last two 0.25 s later: the spacing stays
-    let r = s.execute("effects.moveKeyframes", json!({"clip": c.0, "keys": [key(m, times[1]), key(m, times[2])], "by": secs(0.25).0})).unwrap();
-    assert_eq!(r["keys"].as_array().unwrap().len(), 2);
+    // move the last two 0.25 s later (the clip plays at normal speed: media and timeline time
+    // move alike): the spacing stays
+    let r = s.execute("effects.moveKeyframes", json!({"keyframes": [moving(c, m, times[1]), moving(c, m, times[2])], "delta": secs(0.25).0})).unwrap();
+    assert_eq!(r["keyframes"].as_array().unwrap().len(), 2);
     assert_eq!(scale_keys(&s, c), vec![(times[0], 100.0), (times[1] + secs(0.25), 150.0), (times[2] + secs(0.25), 120.0)]);
     assert_eq!(s.history.undo.len(), undo_before + 1, "one undo step");
     // moving onto another keyframe replaces it
-    s.execute("effects.moveKeyframes", json!({"clip": c.0, "keys": [key(m, times[1] + secs(0.25))], "by": (times[0] - times[1] - secs(0.25)).0})).unwrap();
+    s.execute("effects.moveKeyframes", json!({"keyframes": [moving(c, m, times[1] + secs(0.25))], "delta": (times[0] - times[1] - secs(0.25)).0})).unwrap();
     assert_eq!(scale_keys(&s, c), vec![(times[0], 150.0), (times[2] + secs(0.25), 120.0)]);
     s.undo();
     s.undo();
@@ -91,8 +97,8 @@ fn several_keyframes_delete_move_and_interpolate_in_one_step_each() {
     assert!(s.execute("effects.deleteKeyframes", json!({"clip": c.0, "keys": [key(m, times[0])]})).is_err());
     // hostile input: no keys, bad keys
     assert!(s.execute("effects.deleteKeyframes", json!({"clip": c.0, "keys": []})).is_err());
-    assert!(s.execute("effects.moveKeyframes", json!({"clip": c.0, "keys": [{"effect": 9999, "param": "scale", "mediaTime": 0}], "by": 5})).is_err());
-    assert!(s.execute("effects.moveKeyframes", json!({"clip": c.0, "keys": [key(m, times[1])], "by": i64::MAX})).is_ok(), "saturates, no panic");
+    assert!(s.execute("effects.moveKeyframes", json!({"keyframes": [{"clip": c.0, "effect": 9999, "param": "scale", "time": 0}], "delta": 5})).is_err());
+    assert!(s.execute("effects.moveKeyframes", json!({"keyframes": [moving(c, m, times[1])], "delta": i64::MAX})).is_ok(), "clamped, no panic");
 }
 
 #[test]

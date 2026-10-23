@@ -182,7 +182,7 @@ fn imports_bins_media_sequences_clips_and_effects() {
     assert_eq!(path, "/edits/show/Footage/interview.mov");
     let v = m.info.video.as_ref().unwrap();
     assert_eq!((v.width, v.height, v.frame_rate), (2560, 1440, FrameRate::new(30, 1)));
-    assert_eq!(m.info.audio.as_ref().map(|a| (a.sample_rate, a.channels)), Some((48_000, 2)));
+    assert_eq!(m.info.audio().map(|a| (a.sample_rate, a.channels)), Some((48_000, 2)));
     assert_eq!(m.markers.len(), 1);
     assert_eq!((m.markers[0].start, m.markers[0].name.as_str(), m.markers[0].comment.as_str()), (Tick(S), "Laugh", "keep this"));
 

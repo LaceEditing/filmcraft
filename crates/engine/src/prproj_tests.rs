@@ -400,7 +400,7 @@ fn titles_are_measured_as_premiere_measures_them() {
     // point text placed by its top-left goes back to its baseline, staying where it is
     s.edit("Top-left", |p, _| {
         for it in p.items.values_mut() {
-            let filmcraft_project::ItemKind::Sequence(sq) = &mut it.kind else { continue };
+            let Some(sq) = it.as_sequence_mut() else { continue };
             for t in sq.all_tracks_mut() {
                 for c in t.items.iter_mut().filter(|c| c.id.0 == point) {
                     if let Some(e) = c.effects.iter_mut().find(|e| e.effect == "graphic_text") {

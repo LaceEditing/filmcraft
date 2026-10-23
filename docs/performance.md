@@ -4,6 +4,27 @@
 and `.md` (options and sections: [testing.md](testing.md) §5). Agents read live counters with
 `perf.stats` ([control-protocol.md](control-protocol.md)).
 
+## Interactive builds and redraw work
+
+For interactive editing, build with `cargo build --release -p filmcraft --features whisper` and
+launch `target/release/filmcraft`. The development profile optimizes dependencies and codec hot
+loops, but still builds the editor at optimization level 1; it is not the release performance
+baseline. Keep the same build profile when comparing code changes.
+
+Timeline, Effect Controls, Markers, Captions and mixer drawing borrow a sequence from a shared
+immutable project snapshot instead of deep-copying its clips and effects on every redraw. Commands
+can still replace the session's project during the pass; the snapshot stays valid until drawing
+finishes. Transcript words and paragraphs are cached by project snapshot and active sequence, and
+search highlights by query. Playhead movement reuses them; project edits, undo/redo and view changes
+refresh them. Highlight lookup is constant work per word, including searches with many matches.
+
+To measure a long transcript, run
+`cargo test -p filmcraft-ui-egui --test it transcript_ui::long_transcript_redraw_benchmark -- --ignored --nocapture`
+alone. It reports median and p95 redraw time for 10,000 words with an empty query and a query matching
+every word. It measures UI update work, not native display presentation, and deliberately has no
+machine-dependent timing assertion. The transcript still lays out every word; list virtualization
+is future work.
+
 **Read the numbers with the load average.** These results come from a shared Apple M4 Pro
 (14 cores, 48 GB, macOS 15 / Darwin 24.6) with parallel agent builds running: load average
 **75–200** during every run below. Wall-clock columns (fps, shown/dropped frames, seek latency)
@@ -59,6 +80,77 @@ What remains per live decoder is unchanged: the H.264 decoder publishes each mac
 picture as its own allocations (`Frame::make_row`, five per row), which is where the 290 MB per
 decoder comes from.
 
+## Results (CPU compositor: layer rectangles, an opaque bottom layer and recycled images, before → after)
+
+The CPU compositor is what export runs. In a profile of a 9:29 export it took about a third of the
+busy CPU with the built-in H.264 encoder (the encoder took the other two thirds), and a faster
+encoder leaves it as the largest cost of an export. It works on premultiplied linear `f32` images,
+33 MB each at 1080p, and every layer was one of them: a banner that is transparent except for its
+bottom 100 rows still cost a full conversion and a full mix, and the bottom layer paid for a
+zero-filled canvas and a pass that mixes it over that canvas.
+
+Apple M1 (8 cores: 4 performance + 4 efficiency), 2026-10-06, a machine that was not idle, so the
+two builds ran alternately in the same session and the median is reported.
+
+### Per frame, synthetic 1080p sources
+
+`cargo run --release -p filmcraft-render --example frame_bench`: an 8-bit 4:2:0 camera picture and a
+10-bit 4:4:4 banner with alpha only in its bottom 100 rows; `render_sequence` followed by the
+conversion to 8-bit RGBA, milliseconds per frame (median of 40 frames, 5 alternating rounds):
+
+| scenario | before | after |
+|---|---|---|
+| camera only | 8.9 | 6.5 |
+| camera + banner | 16.2 | 7.8 |
+
+Both builds give the same picture (same checksum).
+
+### A real export
+
+30 s of a 1080p25 camera clip with a ProRes 4444 banner, exported with the built-in encoder
+(deterministic, byte for byte): 46.4 s before, 36.7 s after. **The two exports are the same file**
+(same bytes, same MD5), so every frame of the real pipeline (camera decode, ProRes decode,
+compositing, conversion) matches. The encoder is most of that time; with a faster one the
+compositor's savings are a larger part of the export.
+
+What is left in a frame without overlays is the Y'CbCr → linear float conversion of the camera
+picture (4.5 ms in the synthetic case) and the conversion to 8 bits (2 ms).
+
+## Results (GPU3: GPU export rendering, Off → Auto, #30)
+
+Export ▸ GPU Rendering composites the exported frames on the GPU (`filmcraft-gpu`'s off-screen
+compositor, a pool of up to four renderers) instead of the CPU reference renderer, which stays the
+fallback for anything the GPU stage does not run. Linux, Ryzen 7 9700X (16 threads) + Radeon
+RX 7900 (Mesa 26.2.2), 2026-10-08 / 09, same build, `cargo xtask bench --sections export --only
+<scene> --hw off|auto`: 191 frames to H.264 + AAC with the built-in encoder. `h264` is one 1080p
+clip; `h264_fx` the same clip on V1 with Proc Amp, Gaussian Blur and Vignette, plus two
+picture-in-picture copies (50 % with Brightness & Contrast, 33 % at 70 % opacity with Sharpen).
+Every Auto row rendered all its frames on the GPU, without fallbacks.
+
+| scene | Off: s / CPU ms per frame | **Auto**: s / CPU ms per frame |
+|---|---|---|
+| `h264`, 1080p (load 12–33) | 5.96, 6.08 / 292 | 6.07, 6.36 / 281 |
+| `h264_fx`, 1080p (load 12–33) | 13.00, 12.67 / 737 | **5.63, 5.00 / 238** |
+| `h264_fx`, 4K sequence and clip (load 2–19) | 38.74, 39.34 / 2955 | **11.99 / 775** |
+
+On a plain clip the export is decoding- and encoding-bound and both take the same time; with
+layers and effects the GPU is 2.4× (1080p) to 3.2× (4K) faster, with a third to a quarter of the
+CPU. GPU rendering is nevertheless **Off by default** (opt-in per export) until it has been
+measured on Windows and macOS: the GPU result matches the CPU within the compositor's parity
+tolerance, not bit for bit, and Off keeps exports byte-reproducible on every machine. (The 4K row used the same scene with the sequence, clip and positions scaled to 4K.)
+
+### Memory after an export
+
+The recycled images stay on the shelves of `filmcraft_frame::pool` (up to 320 MiB of them, and
+192 MiB of each plane type), and nothing else asks for images of an export's size, so a finished
+export left them idle. A standalone export's pipeline now frees the idle float images when it goes
+away, however the export ended (done, failed, cancelled, dropped half way). The plane shelves are
+kept (playback recycles decoded frames through them), and so are the float images after one part
+of a batch (a render-preview segment, a proxy), which the next part reuses. A process that exported a synthetic 3 s 1080p24 matte as PNG frames three times
+(Apple M1, `footprint`, 10 s after the last export) rested at **575 MB** with the pool holding
+332 MB idle and at **258 MB** with the trim. The memory does not come back at once: macOS returns
+freed pages over a few seconds (892 MB right after the export in both cases, 726 MB after 2 s).
+
 ## Results (GPU2: standard effects on the GPU compositor, #30, before → after)
 
 Before = this change with clips that carry standard effects sent back to the CPU layer path in
@@ -89,7 +181,7 @@ Same commit, Settings ▸ Playback ▸ Hardware decoding switched with the bench
 `--hw auto` (`cargo xtask bench --sections decode --only dec_h --repeat 3 --hw …`, then
 `--sections playback --only h264` and `--only hevc-2160`), 2026-10-05, Apple M4 Pro, load average
 **150–190** throughout (shared with other agent builds). The decoded pictures are identical either
-way (bit-exact parity tests, `crates/platform/tests/videotoolbox.rs`); only who decodes changes.
+way (bit-exact parity tests, `crates/platform/tests/it/videotoolbox.rs`); only who decodes changes.
 
 ### Decode (every frame through the media stack)
 
@@ -125,6 +217,307 @@ the draft plan's box decimation of the planes, cheap next to software decoding, 
 CPU cost. Zero-copy upload of the decoded `CVPixelBuffer` into wgpu (no copy-out at all) is the
 next step (issue #30).
 
+## Results (HW2: VideoToolbox hardware H.264 encoding, built-in → hardware)
+
+Apple M1 (8 cores, 16 GB), 2026-10-06, single runs on an otherwise idle machine, release build.
+Hardware encoding is opt-in per export (`hardware_encoding: auto`); the built-in encoder is unchanged.
+
+### The encoder alone (100 frames of 1920×1080 25 fps camera footage, High, one-pass VBR, keyframe every 50)
+
+Frames go in as planar Y'CbCr and out as compressed frames (NV12 fill, `VTCompressionSessionEncodeFrame`,
+flush); quality is the luma PSNR of our software decoder's output against the input.
+
+| target | B-frames | real bitrate | luma PSNR | frames/s |
+|---|---|---|---|---|
+| 4 Mb/s | off | 3982 kb/s | 41.66 dB | 202 |
+| 8 Mb/s | off | 7987 kb/s | 43.44 dB | 202 |
+| 16 Mb/s | off | 15972 kb/s | 45.55 dB | 202 |
+| 4 Mb/s | on | 4220 kb/s | 41.37 dB | 183 |
+| 8 Mb/s | on | 8268 kb/s | 43.41 dB | 197 |
+| 16 Mb/s | on | 16388 kb/s | 45.66 dB | 199 |
+
+B-frames buy nothing measurable here (±0.3 dB) and overshoot the target by up to 5 %, so the hardware
+encoder runs without them: frames come out in presentation order and the muxer needs no composition
+offsets or edit list.
+
+### Whole exports (1080p25 camera clip with ProRes 4444 overlays with alpha, AAC, loudness normalised to −14 LUFS)
+
+A 9:29 timeline (569 s, 14 227 frames): the camera clip, an intro, six banners, three subscribe bars
+and an outro.
+
+| encoder | wall time | frames/s | vs real time | file |
+|---|---|---|---|---|
+| built-in (`filmcraft-h264enc`) | 793 s | 17.9 | 1.4× slower | 1445 MB, 20.0 Mb/s |
+| hardware (VideoToolbox) | **311 s** | **45.7** | 1.8× faster | 1417 MB, 19.6 Mb/s |
+
+2.5× faster. The first 134 s of the same timeline, where the overlays are densest (intro, a banner, a
+subscribe bar and the outro in 134 s):
+
+| encoder | wall time | frames/s | vs real time | file |
+|---|---|---|---|---|
+| built-in (`filmcraft-h264enc`) | 395 s | 8.5 | 2.9× slower | 340 MB, 20.0 Mb/s |
+| hardware (VideoToolbox) | **84 s** | **39.9** | 1.6× faster | 312 MB, 18.3 Mb/s |
+
+4.7× faster there. The gain depends on what else an export spends its time on: with the encoder
+off the CPU, what is left is decoding the camera clip, the CPU compositor (every layer, alpha
+included) and the RGBA → Y'CbCr conversion.
+
+The pairs of files have the same frame count and duration, decode in ffmpeg without a message, and
+compare at SSIM 0.990 / PSNR 46.7 dB over the 134 s (lowest frame: 45.1 dB) and SSIM 0.989–0.990 /
+PSNR 46.3–46.6 dB at six 3-second spots of the full export. Audio is identical.
+
+Where the built-in export's time goes (`sample` on the process during a 20 s export, inclusive CPU
+time in the call tree; the figures overlap because work-stealing mixes the tasks): about two thirds
+of the busy CPU is in the encoder, about a third in compositing and layer decoding. Moving the encoder to
+the media engine removes most of the first and lets the next batch render while the previous one
+encodes (the exporter now does that: see "Export: rendering the next batch while the current one is
+encoded" below). What is left is the
+CPU compositor, the next target of #30 ("GPU export").
+
+## Export: rendering the next batch while the current one is encoded
+
+Until now a step of the stepped exporter (`filmcraft_export::Exporter`) rendered a batch of frames in
+parallel and only then encoded, muxed and mixed the audio of that batch on one thread, so the wall
+time was the sum of the stages. Where the sum was large (1080p30, 300 frames, `perf.stats`
+`export.stages`) the stages were: software H.264 render 4257 ms, encode 17845 (RGB to YUV 766 of it),
+audio 462, mux 17, finish 142 = 22.96 s; NVENC H.264 setup 465, render 3316, encode 1113 (convert 794),
+audio 471, mux 20, finish 24 = 5.69 s.
+
+Now a step renders batch k+1 on the rayon pool while the calling thread encodes, muxes and mixes the
+audio of batch k (`rayon::in_place_scope`), and the next step starts from the frames already rendered.
+Wall time is about `max(render, encode + audio + mux)` instead of the sum. What did not change:
+
+- **The file.** Batches are cut and encoded in the same order and the audio / mux interleave still
+  follows the 16-frame groups, so the output is byte-identical with or without overlap, on any core count
+  and with any step size, including one frame per step (tests in `determinism_tests.rs`: H.264, ProRes,
+  Motion-JPEG, two-pass).
+- **Pending media.** A prefetched batch whose sources were not ready is dropped and rendered again by a
+  later step; nothing is encoded from an incomplete batch. The web app (no threads) never overlaps: it runs
+  the sequential render-then-encode as before.
+- **Cancel and errors.** Cancelling drops the prefetched frames; a panic while rendering ahead becomes an
+  export error. The encoder stays on the thread that called `step`.
+- **Memory.** Two batches are in flight (the one being encoded and the one being rendered), so up to
+  `2 * batch * frame_bytes` of finished frames are held, and the batch is lowered until that fits in
+  `IN_FLIGHT_BUDGET` (512 MiB; at least one frame): 16 frames of 1080p (8 MB), 8 + 8 frames of 4K SDR
+  (33 MB), 2 + 2 frames of 4K HDR (100 MB, 3840 x 2160 x 3 f32), 1 of 8K HDR. A batch never grows, and
+  frames are freed as soon as they are encoded. A first try with a 1 GiB budget (16 + 16 frames of 4K SDR,
+  5 + 5 of 4K HDR) raised the peak RSS of the 4K SDR exports by 80-700 MB over the old code; 512 MiB
+  brings it under the old peak (table below). `Exporter::set_overlap(false)` gives the old behaviour.
+- **Known web issue, not changed here.** `AudioOut::pull` moves its position before the pending check, so
+  when a web export retries a batch after a pending audio source, that group of audio is lost. It is
+  independent of the overlap (the web never overlaps); TODO: fix separately.
+
+`perf.stats` `export.stages`: `renderMs` and `encodeMs` (and audio / mux) now run at the same time, so
+their sum can exceed the export's wall time. `waitMs` is the time the encoding side spent waiting for the
+next batch to finish rendering after it was done encoding: large means render-bound, near zero means
+encode-bound.
+
+Measured (Xeon E5-2680 v4 14C/28T, RTX 5060, driver 617.42, Windows 11, release CLI, 300 frames of
+30 fps, mean of 2 alternated rounds, export wall time, peak RSS of the CLI process; "before" is the same
+harness on the commit without the overlap, "now" the 512 MiB budget; the 1080p rows were measured with a
+1 GiB budget, which gives the same batches at that size):
+
+| Case | wall before | wall now | speedup | `waitMs` now | peak RSS before / now |
+|---|---|---|---|---|---|
+| 1080p SW H.264 + AAC | 22.60 s | 20.66 s | 1.09x | 0 | 1279 / 1427 MB (+148) |
+| 1080p NVENC H.264 | 5.56 s | 4.99 s | 1.11x | 49 ms | 1318 / 1441 MB (+123) |
+| 1080p ProRes 422 HQ | 16.97 s | 15.32 s | 1.11x | 0 | 1234 / 1392 MB (+158) |
+| 2160p SW H.264 | 60.79 s | 54.12 s | 1.12x | 0 | 4030 / 3113 MB (-917) |
+| 2160p NVENC H.264 | 18.08 s | 15.64 s | 1.16x | 678 ms | 4177 / 3250 MB (-927) |
+| 2160p ProRes 422 HQ | 60.92 s | 55.71 s | 1.09x | 0 | 3675 / 3140 MB (-535) |
+| 2160p HDR PQ SW H.264 | 82.79 s | 77.62 s | 1.07x | 6758 ms | 5284 / 2560 MB (-2724) |
+| 2160p HDR PQ ProRes 422 HQ | 89.14 s | 83.95 s | 1.06x | 215 ms | 5183 / 2565 MB (-2618) |
+| 1080p effects NVENC H.264 | 28.70 s | 26.82 s | 1.07x | 13116 ms | 2044 / 2130 MB (+86) |
+| 1080p effects SW H.264 | 39.60 s | 34.35 s | 1.15x | 0 | 2017 / 2084 MB (+67) |
+
+With the first 1 GiB budget the 2160p rows were 55.42 / 16.00 / 56.75 s at 4404 / 4254 / 4376 MB peak and
+the HDR rows 76.69 / 84.39 s at 3504 / 3532 MB: the same speed within 2 % (the HDR SW row 1.2 % slower
+at 512 MiB), but 4K SDR used up to 700 MB more than the old code. Halving the budget costs no time and
+makes every 4K export smaller than before.
+
+The gain is 6-16 %, well under the `max(render, encode + audio + mux)` bound (1.06-1.86x). The reason is
+that the encode side is not one core: the software H.264 and ProRes encoders run their slices on the same
+rayon pool, and the RGB to YUV conversion is parallel too, so render and encode compete for the same
+cores and overlapping them only fills idle gaps (the serial parts: entropy coding tails, muxing, audio,
+the encoder's hand-off). Only NVENC, whose encode is light on the CPU, comes close to the bound in the
+1080p case (4.99 s against 4.00 s). The effects case on NVENC is render-bound (`waitMs` 13 s of 27 s: the
+encoder waits for the renderer), as expected. 1080p exports use 70-160 MB more (the second batch of 16
+frames); 4K exports use less than before because the batch is smaller (8 for SDR, 2 for HDR instead of 16).
+
+## Results (HW3: VideoToolbox hardware H.265 (HEVC) encoding, against hardware H.264)
+
+Apple M1 (8 cores, 16 GB), 2026-10-07, single runs on an otherwise idle machine, release build. Both
+encoders are the M1's media engine. H.265 is `Format::Hevc` (Main, 8-bit 4:2:0, one-pass VBR, no
+B-frames); H.264 is the opt-in hardware encoder of HW2 (High).
+
+### Speed
+
+The raw encoders (ffmpeg's `hevc_videotoolbox` and `h264_videotoolbox` on a 1080p25 test pattern, 500
+frames): 166 and 189 frames/s. H.265 is the codec that compresses further, not the faster one to encode.
+
+The 9:29 timeline of HW2 (camera clip, ProRes 4444 overlays, AAC, loudness normalised to −14 LUFS), 20 Mb/s
+H.264 and 10 Mb/s H.265: **204 s and 195 s** (CPU 1042 s and 1029 s), files of 1417 MB and 719 MB. The
+same time: the same H.264 export took 193 s and 200 s on other runs. The export is bound by the CPU
+compositor and the decoders, not by the encoder, so a different hardware codec does not change it.
+
+### Quality per bit
+
+30 s with a banner (15–45 s of that timeline), exported by FilmCraft as ProRes 422 HQ (the reference)
+and by each encoder at several bitrates; ffmpeg's `psnr` and `ssim` of the decoded 4:2:0 pictures against
+the reference. Average PSNR over the three planes, and SSIM (higher is better):
+
+| Mb/s | H.264 | H.265 | difference | H.264 Mb/s for H.265's PSNR |
+|---|---|---|---|---|
+| 20 | 46.88 dB, 0.9902 | 46.91 dB, 0.9903 | +0.03 dB | beyond the range measured |
+| 10 | 44.96 dB, 0.9863 | 45.09 dB, 0.9863 | +0.13 dB | 10.5 |
+| 6 | 43.72 dB, 0.9833 | 44.31 dB, 0.9843 | +0.59 dB | 7.7 |
+| 4 | 42.91 dB, 0.9807 | 43.64 dB, 0.9825 | +0.73 dB | 5.8 |
+| 3 | 42.37 dB, 0.9786 | 43.05 dB, 0.9807 | +0.68 dB | 4.3 |
+
+At 10 Mb/s and above the two give the same picture. At 3–6 Mb/s H.265 reaches the same PSNR with 22–31 %
+less bitrate. Its worst frame is better at every bitrate (lowest per-frame PSNR 45.9 against 42.1 dB at
+20 Mb/s, 43.1 against 41.5 dB at 10, 39.5 against 37.8 dB at 3).
+
+So there is no case for a lower default bitrate: the two formats start at the same 20 Mb/s. H.265
+pays off where the file size matters, at 3–6 Mb/s; that 9:29 timeline is 428 MB at 6 Mb/s.
+
+## Results (HW2: Windows Media Foundation / Direct3D 11 hardware decoding, Off → Auto)
+
+Same binary (release build of the HW2 commit), Settings ▸ Playback ▸ Hardware decoding switched
+with `--hw off` / `--hw auto`, 2026-10-07: Intel Xeon E5-2680 v4 (14 cores / 28 threads, 2.4 GHz),
+NVIDIA GeForce RTX 5060 8 GB (driver 617.14), Windows 11 Pro 26200, idle machine. Two alternating
+rounds; the table gives the range of the two (decode: best of 3 within each). Reproduce with
+`cargo xtask bench --sections decode --only dec_h264 --repeat 3 --hw off|auto` (likewise `dec_hevc`)
+and `--sections playback --only "h264-2160 full" --hw off|auto`; set `FILMCRAFT_FFMPEG` if ffmpeg is not
+on `PATH` for the fixture generator. Pictures are identical either way (bit-exact parity tests,
+`crates/platform/tests/it/media_foundation.rs`). The decoder MFTs were Microsoft's H.264 decoder
+(`Microsoft H264 Video Decoder MFT`) and the `HEVCVideoExtension` decoder, both decoding with DXVA
+on the RTX 5060's NVDEC: `nvidia-smi dmon -s u` showed the decoder engine at 18–27 % during an
+Auto run and 0 % otherwise, and every picture came back as a Direct3D 11 texture.
+
+### Decode (every frame through the media stack)
+
+| codec | size | CPU ms/frame Off → **Auto** | fps Off → **Auto** |
+|---|---|---|---|
+| H.264 | 1080p | 77–80 → **3.3** | 162–166 → **347–353** |
+| H.264 | 2160p | 310–315 → **11.9** | 39–43 → **93** |
+| HEVC Main | 1080p | 69–73 → **3.5** | 89–93 → **307–308** |
+| HEVC Main | 2160p | 315–348 → **12–13** | 26–28 → **87–90** |
+| HEVC Main 10 | 2160p | 314–336 → **17.6** | 32 → **57** |
+
+Counters: every Auto row had `hw frames` = frames × 3 repeats (360 at 1080p, 216 at 2160p), 3
+sessions, 0 fallbacks, 0 declined; every Off row had 0 hardware frames and 0 sessions.
+
+What is left on the CPU is the readback: `examples/mfprobe.rs --time` splits a 2160p H.264 picture
+into 1.1 ms DXVA decode (feeding the MFT), 2.8 ms GPU to CPU copy (staging texture + map) and 7 ms
+CPU conversion (Annex B, biplanar to planar Y'CbCr); Main 10 is 1.4 / 4.5 / 10 ms (twice the bytes).
+A zero-copy path removes the last two.
+
+### Program-monitor playback (8 s, GPU path)
+
+| case | shown/dropped Off → **Auto** | CPU ms/frame Off → **Auto** |
+|---|---|---|
+| H.264 1080p Full | 192/0 → **192/0** | 86–89 → **8.5–8.8** |
+| H.264 2160p Full | 192/0 → **189–190/2–3** | 338–353 → **17–20** |
+| H.264 2160p 1/2 | 192/0 → **190/2** | 355–361 → **22** |
+| HEVC 2160p Full | 112–152/40–80 → **191–192/0–1** | 355–364 → **18** |
+
+This machine has 28 software-decoding threads, so Off keeps up with 4K H.264 (at 340 ms of CPU per
+frame, about 8 cores busy); Auto uses a twentieth of that CPU but drops 2–3 of 192 frames
+(readback latency at the start of the run). 4K HEVC is where Off drops frames and Auto does not.
+Draft playback (1/2 draft: 410–416 → 93–105 CPU ms/frame) is dominated by the draft plan's decimation,
+as on macOS, because the hardware ignores draft mode.
+
+## Results (HW4: Windows NVENC H.264 export, software → hardware)
+
+Same machine as the HW2 results (Xeon E5-2680 v4, 28 threads, RTX 5060, driver 617.14, idle,
+2026-10-07). `cargo xtask bench --sections export --only h264 --hw off|auto --repeat 3`: the export
+of 8 s of a 1080p23.976 H.264 clip (191 frames) to H.264 with the default preset, VBR one pass.
+`--hw off` runs the software encoder; `--hw auto` sets `hardwareEncoding` to auto and runs NVENC
+(preset P5, high-quality tuning). Every NVENC row had `hw frames` = 573 = 191 × 3 repeats.
+
+| encoder | fps | CPU ms/frame | MB |
+|---|---|---|---|
+| software | 15.0 (12.7–12.8 s) | 1050 | 20.4 |
+| **NVENC** | **44** (4.3 s) | **356–373** | 21.7 |
+
+- The remaining CPU is the compositing and render of the frames and the RGBA → YUV conversion, not
+  the encoder.
+- The NVENC file is slightly larger at the same settings (21.7 vs 20.4 MB). The bitrate is not
+  matched, so these rows are not a quality comparison.
+
+Quality at equal bitrate: see the PR description.
+
+## Results (HW2 follow-up: Windows VP9 and AV1 hardware decoding, Off → Auto)
+
+Same machine and method as the H.264 / HEVC results above (Xeon E5-2680 v4, RTX 5060 driver 617.14,
+idle, 2026-10-07, two alternating rounds of `--hw off` / `--hw auto`, the same binary). MFTs:
+`VP9VideoExtensionDecoder` and `AV1VideoExtension` (Microsoft Store codec extensions), DXVA on the
+GPU's NVDEC (profiles VP9 0 / 2, AV1 main). AV1 fixtures here are libaom (`libsvtav1` is not in this
+ffmpeg build; the bench falls back to it) and VP9 are libvpx-vp9, as in the bench's `dec_*` specs.
+`cargo xtask bench --sections decode --only dec_vp9 --repeat 3 --hw off|auto` (likewise `dec_av1`),
+`--sections playback --only "av1-2160 full" --hw off|auto`.
+
+| codec | size | CPU ms/frame Off → **Auto** | fps Off → **Auto** (best of 3) |
+|---|---|---|---|
+| VP9 | 1080p | 38-43 → **3.5-3.6** | 60 → **281-283** |
+| VP9 | 2160p | 165-169 → **15-16** | 16 → **70-79** |
+| AV1 | 1080p | 55-56 → **3.3-3.4** | 22 → **373-374** |
+| AV1 | 2160p | 219-221 → **10.9-11.3** | 5.5 → **106-107** |
+
+Every Auto row had `hw frames` = frames × 3 repeats, 3 sessions, 0 fallbacks, 0 declined.
+
+| playback 8 s, Full | shown/dropped Off → **Auto** | CPU ms/frame Off → **Auto** |
+|---|---|---|
+| VP9 2160p | 11-12/180-181 → **191/1** | 117-124 → **24-27** |
+| AV1 2160p | 0/192 → **192/0** | 47.5-47.9 → **17-20** |
+
+Software AV1 decodes 4K at 5.5 fps here, so it never plays in real time; with the hardware decoder it
+plays without a drop. As on the other codecs, the hardware ignores draft mode and what is left on the
+CPU is the readback and plane conversion.
+
+## Results (Linux VA-API H.264 and HEVC hardware decoding, Off → Auto)
+
+Same commit, Settings ▸ Playback ▸ Hardware decoding switched with the bench flag
+(`cargo xtask bench --sections decode --only dec_h --repeat 3 --hw off|auto`), 2026-10-08, Intel
+Core i5-13500H with Iris Xe graphics (Raptor Lake-P), 7.4 GB RAM, Intel iHD driver 26.1.2 through
+libva 2.22, load average 5–15. Only H.264 goes through VA-API so far; the HEVC rows decode in
+software either way and show the run-to-run spread. The decoded pictures are identical
+(bit-exact parity tests, `crates/platform/tests/vaapi.rs`).
+
+| codec | size | CPU ms/frame Off → **Auto** | fps Off → **Auto** (best of 3) | hw frames |
+|---|---|---|---|---|
+| H.264 | 1080p | 103.7 → **2.3** | 133 → **263** | 360 |
+| H.264 | 2160p | 416.5 → **11.4** | 32 → **56** | 216 |
+| HEVC | 1080p | 63.2 → 46.5 | 99 → 131 | 0 |
+| HEVC | 2160p | 349.5 → 353.7 | 30 → 35 | 0 |
+| HEVC Main 10 | 2160p | 348.9 → 352.6 | 29 → 29 | 0 |
+
+What is left on the CPU per H.264 frame is the host side of stateless decoding (parsing, DPB,
+filling the VA buffers) and the read-back: `vaGetImage` into an NV12 image and the copy into
+planar Y'CbCr. One picture is decoded at a time and read back as soon as the DPB outputs it, so
+4K throughput (56 fps) is bound by that round trip, not by the video engine; overlapping decode
+and read-back, or zero-copy into wgpu, would raise it.
+
+### HEVC through VA-API (HW5 follow-up)
+
+Same machine and commands on 2026-10-09 with HEVC added, at a lower load (the software decoders ran
+faster than in the table above; compare within a row). H.264 is unchanged; every HEVC stream now
+goes through VA-API too (216–360 hardware frames, no fallbacks), bit-exact with the software decoder.
+
+| codec | size | CPU ms/frame Off → **Auto** | fps Off → **Auto** (best of 3) |
+|---|---|---|---|
+| H.264 | 1080p | 57.3 → **2.6** | 227 → **241** |
+| H.264 | 2160p | 231.8 → **12.6** | 58 → **52** |
+| HEVC | 1080p | 45.6 → **2.3** | 141 → **341** |
+| HEVC | 2160p | 202.5 → **10.1** | 47 → **76** |
+| HEVC Main 10 | 2160p | 211.6 → **18.4** | 42 → **46** |
+
+At this lower load the multi-threaded software decoders keep up with the one-picture-at-a-time
+hardware path on throughput for H.264 and 10-bit HEVC, at 5–20 % of their CPU time; under load
+(the run above) the hardware path is ahead on both. 10-bit pictures cost more to read back (P010 is
+twice the bytes of NV12 and is shifted down into 16-bit planes).
+
 ## Results (GPU1: blend modes on the GPU compositor, #30, before → after)
 
 Before = this change with the old whole-frame CPU fallback for non-Normal blend modes put back
@@ -145,6 +538,79 @@ A stack with blend modes now costs what the same stack in Normal does: the frame
 decode, and the UI-thread present (upload and draw, including the backdrop copies for the two
 blended layers) stays at 9–10 ms p50, as for `stack3`. Before, every frame was composited on the
 CPU (≈ 2 cores more at 23.976 fps) and Full resolution could not keep up at this load.
+
+## Results (#847: AV1 in-loop filters in parallel row bands, before → after)
+
+The AV1 decoder ran deblocking, CDEF and loop restoration on one thread per frame. A single-tile
+stream (what SVT-AV1 and most encoders write by default) has no other parallelism inside a
+frame, and a frame's references are waited for as whole frames, so this serial tail sat on the
+critical path of every frame that references it. The three filters now run in bands of 64 luma
+rows on the decoder's rayon pool, one join per filter per frame (the loop filter recomputes the
+8 rows above each band rather than splitting into two passes, because every join costs a worker
+wake-up, which is slow on a busy machine). Output is bit-exact with the single-threaded path and
+with libdav1d (all oracle and conformance tests, plus new 4:2:2 / 4:4:4 libaom fixtures); with
+one thread the code path is the old one.
+
+Linux, AMD Ryzen 7 7800X3D (8 cores / 16 threads), 2026-10-11, shared with other agents' builds;
+base = `2ff3f5e`, after = this change, 16 decoder threads, SVT-AV1 preset 8 fixtures from
+`crates/av1/tests/it/perf.rs` (`perf_1080p_lowdelay` and `perf_2160p_gop` are new there).
+
+`av1dec` example (`AV1_LOOPS=2 AV1_THREADS=16`), 8 rounds alternating base / after per fixture,
+load average 11–27; speed-up = base wall time / after wall time of the adjacent pair:
+
+| fixture | fps base → after (median) | paired speed-up, median (range) | after faster | CPU ms / frame (all threads) |
+|---|---|---|---|---|
+| `perf_1080p_lowdelay` (each frame refs the last) | 31.0 → **39.9** | 1.28 (0.85–1.48) | 6 / 8 | 44.2 → 55.0 |
+| `perf_1080p_gop` (crf 30) | 74.8 → **97.7** | 1.30 (1.06–1.41) | 8 / 8 | 30.2 → 35.9 |
+| `perf_1080p_gop_hq` (crf 18) | 32.0 → **37.5** | 1.16 (1.04–1.29) | 8 / 8 | 66.9 → 77.1 |
+| `perf_2160p_gop` (one tile) | 23.0 → **25.3** | 1.14 (1.08–1.41) | 8 / 8 | 103.1 → 115.5 |
+| `perf_1080p_intra` (10 key frames) | 121.3 → 138.1 | 1.03 (0.92–1.21) | 4 / 8 | 40.8 → 45.5 |
+
+Per-stage wall time on the frame worker (`tests/perf.rs`, 16 threads, ms per frame, median of 2
+alternating rounds at load average 8–11):
+
+| fixture | 16 threads fps | deblock | CDEF | restoration |
+|---|---|---|---|---|
+| `perf_1080p_lowdelay` | 31.8 → **48.7** | 2.03 → 0.63 | 5.16 → 1.62 | 5.81 → 1.40 |
+| `perf_2160p_gop` | 24.0 → **31.9** | 2.78 → 0.81 | 7.38 → 3.74 | 7.84 → 2.70 |
+| `perf_1080p_gop_hq` | 34.8 → 33.6 | 1.10 → 0.55 | 6.53 → 3.08 | 4.94 → 1.65 |
+
+One thread is unchanged (`perf_1080p_lowdelay`, 8 pairs: 2.19–2.20 s both). The extra CPU time
+is mostly rayon workers spinning briefly before they sleep after each join, plus the loop
+filter's recomputed margin rows. Key-frame-only streams gain little: their frames are
+independent, so frame threads already keep every core busy. What remains is the tile decode
+itself (entropy decoding and reconstruction of a single tile, 65–80 % of a frame), which only
+row-level frame threading (waiting for reference rows instead of whole frames) can overlap.
+
+## Results (VP9 loop filter wavefront, #980, before → after)
+
+The VP9 post stage of a frame (band assembly, loop filter, publication) ran on one thread, and
+later frames wait per band for their references, so the loop filter (about 30 % of the decode
+profile) set the pace of every inter frame: with 16 threads the tile columns spent most of their
+time waiting for the previous frame's bands. The loop filter now runs as a wavefront over
+superblock rows (row r two superblocks behind row r - 1, which is what the raster order of 8.8.1
+allows), the post thread and helpers on the decoder's pool each taking a row. No lock is held
+while a superblock is filtered: rows exchange copies of the 8 rows the filter reaches across a
+band boundary. Output is bit-identical (the conformance tests compare 1, 2, 3, 5 and 16 threads
+with ffmpeg).
+
+AMD Ryzen 7 7800X3D (8 cores / 16 threads), shared with other agents' builds, 2026-10-11.
+`vp9dec` example, 16 threads, runs alternating base / after; paired speed-up = base wall time /
+after wall time per pair:
+
+| fixture | load | paired speed-up, median (range) | after faster | CPU ms/frame |
+|---|---|---|---|---|
+| `bench_1080p` (4 tile columns) | 15–18 | 1.39 (1.20–2.09) | 6/6 | 13.5 → 15.3 |
+| `bench_4k` (8 tile columns) | 15–18 | 1.52 (1.49–1.59) | 6/6 | 48.0 → 57.8 |
+| 1080p30 realtime, noisy (6 Mb/s) | 15–18 | 1.56 (1.27–1.72) | 6/6 | 15.3 → 20.8 |
+| `bench_1080p` | 25–33 | 1.17 (0.91–1.65) | 4/6 | 15.7 → 17.9 |
+| `bench_4k` | 25–33 | 1.29 (0.99–2.03) | 5/6 | 56.9 → 63.1 |
+| 1080p30 realtime, noisy | 25–33 | 1.53 (1.40–1.94) | 6/6 | 22.5 → 25.4 |
+
+With one thread the rows run one after the other: 31.12 → 31.28 G user instructions for the noisy
+1080p clip (+0.5 %, `perf stat`). The extra CPU with threads is mostly rayon workers spinning
+before they sleep. With the machine oversubscribed (load above 16) the wavefront gains less, as
+every row waits for the one above.
 
 ## Results (M4.10: 4K VP9, AV1 and HEVC, before → after)
 
@@ -227,7 +693,7 @@ copy.
    the loop filter; HEVC sub-layer non-reference pictures of the top sub-layer skip deblocking
    and SAO; AV1 shown frames that refresh no slot skip deblocking, CDEF and loop restoration.
    Tested per codec (unflagged pictures bit-exact, single- and multi-threaded) and through the
-   media stack (`crates/codecs/tests/draft_decoders.rs`: draft frames reach draft requests only;
+   media stack (`crates/codecs/tests/it/draft_decoders.rs`: draft frames reach draft requests only;
    an export after draft playback is bit-exact with ffmpeg).
 
 Not done: AV1 row-level frame threading (references are waited for as whole frames) and its

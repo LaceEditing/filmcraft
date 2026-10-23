@@ -122,7 +122,7 @@ fn clip_views(app: &FilmcraftApp, pic: Rect, frame: (u32, u32)) -> Vec<ClipView>
                 continue;
             }
             let Some(src) = filmcraft_render::source_size(&app.session.project, it.item) else { continue };
-            let m = filmcraft_render::motion_matrix(seq, it, src, it.effect_time_at(ph));
+            let m = filmcraft_render::motion_matrix(seq, it, src, app.session.project.source_par(it.item), it.effect_time_at(ph));
             out.push(ClipView { clip: it.id.0, m: to_screen.then_apply(&m), src: (src.0 as f64, src.1 as f64), item: it.clone() });
         }
     }

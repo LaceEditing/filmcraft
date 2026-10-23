@@ -100,6 +100,23 @@ fn a_linked_partner_on_a_locked_track_stays_and_the_listed_clip_still_moves() {
     assert_eq!(*s.project, *before);
 }
 
+/// Moving a clip off a locked track used to leave it there and place another item with the same
+/// clip id on the destination (#917). The source is locked, so the move is refused.
+#[test]
+fn a_clip_on_a_locked_track_cannot_move_to_another_track() {
+    let mut s = demo();
+    let (v_track, v, _, _) = pair_in_an_empty_sequence(&mut s, 0.0);
+    s.execute("timeline.setTrack", json!({"track": "V1", "locked": true})).unwrap();
+    let before = s.project.clone();
+    let e = s.execute("timeline.move", json!({"moves": [{"clip": v.id.0, "track": "V2", "time": v.start.0}], "linked": false})).unwrap_err();
+    assert!(matches!(&e, EngineError::Edit(filmcraft_edit::EditError::Locked)), "{e:?}");
+    assert_eq!(*s.project, *before);
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.find_item(v.id).map(|(t, _)| t), Some(v_track));
+    assert_eq!(q.video_tracks[1].items.len(), 0);
+    q.check().unwrap();
+}
+
 /// A partner that would land where it already is does not move: re-placing it would drop the
 /// transitions at its edges and list it in `moved` for nothing. Moving only the picture to
 /// another track at the same time leaves the sound as it was.
@@ -248,105 +265,183 @@ fn a_move_that_lands_on_another_clip_reports_what_it_cut() {
     assert_eq!(r["overwritten"], json!([]));
 }
 
-/// `timeline.copyTo` (an Alt-drag): copies land where asked, the originals stay, copies of a
-/// linked pair are linked to each other (not to the originals), a copy whose partner stays behind
-/// is not linked, and it is one undo step.
+/// Option-drag copies (`copy: true`) with Cmd held insert, pushing the clips after them along;
+/// a copy onto a track of the other kind, of a clip that is not there, or of nothing is refused
+/// and changes nothing.
 #[test]
-fn copy_to_places_copies_and_keeps_the_originals() {
+fn copy_inserts_and_refuses_what_it_cannot_do() {
     let mut s = demo();
-    let (v1, v, a1, a) = pair_in_an_empty_sequence(&mut s, 0.0);
-    let at = v.end() + Tick::from_seconds_f64(1.0);
-    let before = s.project.clone();
-    let r =
-        s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": v1.0, "time": at.0}, {"clip": a.id.0, "track": a1.0, "time": at.0}]})).unwrap();
-    let copies: Vec<ClipId> = r["clips"].as_array().unwrap().iter().map(|c| ClipId(c.as_u64().unwrap())).collect();
-    assert_eq!(copies.len(), 2);
+    let (v1, v, a1, _) = pair_in_an_empty_sequence(&mut s, 0.0);
+    s.execute("timeline.move", json!({"moves": [{"clip": v.id.0, "track": v1.0, "time": 0}], "copy": true, "insert": true, "linked": false})).unwrap();
+    assert_eq!(state(&s, v.id), (v1, v.duration), "an insert copy pushes the original along");
+    s.execute("edit.undo", json!({})).unwrap();
+    let (before, undo) = (s.project.clone(), s.history.undo.len());
+    for moves in [json!([{"clip": v.id.0, "track": a1.0, "time": 0}]), json!([{"clip": 999_999, "track": v1.0, "time": 0}]), json!([])] {
+        assert!(s.execute("timeline.move", json!({"moves": moves, "copy": true, "linked": false})).is_err(), "{moves}");
+        assert_eq!(*s.project, *before, "{moves}");
+        assert_eq!(s.history.undo.len(), undo);
+    }
+}
+
+/// A Project item dropped below the last audio track (`"audioTrack": "new"`) gets a new track
+/// only for the streams it has: a sound adds no video track.
+#[test]
+fn placing_a_sound_on_a_new_track_adds_no_video_track() {
+    let mut s = demo();
+    s.execute("file.newSequence", json!({"name": "Drops", "video": 1, "audio": 1})).unwrap();
+    let Some(sound) = s.project.items.values().find(|i| !i.has_video() && i.has_audio()).map(|i| i.id) else { return };
+    let undo = s.history.undo.len();
+    s.execute("timeline.place", json!({"item": sound.0, "audioTrack": "new", "time": 0})).unwrap();
     let q = s.active_sequence().unwrap();
-    assert_eq!((state(&s, v.id), state(&s, a.id)), ((v1, v.start), (a1, a.start)), "the originals stay");
-    let cv = q.find_item(copies[0]).map(|(_, i)| i.clone()).unwrap();
-    let ca = q.find_item(copies[1]).map(|(_, i)| i.clone()).unwrap();
-    assert_eq!((cv.start, ca.start, cv.item, cv.duration), (at, at, v.item, v.duration));
-    assert!(cv.link.is_some() && cv.link == ca.link && cv.link != v.link, "the copies are linked to each other");
-    let mut sel = s.state.selection.clone();
-    sel.sort();
-    assert_eq!(sel, copies, "the copies are selected");
+    assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (1, 2));
+    assert_eq!(q.audio_tracks[1].items.len(), 1, "the sound is on the new track");
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+}
+
+/// Option-drag (`copy: true`) moved the clips instead of copying them.
+#[test]
+fn copy_leaves_the_originals_and_links_the_copies() {
+    let mut s = demo();
+    let (v_track, v, a_track, a) = pair_in_an_empty_sequence(&mut s, 0.0);
+    let to = v.end() + s.sequence_rate().tick_of(24);
+    let before = s.project.clone();
+    // the picture is listed; its linked sound is copied with it
+    let r = s.execute("timeline.move", json!({"moves": [{"clip": v.id.0, "track": "V2", "time": to.0}], "copy": true})).unwrap();
+    let copies: Vec<ClipId> = r["copied"].as_array().unwrap().iter().map(|c| ClipId(c.as_u64().unwrap())).collect();
+    assert_eq!(copies.len(), 2, "picture and sound are copied: {r}");
+    assert_eq!((state(&s, v.id), state(&s, a.id)), ((v_track, v.start), (a_track, a.start)), "the originals stay");
+    let q = s.active_sequence().unwrap();
+    let (vt, vc) = q.find_item(copies[0]).unwrap();
+    let (at, ac) = q.find_item(copies[1]).unwrap();
+    assert_eq!((vt, vc.start, vc.item, vc.source_in, vc.duration), (q.video_tracks[1].id, to, v.item, v.source_in, v.duration));
+    assert_eq!((at, ac.start), (a_track, to), "the sound copy keeps its offset on its own track");
+    assert!(vc.link.is_some() && vc.link == ac.link && vc.link != v.link, "the copies are linked to each other only");
+    assert_eq!(s.state.selection, copies, "the copies are selected");
     q.check().unwrap();
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(*s.project, *before, "one undo step");
-
-    // one side alone: its copy is not linked; inserting pushes later clips along
-    let r = s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": "V2", "time": 0}]})).unwrap();
-    let c = ClipId(r["clips"][0].as_u64().unwrap());
-    assert_eq!(s.active_sequence().unwrap().find_item(c).and_then(|(_, i)| i.link), None);
+    // copying just one side (linked: false) leaves the copy unlinked
+    let r = s.execute("timeline.move", json!({"moves": [{"clip": a.id.0, "track": a_track.0, "time": to.0}], "copy": true, "linked": false})).unwrap();
+    let c = ClipId(r["copied"][0].as_u64().unwrap());
+    assert_eq!(r["copied"].as_array().unwrap().len(), 1);
+    assert!(s.active_sequence().unwrap().find_item(c).unwrap().1.link.is_none());
+    // a copy onto a locked track is refused and changes nothing
     s.execute("edit.undo", json!({})).unwrap();
-    s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": v1.0, "time": 0}], "insert": true})).unwrap();
-    assert_eq!(state(&s, v.id), (v1, v.duration), "an insert copy pushes the original along");
-    s.execute("edit.undo", json!({})).unwrap();
-
-    // refused: a picture onto an audio track, a locked track, a missing clip; nothing changes
-    let undo = s.history.undo.len();
-    assert!(s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": a1.0, "time": 0}]})).is_err());
     s.execute("timeline.setTrack", json!({"track": "V2", "locked": true})).unwrap();
-    assert!(s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": "V2", "time": 0}]})).is_err());
-    assert!(s.execute("timeline.copyTo", json!({"moves": [{"clip": 999_999, "track": v1.0, "time": 0}]})).is_err());
-    assert!(s.execute("timeline.copyTo", json!({"moves": []})).is_err());
-    assert_eq!(s.history.undo.len(), undo + 1, "only the lock was a change");
+    let r = s.execute("timeline.move", json!({"moves": [{"clip": v.id.0, "track": "V2", "time": to.0}], "copy": true, "linked": false}));
+    assert!(r.is_err());
+    assert_eq!(s.active_sequence().unwrap().all_tracks().map(|t| t.items.len()).sum::<usize>(), 2);
 }
 
-/// A clip dragged below the last audio track (or above the top video track) lands on a new
-/// track: `timeline.move` / `timeline.copyTo` naming a track past the last one add it, in the same
-/// undo step as the move; a move that fails leaves no new track behind.
 #[test]
-fn moving_past_the_last_track_adds_one() {
-    let mut s = Session::default();
-    s.execute("file.openDemoProject", json!({})).unwrap();
-    let (_, v, _, a) = pair_in_an_empty_sequence(&mut s, 1.0);
-    let undo = s.history.undo.len();
-    s.execute("timeline.move", json!({"moves": [{"clip": a.id.0, "track": "A3", "time": a.start.0}], "linked": false, "addTracks": true})).unwrap();
-    let q = s.active_sequence().unwrap();
-    assert_eq!(q.audio_tracks.len(), 3, "a third audio track was added");
-    assert_eq!(state(&s, a.id).0, q.audio_tracks[2].id);
-    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
-    s.undo();
-    let q = s.active_sequence().unwrap();
-    assert_eq!(q.audio_tracks.len(), 2, "undo takes the track away with the move");
-    assert_eq!(state(&s, a.id).0, q.audio_tracks[0].id);
-    // a copy above the top video track
-    s.execute("timeline.copyTo", json!({"moves": [{"clip": v.id.0, "track": "V3", "time": v.start.0}], "addTracks": true})).unwrap();
-    let q = s.active_sequence().unwrap();
-    assert_eq!(q.video_tracks.len(), 3);
-    assert_eq!(q.video_tracks[2].items.len(), 1, "the copy is on the new track");
-    // a failing move adds nothing
-    let tracks = s.active_sequence().unwrap().audio_tracks.len();
-    assert!(s.execute("timeline.move", json!({"moves": [{"clip": 999_999, "track": "A9", "time": 0}], "addTracks": true})).is_err());
-    assert_eq!(s.active_sequence().unwrap().audio_tracks.len(), tracks);
-    assert!(s.execute("timeline.move", json!({"moves": [{"clip": a.id.0, "track": "A40", "time": 0}], "addTracks": true})).is_err(), "too many at once");
-    // without addTracks a missing track stays an error
-    assert!(s.execute("timeline.move", json!({"moves": [{"clip": a.id.0, "track": "A9", "time": 0}]})).is_err());
-    assert_eq!(s.active_sequence().unwrap().audio_tracks.len(), tracks);
-}
-
-/// A Project item dropped past the last track: `timeline.place` naming tracks past the last adds
-/// them (only for the streams the item has), in the clip's undo step.
-#[test]
-fn placing_past_the_last_track_adds_one() {
-    let mut s = Session::default();
-    s.execute("file.openDemoProject", json!({})).unwrap();
-    s.execute("file.newSequence", json!({"name": "Drops", "video": 1, "audio": 1})).unwrap();
-    let item = s.project.items.values().find(|i| i.has_video() && i.has_audio() && i.as_media().is_some()).map(|i| i.id).unwrap();
-    let undo = s.history.undo.len();
-    let r = s.execute("timeline.place", json!({"item": item.0, "track": "V1", "audioTrack": "A2", "time": 0, "addTracks": true})).unwrap();
-    let q = s.active_sequence().unwrap();
-    assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (1, 2), "{r}");
-    assert_eq!(q.audio_tracks[1].items.len(), 1);
-    assert_eq!(s.history.undo.len(), undo + 1);
-    s.execute("timeline.place", json!({"item": item.0, "track": "V2", "audioTrack": "A1", "time": 0, "addTracks": true})).unwrap();
-    assert_eq!(s.active_sequence().unwrap().video_tracks.len(), 2);
-    // a sound-only item adds no video track
-    if let Some(sound) = s.project.items.values().find(|i| !i.has_video() && i.has_audio()).map(|i| i.id) {
-        let v = s.active_sequence().unwrap().video_tracks.len();
-        s.execute("timeline.place", json!({"item": sound.0, "audioTrack": "A3", "time": 0, "addTracks": true})).unwrap();
+fn new_track_moves_and_copies_are_one_atomic_edit() {
+    for copy in [false, true] {
+        let mut s = demo();
+        let (vt, v, at, a) = last_pair(&s);
+        let before = s.project.clone();
+        let count = s.history.undo.len();
         let q = s.active_sequence().unwrap();
-        assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (v, 3));
+        let counts = (q.video_tracks.len(), q.audio_tracks.len());
+        let r = s
+            .execute(
+                "timeline.move",
+                json!({"moves":[{"clip":v.id.0,"track":"new","time":v.start.0},{"clip":a.id.0,"track":"new","time":a.start.0}],"linked":false,"copy":copy}),
+            )
+            .unwrap();
+        let q = s.active_sequence().unwrap();
+        assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (counts.0 + 1, counts.1 + 1));
+        let new_v = q.video_tracks.last().unwrap();
+        let new_a = q.audio_tracks.last().unwrap();
+        assert_eq!(new_a.channels, before.sequence(s.state.active_sequence.unwrap()).unwrap().track(at).unwrap().channels);
+        assert_eq!((new_v.items[0].item, new_a.items[0].item), (v.item, a.item));
+        assert_eq!((new_v.items[0].start, new_a.items[0].start), (v.start, a.start));
+        if copy {
+            assert_eq!(state(&s, v.id), (vt, v.start));
+            assert_eq!(state(&s, a.id), (at, a.start));
+            assert_ne!(new_v.items[0].id, v.id);
+            assert!(new_v.items[0].link.is_some() && new_v.items[0].link == new_a.items[0].link);
+            assert_ne!(new_v.items[0].link, v.link);
+            assert_eq!(s.state.selection.len(), 2);
+            assert_eq!(r["copied"].as_array().unwrap().len(), 2);
+        } else {
+            assert_eq!(state(&s, v.id), (new_v.id, v.start));
+            assert_eq!(state(&s, a.id), (new_a.id, a.start));
+        }
+        q.check().unwrap();
+        assert_eq!(s.history.undo.len(), count + 1);
+        let after = s.project.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(*s.project, *before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(*s.project, *after);
     }
+}
+
+#[test]
+fn new_track_group_keeps_clips_from_the_same_source_together() {
+    let mut s = demo();
+    let q = s.active_sequence().unwrap();
+    let clips = q.video_tracks[0].items[..2].to_vec();
+    let tracks = q.video_tracks.len();
+    let before = s.project.clone();
+    let moves: Vec<_> = clips.iter().map(|c| json!({"clip":c.id.0,"track":"new","time":c.start.0})).collect();
+    s.execute("timeline.move", json!({"moves":moves,"linked":false})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.video_tracks.len(), tracks + 1);
+    let t = q.video_tracks.last().unwrap();
+    assert_eq!(t.items, clips);
+    q.check().unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.project, *before);
+}
+
+#[test]
+fn refused_new_track_moves_preserve_document_and_both_history_stacks() {
+    let mut s = demo();
+    let (_, v, _, _) = last_pair(&s);
+    s.execute("timeline.setTrack", json!({"track":"V1","locked":true})).unwrap();
+    for moves in [
+        json!([{"clip":v.id.0,"track":"new","time":v.start.0}]),
+        json!([{"clip":u64::MAX,"track":"new","time":0}]),
+        json!([{"clip":v.id.0,"track":"new","time":i64::MAX}]),
+        json!([{"clip":v.id.0,"track":"new","time":0},{"clip":u64::MAX,"track":"V2","time":0}]),
+    ] {
+        let before = s.project.clone();
+        let history = s.execute("history.list", json!({})).unwrap();
+        assert!(s.execute("timeline.move", json!({"moves":moves,"linked":false})).is_err());
+        assert_eq!(*s.project, *before);
+        assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    let before = s.project.clone();
+    let history = s.execute("history.list", json!({})).unwrap();
+    assert!(!history["redo"].as_array().unwrap().is_empty());
+    for moves in [
+        json!([{"clip":v.id.0,"track":"new","time":0},{"clip":u64::MAX,"track":"V2","time":0}]),
+        json!([{"clip":v.id.0,"track":"new","time":i64::MAX}]),
+        json!([{"clip":v.id.0,"track":"new"}]),
+        json!([{"clip":v.id.0,"track":"new","time":"invalid"}]),
+    ] {
+        assert!(s.execute("timeline.move", json!({"moves":moves,"linked":false})).is_err());
+        assert_eq!(*s.project, *before);
+        assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
+    }
+}
+
+#[test]
+fn new_track_moves_respect_the_track_limit() {
+    let mut s = demo();
+    let (_, v, _, _) = last_pair(&s);
+    s.edit_sequence("Limit fixture", |q, ctx, _| {
+        while q.video_tracks.len() < crate::sequence_tools::MAX_TRACKS {
+            q.video_tracks.push(filmcraft_project::Track::new(TrackId(ctx.alloc()), filmcraft_project::TrackKind::Video, "Limit".into()));
+        }
+        Ok(())
+    })
+    .unwrap();
+    let before = s.project.clone();
+    let history = s.execute("history.list", json!({})).unwrap();
+    assert!(s.execute("timeline.move", json!({"moves":[{"clip":v.id.0,"track":"new","time":v.start.0}],"linked":false})).is_err());
+    assert_eq!(*s.project, *before);
+    assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
 }

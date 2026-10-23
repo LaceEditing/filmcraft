@@ -474,12 +474,13 @@ fn lane_drags_live_and_zooms() {
     d.ok("ui.drag", json!({"from": {"x": end.x, "y": end.y}, "to": {"x": bar.x + (end.x - bar.x) * 0.5, "y": end.y}, "steps": 10}));
     d.frames(3);
     assert!(d.app().ui.ec_view.is_some(), "zoomed with the bar");
-    // the divider
-    let split = d.app().ui.ec_split;
+    // the divider (the effect list's width, in points, is kept: `effect_controls_split`, #643)
     let dv = d.center("effectControls.divider");
     d.ok("ui.drag", json!({"from": {"x": dv.x, "y": dv.y}, "to": {"x": dv.x - 80.0, "y": dv.y}, "steps": 6}));
     d.frames(2);
-    assert!(d.app().ui.ec_split < split, "the divider moved left");
+    let moved = d.center("effectControls.divider");
+    assert!(moved.x < dv.x - 10.0, "the divider moved left: {dv:?} -> {moved:?}");
+    assert!(d.app().ui.effect_controls_split > 0.0, "the list keeps its new width");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

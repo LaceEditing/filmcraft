@@ -126,7 +126,8 @@ impl VideoInfo {
 
     /// Pixel aspect ratio derived from the display size (pixels or aspect-ratio units), reduced.
     pub fn pixel_aspect(&self) -> (u32, u32) {
-        let (pw, ph) = (self.pixel_width.saturating_sub(self.crop.2 + self.crop.3) as u64, self.pixel_height.saturating_sub(self.crop.0 + self.crop.1) as u64);
+        let pw = self.pixel_width.saturating_sub(self.crop.2.saturating_add(self.crop.3)) as u64;
+        let ph = self.pixel_height.saturating_sub(self.crop.0.saturating_add(self.crop.1)) as u64;
         let (Some(dw), Some(dh)) = (self.display_width, self.display_height) else { return (1, 1) };
         if pw == 0 || ph == 0 || dw == 0 || dh == 0 || !matches!(self.display_unit, 0 | 3) {
             return (1, 1);
@@ -191,6 +192,10 @@ pub struct Sample {
     pub block_offset: u64,
     /// Index of this frame within a laced block.
     pub lace: u16,
+    /// (offset, size) of the block's `BlockAdditional` with `BlockAddID` 1, when it has one and
+    /// is not laced. In WebM this is the alpha layer of a VP8/VP9 track with `AlphaMode` 1: a
+    /// second, independently coded stream whose luma plane is the frame's alpha.
+    pub addition: Option<(u64, u32)>,
 }
 
 /// A Matroska track (`TrackEntry`) plus, once indexed, its sample table.
@@ -343,5 +348,29 @@ mod rotation_tests {
         assert_eq!(with_roll(0, 0.0, 180.0, 0.0).display_rotation(), None, "pitch flip");
         assert_eq!(with_roll(0, 0.0, 0.0, 45.0).display_rotation(), None, "not a quarter turn");
         assert_eq!(with_roll(0, 0.0, 0.0, f64::NAN).display_rotation(), None, "malformed angle");
+    }
+}
+
+#[cfg(test)]
+mod aspect_overflow_tests {
+    use super::VideoInfo;
+
+    #[test]
+    fn hostile_crop_sums_do_not_overflow() {
+        let video = VideoInfo {
+            pixel_width: 640,
+            pixel_height: 480,
+            display_width: Some(640),
+            display_height: Some(480),
+            crop: (u32::MAX, 1, u32::MAX, 1),
+            ..Default::default()
+        };
+        assert_eq!(video.pixel_aspect(), (1, 1));
+    }
+
+    #[test]
+    fn ordinary_pixel_aspect_is_unchanged() {
+        let video = VideoInfo { pixel_width: 1920, pixel_height: 1080, display_width: Some(1440), display_height: Some(1080), ..Default::default() };
+        assert_eq!(video.pixel_aspect(), (3, 4));
     }
 }

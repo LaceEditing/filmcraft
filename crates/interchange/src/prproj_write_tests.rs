@@ -851,7 +851,7 @@ fn new_sequences_synthetic_items_and_bins_are_built() {
         name: "Orange".into(),
         kind: filmcraft_media::MediaKind::Still,
         duration: Tick(5 * S),
-        audio: None,
+        audio_streams: Vec::new(),
         container: String::new(),
         start_timecode: None,
         file_size: None,

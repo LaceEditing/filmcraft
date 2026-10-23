@@ -1,6 +1,6 @@
 //! Colour, keying and matte effects.
 
-use filmcraft_color::{Matrix, hsl_to_rgb, rgb_to_hsl, rgb_to_ycbcr};
+use filmcraft_color::{hsl_to_rgb, rgb_to_hsl};
 use filmcraft_project::EffectInstance;
 use filmcraft_project::effect::LIGHT_IDS;
 use rayon::prelude::*;
@@ -110,112 +110,8 @@ pub(crate) fn cdl(c: [f32; 3], s: [f32; 3], o: [f32; 3], p: [f32; 3], sat: f32) 
     v.map(|q| (l + sat * (q - l)).clamp(0.0, 1.0))
 }
 
-/// Video Limiter: keeps Y′CbCr (Rec. 709, display-encoded) within 0…Clip Level with an
-/// exponential soft knee that starts `compression` below the limit.
-pub fn video_limiter(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
-    let max = 1.0 + chv(e, "clip_level") as f32 / 100.0;
-    let comp = [0.0, 0.03, 0.05, 0.10, 0.20][chv(e, "compression").min(4) as usize];
-    let axis = chv(e, "axis");
-    let warn = bv(e, "gamut_warning");
-    let wc = lin(cv(e, "warning_color", cx));
-    img.map_rgb(|c, _, _| {
-        let v = [linear_to_enc(c[0]), linear_to_enc(c[1]), linear_to_enc(c[2])];
-        let out = limit(v, max, comp, axis);
-        if warn && v.iter().zip(&out).any(|(a, b)| (a - b).abs() > 1e-4) {
-            return wc;
-        }
-        dec_unclamped(out)
-    });
-    let _ = cx;
-}
-
-/// sRGB encoding that keeps values above 1 (super-whites) instead of clamping them.
-#[inline]
-fn linear_to_enc(v: f32) -> f32 {
-    if v <= 1.0 { filmcraft_color::linear_to_srgb(v.max(0.0)) } else { 1.0 + (v - 1.0) / 2.4 }
-}
-#[inline]
-fn enc_to_linear(v: f32) -> f32 {
-    if v <= 1.0 { filmcraft_color::srgb_to_linear(v.max(0.0)) } else { 1.0 + (v - 1.0) * 2.4 }
-}
-fn dec_unclamped(c: [f32; 3]) -> [f32; 3] {
-    c.map(enc_to_linear)
-}
-
-#[inline]
-fn knee(v: f32, max: f32, comp: f32) -> f32 {
-    let k = max * (1.0 - comp);
-    if comp <= 0.0 || v <= k {
-        return v.min(max);
-    }
-    let r = max - k;
-    k + r * (1.0 - (-(v - k) / r).exp())
-}
-
-pub(crate) fn limit(v: [f32; 3], max: f32, comp: f32, axis: u32) -> [f32; 3] {
-    let m = Matrix::Bt709;
-    let ycc = rgb_to_ycbcr(v[0], v[1], v[2], m);
-    let (kr, kb) = (0.2126f32, 0.0722f32);
-    let to_rgb = |y: f32, cb: f32, cr: f32| {
-        let r = y + 2.0 * (1.0 - kr) * cr;
-        let b = y + 2.0 * (1.0 - kb) * cb;
-        let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
-        [r, g, b]
-    };
-    let (mut y, mut cb, mut cr) = (ycc[0], ycc[1], ycc[2]);
-    if axis != 1 {
-        y = knee(y.max(0.0), max, comp);
-    }
-    if axis != 0 {
-        // scale chroma so every channel fits 0…max (the gamut of legal R′G′B′)
-        let rgb = to_rgb(y, cb, cr);
-        let mut s = 1.0f32;
-        for &ch in &rgb {
-            let d = ch - y;
-            if ch > max && d > 1e-6 {
-                s = s.min(((max - y) / d).max(0.0));
-            }
-            if ch < 0.0 && d < -1e-6 {
-                s = s.min((y / -d).max(0.0));
-            }
-        }
-        if axis == 3 && s < 1.0 {
-            // smart limit: soft chroma compression rather than a hard cut
-            s = knee(s, 1.0, comp.max(0.03)).min(1.0);
-        }
-        cb *= s;
-        cr *= s;
-    }
-    to_rgb(y, cb, cr).map(|q| q.clamp(0.0, max))
-}
-
-/// Vignette: darkens (negative Amount, towards Color) or lightens the frame edges.
-pub fn vignette(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
-    let amt = fv(e, "amount", cx) / 100.0;
-    if amt.abs() < 1e-5 {
-        return;
-    }
-    let mid = fv(e, "midpoint", cx) / 100.0;
-    let round = fv(e, "roundness", cx) / 100.0;
-    let feather = (fv(e, "feather", cx) / 100.0).max(0.01);
-    let col = cv(e, "color", cx);
-    let target = if amt < 0.0 { [col[0], col[1], col[2]] } else { [1.0; 3] };
-    let (w, h) = (img.w as f32, img.h as f32);
-    let aspect = w / h;
-    img.map_rgb(|c, x, y| {
-        let mut nx = (x as f32 + 0.5) / w * 2.0 - 1.0;
-        let ny = (y as f32 + 0.5) / h * 2.0 - 1.0;
-        // roundness 100 = circle; 0 = an ellipse following the frame; −100 = squarer
-        if round > 0.0 {
-            nx *= 1.0 + (aspect - 1.0) * round;
-        }
-        let p = if round < 0.0 { 2.0 + (-round) * 6.0 } else { 2.0 };
-        // 0 at the centre, 1 at the corners
-        let d = (nx.abs().powf(p) + ny.abs().powf(p)).powf(1.0 / p) / 2f32.powf(1.0 / p);
-        let edge = smoothstep(mid - feather * 0.5, mid + feather * 0.5, d);
-        dec(lerp3(enc(c), target, edge * amt.abs()))
-    });
-}
+#[allow(unused_imports)]
+pub(crate) use crate::gpufx::limit;
 
 /// Logo Cutout: removes a flat white/black/custom background by un-multiplying it — the alpha of
 /// a pixel is how far it is from the background towards the gamut edge, and the colour is
@@ -287,20 +183,17 @@ pub fn ultra_key(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     // a key without a dominant channel (grey) keys nothing meaningful: keep the division sane
     let kd = excess(key).max(0.02);
     let yk = luma(key).clamp(0.02, 1.0);
-    let setting = chv(e, "setting");
-    // Relaxed / Aggressive narrow / widen what is keyed; Default and Custom use the values as set
-    let (slope_mul, ped_mul) = match setting {
-        1 => (0.85, 0.7),
-        2 => (1.2, 1.5),
-        _ => (1.0, 1.0),
-    };
-    let pct = |id: &str| (fv(e, id, cx) / 100.0).clamp(0.0, 1.0);
+    // Default, Relaxed and Aggressive use their preset values (see `ultra_key_setting`); Custom
+    // uses the values as set
+    let preset = filmcraft_project::effect::ultra_key_setting(chv(e, "setting"));
+    let pf = |id: &str, fallback: f32| preset.and_then(|rows| rows.iter().find(|(k, _)| *k == id).map(|(_, v)| *v as f32)).unwrap_or(fallback);
+    let pct = |id: &str| (pf(id, fv(e, id, cx)) / 100.0).clamp(0.0, 1.0);
     let transparency = pct("transparency");
     let highlight = pct("highlight");
     let shadow = pct("shadow");
     let tolerance = pct("tolerance");
-    let pedestal = (pct("pedestal") * 0.25 * ped_mul).min(0.9);
-    let slope = 0.5876 / (1.0 - 0.99 * transparency) * slope_mul;
+    let pedestal = (pct("pedestal") * 0.25).min(0.9);
+    let slope = 0.5876 / (1.0 - 0.99 * transparency);
     let x0 = -0.093 * tolerance;
     let dark_pow = 5.24 * shadow;
     let bright_pow = 0.2975 + 3.0 * highlight;
@@ -336,9 +229,9 @@ pub fn ultra_key(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         alpha.par_iter_mut().for_each(|a| *a = ((*a - mid) * g + mid).clamp(0.0, 1.0));
     }
     // spill suppression + colour correction on the foreground
-    let spill = fv(e, "spill", cx).max(0.0) / 50.0;
+    let spill = pf("spill", fv(e, "spill", cx)).max(0.0) / 50.0;
     let range = pct("range");
-    let luma_back = fv(e, "spill_luma", cx).max(0.0) / 50.0;
+    let luma_back = pf("spill_luma", fv(e, "spill_luma", cx)).max(0.0) / 50.0;
     let desat = pct("desaturate");
     let weights = [0.2126f32, 0.7152, 0.0722];
     let dom_weight = weights[dom];
@@ -527,7 +420,7 @@ pub fn noise(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     let colored = bv(e, "color");
     let clip = bv(e, "clip");
     let grain = (fv(e, "grain_size", cx).max(1.0) * cx.px_scale).max(1.0);
-    let frame = (cx.seconds * 30.0) as u64;
+    let frame = crate::effects::noise_frame_seed(cx);
     let w = img.w;
     img.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
         for x in 0..w {

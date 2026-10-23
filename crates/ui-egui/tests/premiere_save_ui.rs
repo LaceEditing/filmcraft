@@ -255,18 +255,19 @@ fn a_failed_save_says_so_and_the_close_prompt_stays() {
         v.events.clear();
     }
     d.frames(1);
-    assert_eq!(d.harness.state().dialog, Some(filmcraft_ui_egui::Dialog::CloseConfirm));
-    d.ok("ui.click", json!({"id": "closeConfirm.save"}));
+    assert!(d.harness.state().ui.clip_dialog.as_ref().is_some_and(|c| c.command == "app.quit"), "the quit prompt opened");
+    d.ok("ui.click", json!({"id": "quit.save"}));
     d.frames(3);
-    assert_eq!(d.harness.state().dialog, Some(filmcraft_ui_egui::Dialog::CloseConfirm), "the prompt stays");
-    assert!(!d.harness.state().close_confirmed);
-    let els = d.ok("ui.elements", json!({"prefix": "closeConfirm.error"}));
+    assert!(d.harness.state().ui.clip_dialog.as_ref().is_some_and(|c| c.command == "app.quit"), "the prompt stays");
+    assert_eq!(d.harness.state().dialog, None, "no second dialog over the prompt");
+    assert!(!d.harness.state().quit_confirmed);
+    let els = d.ok("ui.elements", json!({"prefix": "quit.error"}));
     assert!(els.as_array().is_some_and(|a| !a.is_empty()), "the reason is shown");
     // writable again: Save from the prompt goes through and closes
     std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o755)).unwrap();
-    d.ok("ui.click", json!({"id": "closeConfirm.save"}));
+    d.ok("ui.click", json!({"id": "quit.save"}));
     d.frames(3);
-    assert!(d.harness.state().close_confirmed, "saved, so the window closes");
+    assert!(d.harness.state().quit_confirmed, "saved, so the window closes");
     assert!(!d.harness.state().session.is_dirty());
     let _ = std::fs::remove_dir_all(&dir);
 }

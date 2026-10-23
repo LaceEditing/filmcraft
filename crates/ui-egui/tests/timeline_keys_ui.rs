@@ -184,7 +184,7 @@ fn clicking_a_gap_and_clearing_it_ripples() {
     for key in ["Backspace", "Delete", "Shift+Delete", "Alt+Backspace"] {
         click_gap(&mut d, first, second, "left");
         assert!(d.app().session.state.selection.is_empty(), "{key}: clicking the gap deselects the clip");
-        assert!(d.app().session.selected_gap().is_some(), "{key}: the gap is selected");
+        assert!(d.app().session.state.gap_selection.is_some(), "{key}: the gap is selected");
         let gap = d.ok("ui.elements", json!({"prefix": "timeline.gap"}));
         assert_eq!(gap.as_array().map(Vec::len), Some(1), "{key}: the selected gap is drawn: {gap}");
         d.key(key);
@@ -197,7 +197,7 @@ fn clicking_a_gap_and_clearing_it_ripples() {
     // right-clicking the gap offers Ripple Delete
     click_gap(&mut d, first, second, "right");
     d.frames(2);
-    d.ok("ui.click", json!({"id": "timeline.gapMenu.rippleDelete"}));
+    d.ok("ui.click", json!({"id": "timeline.gapMenu.edit.rippleDelete"}));
     d.frames(3);
     assert_eq!(d.start(second), f48, "the gap menu's Ripple Delete closes it");
     d.key("Cmd+Z");
@@ -207,7 +207,7 @@ fn clicking_a_gap_and_clearing_it_ripples() {
     let end = d.ok("ui.timeline.locate", json!({"clip": second.0, "edge": "out"}));
     d.ok("ui.click", json!({"x": end["x"].as_f64().unwrap() + 30.0, "y": end["y"]}));
     d.frames(3);
-    assert!(d.app().session.state.selection.is_empty() && d.app().session.selected_gap().is_none());
+    assert!(d.app().session.state.selection.is_empty() && d.app().session.state.gap_selection.is_none());
     d.key("Backspace");
     assert_eq!(d.start(second), f96, "nothing to clear");
 }

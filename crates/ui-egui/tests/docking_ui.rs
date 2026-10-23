@@ -1,7 +1,7 @@
-//! Headless UI tests of moving panels around (Premiere's docking): dragging a tab into another
-//! group or beside it, a group by its strip, the dock's outer edges, the tab ×, the panel
-//! menu (Undock, Close Other Panels, Maximize Frame), Window ▸ checkmarks, and the arrangement
-//! reopening after a restart until Reset to Saved Layout.
+//! Headless UI tests of closing, reopening and undocking panels (Premiere's docking): the tab ×,
+//! the panel menu (Undock, Maximize Frame), a compact panel's grip, and Window ▸ checkmarks.
+//! Dragging panels into, beside and out of groups is tested with the shared docking model
+//! (`it/shared_docking_ui.rs`).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, channel};
@@ -74,21 +74,12 @@ impl Driver {
         v.as_array().unwrap().iter().any(|e| e["id"] == json!(id))
     }
 
-    fn drag(&mut self, from: Value, to: Value) {
-        self.ok("ui.drag", json!({"from": from, "to": to, "steps": 10}));
-        self.frames(4);
-    }
-
     fn app(&mut self) -> &mut FilmcraftApp {
         self.harness.state_mut()
     }
 
     fn dock(&mut self) -> DockNode {
         self.app().ui.dock.clone()
-    }
-
-    fn group(&mut self, p: PanelKind) -> Vec<PanelKind> {
-        self.dock().group_of(p).map(|g| g.0).unwrap_or_default()
     }
 
     /// A tab of the Project group that is on screen (the strip may not show them all).
@@ -102,28 +93,6 @@ impl Driver {
         let ids: Vec<&str> = tabs.as_array().unwrap().iter().filter_map(|e| e["id"].as_str()).collect();
         panic!("none of {candidates:?} has a tab on screen: {ids:?}\n{:?} max {:?}", self.dock(), self.app().ui.keys.maximized);
     }
-}
-
-#[test]
-fn tabs_move_into_groups_and_beside_them() {
-    let dir = data_dir("move");
-    let mut d = Driver::new(&dir);
-    let p = d.visible_tab(&[PanelKind::Project, PanelKind::MediaBrowser, PanelKind::Libraries]);
-    // into the Program monitor's group (its centre)
-    d.drag(json!({"id": format!("panel.tab.{}", p.id())}), json!({"id": "panel.Program"}));
-    assert_eq!(d.group(PanelKind::Program), [PanelKind::Program, p], "{:?}", d.dock());
-    assert!(d.dock().is_visible(p), "the moved tab is shown");
-    // beside the Timeline: dropped on its top quarter, the Timeline's place splits
-    d.drag(json!({"id": format!("panel.tab.{}", p.id())}), json!({"id": "panel.Timeline", "fx": 0.5, "fy": 0.08}));
-    assert_eq!(d.group(p), [p]);
-    assert_eq!(d.group(PanelKind::Timeline), [PanelKind::Timeline]);
-    // a whole group by the empty part of its strip, to the right edge of the dock area
-    let (props, _) = d.dock().group_of(PanelKind::Properties).unwrap();
-    d.drag(json!({"id": "panel.grip.Properties", "fx": 0.6}), json!({"x": 1596.0, "y": 500.0}));
-    let dock = d.dock();
-    let DockNode::Split { vertical: false, b, .. } = &dock else { panic!("{dock:?}") };
-    assert_eq!(**b, DockNode::Tabs { panels: props, active: 0 }, "a full-height column at the right");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -144,7 +113,7 @@ fn close_reopen_undock_and_maximize() {
     let menu = d.ok("ui.menu.list", json!({}));
     let item = menu.as_array().unwrap().iter().find(|i| i["id"] == json!(format!("window.panel.{}", p.id()))).cloned().unwrap();
     assert_eq!(item["checked"], json!(true));
-    // panel menu ▸ Undock Panel: a window of its own, out of the dock
+    // panel menu ▸ Undock Panel: it floats, out of the dock
     d.ok("ui.click", json!({"id": "panel.menu.Program"}));
     d.frames(2);
     d.ok("ui.click", json!({"id": "panel.menu.Program.undock"}));
@@ -155,58 +124,44 @@ fn close_reopen_undock_and_maximize() {
     // showing it (Window ▸ / a shortcut) does not add a second one to the dock
     d.exec("window.panel.Program", json!({}));
     assert!(!d.dock().contains(PanelKind::Program));
-    // dock it back: where it was
-    let docked = d.dock();
-    d.exec("window.dock.redock", json!({"panel": "Program"}));
+    let menu = d.ok("ui.menu.list", json!({}));
+    let item = menu.as_array().unwrap().iter().find(|i| i["id"] == json!("window.panel.Program")).cloned().unwrap();
+    assert_eq!(item["checked"], json!(true), "Window ▸ ticked while floating");
+    // dock it back, its own group beside the Source monitor (the floating panel is a window over
+    // the dock, in front of the Timeline's ≡)
+    d.exec("window.dockPanel", json!({"panel": "Program", "anchor": "Source", "zone": "right"}));
+    d.frames(2);
     assert!(d.dock().contains(PanelKind::Program) && d.app().ui.floating.is_empty());
-    assert_eq!(d.group(PanelKind::Program), [PanelKind::Program], "its own group again, not a tab elsewhere: {:?}", d.dock());
-    assert_ne!(d.dock(), docked);
-    // Maximize Frame keeps the layout
+    assert_eq!(d.dock().group_of(PanelKind::Program).map(|(g, _)| g), Some(vec![PanelKind::Program]), "its own group: {:?}", d.dock());
+    // Maximize Frame keeps the layout (the Timeline's menu is taller than the Program's: all of it shows)
     let before = d.dock();
     d.ok("ui.click", json!({"id": "panel.menu.Timeline"}));
     d.frames(2);
     d.ok("ui.click", json!({"id": "panel.menu.Timeline.groupSettings"}));
     d.frames(2);
+    for item in ["closeGroup", "undockGroup", "maximizeGroup"] {
+        assert!(d.has(&format!("panel.menu.Timeline.{item}")), "Panel Group Settings ▸ {item}");
+    }
     d.ok("ui.click", json!({"id": "panel.menu.Timeline.maximize"}));
     d.frames(2);
     assert_eq!(d.app().ui.keys.maximized, Some(PanelKind::Timeline));
     assert_eq!(d.dock(), before, "the layout is kept while maximized");
-    // Ctrl at the drop undocks
+    // Panel Group Settings ▸ Undock Panel Group: the whole group floats, tabs in order, the shown one shown
     d.app().ui.keys.maximized = None;
     d.frames(2);
-    let q = d.visible_tab(&[PanelKind::EffectControls, PanelKind::Source]);
-    d.ok("ui.drag", json!({"from": {"id": format!("panel.tab.{}", q.id())}, "to": {"id": "panel.Program"}, "steps": 8, "modifiers": {"command": true}}));
-    d.frames(4);
-    assert!(d.app().ui.floating.iter().any(|f| f.panels == [q]), "{:?}", d.app().ui.floating);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn the_arrangement_reopens_until_reset() {
-    let dir = data_dir("persist");
-    let moved = {
-        let mut d = Driver::new(&dir);
-        d.exec("window.dock.move", json!({"panel": "Effects", "target": "Program", "zone": "left"}));
-        d.exec("window.dock.undock", json!({"panel": "History"}));
-        d.frames(70);
-        let moved = d.dock();
-        assert_eq!(d.group(PanelKind::Effects), [PanelKind::Effects]);
-        moved
-    };
-    // a new app on the same data directory reopens it as it was left
-    let mut d = Driver::new(&dir);
-    d.frames(4);
-    assert_eq!(d.dock(), moved);
-    assert!(d.app().ui.floating.iter().any(|f| f.panels == [PanelKind::History]));
-    // Reset to Saved Layout
-    d.exec("window.workspace.reset", json!({}));
-    assert_eq!(d.dock(), filmcraft_ui_egui::dock::workspace("Editing"));
-    assert!(d.app().ui.floating.is_empty());
-    d.frames(70);
-    drop(d);
-    let mut d = Driver::new(&dir);
-    d.frames(4);
-    assert_eq!(d.dock(), filmcraft_ui_egui::dock::workspace("Editing"), "and the reset sticks");
+    let (group, active) = d.dock().group_of(p).unwrap();
+    let shown = group[active];
+    d.ok("ui.click", json!({"id": format!("panel.menu.{}", shown.id())}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": format!("panel.menu.{}.groupSettings", shown.id())}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": format!("panel.menu.{}.undockGroup", shown.id())}));
+    d.frames(3);
+    assert!(group.iter().all(|q| !d.dock().contains(*q)), "{:?}", d.dock());
+    let floating = d.app().ui.floating.clone();
+    assert_eq!(floating.len(), 1);
+    assert_eq!(floating[0].panels, group);
+    assert_eq!(floating[0].panels[floating[0].active], shown);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -218,7 +173,7 @@ fn compact_panels_close_from_their_grip_and_the_window_menu_toggles() {
     let dir = data_dir("compact");
     let mut d = Driver::new(&dir);
     // right-click the Tools grip: its panel menu ▸ Close Panel
-    d.ok("ui.click", json!({"id": "panel.grip.Tools", "button": "right"}));
+    d.ok("ui.click", json!({"id": "panel.drag.Tools", "button": "right"}));
     d.frames(2);
     assert!(d.has("panel.menu.Tools.close"), "the panel menu opened");
     d.ok("ui.click", json!({"id": "panel.menu.Tools.close"}));
@@ -228,10 +183,9 @@ fn compact_panels_close_from_their_grip_and_the_window_menu_toggles() {
     d.ok("ui.click", json!({"id": "panel.close.AudioMeters"}));
     d.frames(2);
     assert!(!d.app().panel_open(PanelKind::AudioMeters));
-    // Window ▸ Tools reopens it where it was; choosing it again from the menu closes it
+    // Window ▸ Tools reopens it; choosing it again from the menu closes it
     d.ok("ui.menu.invoke", json!({"id": "window.panel.Tools", "params": {"fromMenu": true}}));
     assert!(d.app().panel_open(PanelKind::Tools));
-    assert_eq!(d.group(PanelKind::Tools), [PanelKind::Tools], "in its own place again");
     d.ok("ui.menu.invoke", json!({"id": "window.panel.Tools", "params": {"fromMenu": true}}));
     assert!(!d.app().panel_open(PanelKind::Tools), "a ticked panel closes from the Window menu");
     // a shortcut's (no fromMenu) only shows

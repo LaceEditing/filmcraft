@@ -6,6 +6,9 @@ use crate::ebml::{Children, float, int, string, uint};
 use crate::ids::*;
 use crate::track::{AudioInfo, Colour, ContentEncoding, MasteringMetadata, Projection, Track, TrackKind, VideoInfo, gcd};
 
+// A malformed Matroska file may contain arbitrarily deep ChapterAtom and SimpleTag chains.
+const MAX_META_DEPTH: usize = 64;
+
 /// `Info` element.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SegmentInfo {
@@ -234,7 +237,7 @@ pub(crate) fn parse_cues(d: &[u8], out: &mut Vec<CuePoint>) {
     }
 }
 
-fn parse_chapter(d: &[u8]) -> Chapter {
+fn parse_chapter(d: &[u8], depth: usize) -> Chapter {
     let mut c = Chapter { uid: 0, string_uid: None, start_ns: 0, end_ns: None, hidden: false, enabled: true, displays: Vec::new(), children: Vec::new() };
     for e in Children::new(d) {
         match e.id {
@@ -260,7 +263,7 @@ fn parse_chapter(d: &[u8]) -> Chapter {
                 }
                 c.displays.push(disp);
             }
-            CHAPTER_ATOM => c.children.push(parse_chapter(e.data)),
+            CHAPTER_ATOM if depth < MAX_META_DEPTH => c.children.push(parse_chapter(e.data, depth + 1)),
             _ => {}
         }
     }
@@ -276,7 +279,7 @@ pub(crate) fn parse_chapters(d: &[u8], out: &mut Vec<Edition>) {
                 EDITION_FLAG_HIDDEN => edition.hidden = uint(e.data) != 0,
                 EDITION_FLAG_DEFAULT => edition.default = uint(e.data) != 0,
                 EDITION_FLAG_ORDERED => edition.ordered = uint(e.data) != 0,
-                CHAPTER_ATOM => edition.chapters.push(parse_chapter(e.data)),
+                CHAPTER_ATOM => edition.chapters.push(parse_chapter(e.data, 0)),
                 _ => {}
             }
         }
@@ -284,7 +287,7 @@ pub(crate) fn parse_chapters(d: &[u8], out: &mut Vec<Edition>) {
     }
 }
 
-fn parse_simple_tag(d: &[u8]) -> SimpleTag {
+fn parse_simple_tag(d: &[u8], depth: usize) -> SimpleTag {
     let mut t = SimpleTag { name: String::new(), language: "und".into(), default: true, string: None, binary: None, children: Vec::new() };
     for e in Children::new(d) {
         match e.id {
@@ -293,7 +296,7 @@ fn parse_simple_tag(d: &[u8]) -> SimpleTag {
             TAG_DEFAULT => t.default = uint(e.data) != 0,
             TAG_STRING => t.string = Some(string(e.data)),
             TAG_BINARY => t.binary = Some(e.data.to_vec()),
-            SIMPLE_TAG => t.children.push(parse_simple_tag(e.data)),
+            SIMPLE_TAG if depth < MAX_META_DEPTH => t.children.push(parse_simple_tag(e.data, depth + 1)),
             _ => {}
         }
     }
@@ -318,7 +321,7 @@ pub(crate) fn parse_tags(d: &[u8], out: &mut Vec<Tag>) {
                         }
                     }
                 }
-                SIMPLE_TAG => tag.simple.push(parse_simple_tag(e.data)),
+                SIMPLE_TAG => tag.simple.push(parse_simple_tag(e.data, 0)),
                 _ => {}
             }
         }
@@ -522,18 +525,84 @@ pub(crate) fn parse_tracks(d: &[u8], timestamp_scale: u64) -> Vec<Track> {
         if t.kind == TrackKind::Audio && t.audio.is_none() {
             t.audio = Some(AudioInfo::default());
         }
-        // CodecPrivate may itself be header-stripped (scope bit 2 = private data)
-        for enc in &t.encodings {
-            if let ContentEncoding::HeaderStripping { bytes, scope } = enc
-                && scope & 2 != 0
-            {
-                let mut p = bytes.clone();
-                p.extend_from_slice(&t.codec_private);
-                t.codec_private = p;
-            }
-        }
+        // CodecPrivate may itself be header-stripped (scope bit 2 = private data).
+        // Compose all applicable prefixes once: repeatedly cloning the complete
+        // private data lets many compact encoding entries multiply allocation.
+        restore_codec_private(&t.encodings, &mut t.codec_private);
         t.codec = map_codec(&t.codec_id, &t.codec_private, t.audio.as_ref());
         out.push(t);
     }
     out
+}
+
+fn restore_codec_private(encodings: &[ContentEncoding], codec_private: &mut Vec<u8>) {
+    let prefix_len = encodings
+        .iter()
+        .filter_map(|enc| match enc {
+            ContentEncoding::HeaderStripping { bytes, scope } if scope & 2 != 0 && !bytes.is_empty() => Some(bytes.len()),
+            _ => None,
+        })
+        .fold(0usize, usize::saturating_add);
+    if prefix_len == 0 {
+        return;
+    }
+    let Some(capacity) = prefix_len.checked_add(codec_private.len()) else { return };
+    let mut restored = Vec::with_capacity(capacity);
+    // Each successive stripping encoding prepends its bytes, so restore in
+    // reverse declaration order to preserve the prior result.
+    for enc in encodings.iter().rev() {
+        if let ContentEncoding::HeaderStripping { bytes, scope } = enc
+            && scope & 2 != 0
+            && !bytes.is_empty()
+        {
+            restored.extend_from_slice(bytes);
+        }
+    }
+    restored.extend_from_slice(codec_private);
+    *codec_private = restored;
+}
+
+#[cfg(test)]
+mod metadata_depth_tests {
+    use super::*;
+
+    #[test]
+    fn deeply_nested_chapters_stop_at_depth_limit() {
+        // Unknown-size elements make every pair the sole child of the previous ChapterAtom.
+        let data = [0xB6, 0xFF].repeat(100_000);
+        let chapter = parse_chapter(&data, 0);
+        let mut current = &chapter;
+        for _ in 0..MAX_META_DEPTH {
+            assert_eq!(current.children.len(), 1);
+            current = &current.children[0];
+        }
+        assert!(current.children.is_empty());
+    }
+
+    #[test]
+    fn codec_private_header_stripping_is_composed_once_in_reverse_order() {
+        let encodings = vec![
+            ContentEncoding::HeaderStripping { bytes: b"first".to_vec(), scope: 2 },
+            ContentEncoding::HeaderStripping { bytes: Vec::new(), scope: 2 },
+            ContentEncoding::HeaderStripping { bytes: b"second".to_vec(), scope: 2 },
+            ContentEncoding::HeaderStripping { bytes: b"frame".to_vec(), scope: 1 },
+        ];
+        let mut private = b"private".to_vec();
+
+        restore_codec_private(&encodings, &mut private);
+
+        assert_eq!(private, b"secondfirstprivate");
+    }
+
+    #[test]
+    fn deeply_nested_simple_tags_stop_at_depth_limit() {
+        let data = [0x67, 0xC8, 0xFF].repeat(100_000);
+        let tag = parse_simple_tag(&data, 0);
+        let mut current = &tag;
+        for _ in 0..MAX_META_DEPTH {
+            assert_eq!(current.children.len(), 1);
+            current = &current.children[0];
+        }
+        assert!(current.children.is_empty());
+    }
 }

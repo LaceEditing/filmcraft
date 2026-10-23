@@ -21,24 +21,20 @@ pub fn add_generator(p: &mut Project, pool: &MediaPool, src: GeneratorSource, na
         i.name = name.to_string();
         i
     };
-    let g = src.generator.clone();
-    let id = p.add_item(
-        name,
-        label,
-        ItemKind::Media(MediaClip {
-            media: MediaRef::Generator(g),
-            info,
-            interpret: Default::default(),
-            mark_in: None,
-            mark_out: None,
-            markers: vec![],
-            offline: false,
-            proxy: None,
-            identity: None,
-        }),
-        bin,
-    );
-    pool.insert(id, Arc::new(src.with_name(name)));
+    let clip = MediaClip {
+        media: MediaRef::Generator(src.generator.clone()),
+        info,
+        interpret: Default::default(),
+        mark_in: None,
+        mark_out: None,
+        markers: vec![],
+        offline: false,
+        proxy: None,
+        identity: None,
+    };
+    let key = crate::media_pool::media_key(&clip);
+    let id = p.add_item(name, label, ItemKind::Media(clip), bin);
+    pool.insert_keyed(id, key, Arc::new(src.with_name(name)));
     id
 }
 
@@ -224,5 +220,7 @@ fn build_demo(pool: &MediaPool) -> Option<(Project, ItemId)> {
     for tr in s.all_tracks_mut() {
         tr.sort();
     }
+    // the transitions and markers above take fixed ids: new ones start past them
+    p.next_id = p.next_id.max(p.max_id().saturating_add(1));
     Some((p, seq))
 }

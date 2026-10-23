@@ -151,7 +151,7 @@ impl PictureInfo {
     /// Frame height: field-based layouts code the height of one field.
     pub fn frame_height(&self) -> u32 {
         let h = if self.display_height > 0 { self.display_height } else { self.stored_height };
-        if matches!(self.frame_layout, 1 | 3) { h * 2 } else { h }
+        if matches!(self.frame_layout, 1 | 3) { h.saturating_mul(2) } else { h }
     }
     pub fn frame_width(&self) -> u32 {
         if self.display_width > 0 { self.display_width } else { self.stored_width }
@@ -188,7 +188,7 @@ pub struct SoundInfo {
 impl SoundInfo {
     /// Bytes per sample frame of plain PCM.
     pub fn frame_bytes(&self) -> usize {
-        if self.block_align > 0 { self.block_align as usize } else { self.channels.max(1) as usize * (self.bits as usize).div_ceil(8).max(1) }
+        if self.block_align > 0 { self.block_align as usize } else { (self.channels.max(1) as usize).saturating_mul((self.bits as usize).div_ceil(8).max(1)) }
     }
 }
 
@@ -208,12 +208,16 @@ pub fn aes3_element_samples(v: &[u8]) -> usize {
 /// (bits 4-27 of the little-endian 32-bit word), first `channels` of the 8 channels.
 pub fn decode_pcm(v: &[u8], format: SoundFormat, channels: usize, bits: u32, frame_bytes: usize) -> Result<Vec<Vec<f32>>> {
     let ch = channels.max(1);
+    if ch > 256 {
+        return Err(crate::Error::Invalid("PCM channel count exceeds 256".into()));
+    }
     match format {
         SoundFormat::Pcm => {
             let bps = (bits as usize).div_ceil(8);
             if bps == 0 || bps > 4 || frame_bytes < bps * ch {
                 return Err(crate::Error::Unsupported(format!("{bits}-bit PCM with {frame_bytes}-byte frames")));
             }
+            // `frame_bytes >= bps * ch`, so the output is bounded by the bytes actually supplied.
             let n = v.len() / frame_bytes;
             let mut out = vec![Vec::with_capacity(n); ch];
             let scale = 1.0 / (1u64 << (8 * bps - 1)) as f32;
@@ -233,6 +237,11 @@ pub fn decode_pcm(v: &[u8], format: SoundFormat, channels: usize, bits: u32, fra
             Ok(out)
         }
         SoundFormat::Aes3Element => {
+            // SMPTE 331M: an AES3 element carries at most eight channels (and an output buffer per
+            // declared channel would multiply a hostile header's allocation).
+            if ch > 8 {
+                return Err(crate::Error::Invalid("an AES3 element has at most eight channels".into()));
+            }
             let n = aes3_element_samples(v);
             let mut out = vec![Vec::with_capacity(n); ch];
             for i in 0..n {
@@ -257,6 +266,14 @@ mod tests {
         let mut b = [0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0];
         b[8..8 + item.len()].copy_from_slice(item);
         Ul(b)
+    }
+
+    #[test]
+    fn interlaced_picture_height_does_not_overflow() {
+        let picture = PictureInfo { stored_height: u32::MAX, frame_layout: 1, ..Default::default() };
+        assert_eq!(picture.frame_height(), u32::MAX);
+        let picture = PictureInfo { display_height: 240, stored_height: u32::MAX, frame_layout: 3, ..Default::default() };
+        assert_eq!(picture.frame_height(), 480);
     }
 
     #[test]

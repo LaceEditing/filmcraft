@@ -2,6 +2,7 @@
 //! Off gives the software decoder (and no hardware frames), Auto the hardware one where the
 //! system has it. Its own test binary: the switch is process-wide.
 
+#[path = "it/common/mod.rs"]
 mod common;
 
 use common::*;
@@ -36,7 +37,16 @@ fn off_uses_the_software_decoder() {
         assert_eq!(d.name(), "FilmCraft HEVC");
         return;
     }
-    assert!(matches!(d.name(), "VideoToolbox HEVC" | "NVDEC HEVC"), "{}", d.name());
+    // Linux has two backends (NVDEC in front of VA-API): `register` reports the front one, but
+    // a stream NVDEC declines (an older GPU without HEVC) can still go to VA-API on a second GPU
+    let backend = match available {
+        filmcraft_platform::Availability::Available(name) => name,
+        filmcraft_platform::Availability::Unavailable(why) => panic!("a hardware decoder, but register() said {why}"),
+    };
+    let decoders: &[&str] = if backend == "NVDEC" { &["NVDEC", "VA-API"] } else { &[backend] };
+    assert!(decoders.iter().any(|b| d.name().starts_with(b)) && d.name().contains("HEVC"), "{} from {backend}", d.name());
+    assert_eq!(filmcraft_codecs::hw::hw_backend(), Some(backend), "perf.stats reports the backend");
+    assert!(filmcraft_platform::registered(), "register() put the factory in the registry");
     let h1 = filmcraft_codecs::hw::hw_stats();
     let src = filmcraft_codecs::open_bytes("hevc_main.mp4", bytes).unwrap();
     for i in 0..30 {

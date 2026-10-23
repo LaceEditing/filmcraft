@@ -152,7 +152,7 @@ fn check(path: &str, out_dir: &str, n: usize) -> Result<String, String> {
             m.media = filmcraft_project::MediaRef::File { path: format!("{dir}{sep}fc-new {name}") };
             m.markers.clear();
             let has_video = m.info.video.is_some();
-            let has_audio = m.info.audio.is_some();
+            let has_audio = m.info.audio().is_some();
             let id = project.add_item(&format!("fc-new {name}"), orig.label, filmcraft_project::ItemKind::Media(m), None);
             let seq = project.sequence_mut(sid);
             if let Some(seq) = seq {

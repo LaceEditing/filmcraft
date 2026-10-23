@@ -5,6 +5,8 @@
 use egui::{Align2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
+use craft_ui::layout::{ResizeHandle, ResizeHandleStyle, SplitAxis, SplitSize as SharedSplitSize, split_rect};
+
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
@@ -30,16 +32,18 @@ pub enum PanelKind {
     LumetriScopes,
     EssentialGraphics,
     EssentialSound,
+    TextToSpeech,
     Properties,
     Text,
     Events,
     Progress,
     ReferenceMonitor,
     Timecode,
+    ProjectNotes,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 26] = [
+    pub const ALL: [PanelKind; 28] = [
         PanelKind::Project,
         PanelKind::MediaBrowser,
         PanelKind::Libraries,
@@ -60,12 +64,14 @@ impl PanelKind {
         PanelKind::LumetriScopes,
         PanelKind::EssentialGraphics,
         PanelKind::EssentialSound,
+        PanelKind::TextToSpeech,
         PanelKind::Properties,
         PanelKind::Text,
         PanelKind::Events,
         PanelKind::Progress,
         PanelKind::ReferenceMonitor,
         PanelKind::Timecode,
+        PanelKind::ProjectNotes,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -89,12 +95,14 @@ impl PanelKind {
             PanelKind::LumetriScopes => "Lumetri Scopes",
             PanelKind::EssentialGraphics => "Essential Graphics",
             PanelKind::EssentialSound => "Essential Sound",
+            PanelKind::TextToSpeech => "Text to Speech",
             PanelKind::Properties => "Properties",
             PanelKind::Text => "Text",
             PanelKind::Events => "Events",
             PanelKind::Progress => "Progress",
             PanelKind::ReferenceMonitor => "Reference Monitor",
             PanelKind::Timecode => "Timecode",
+            PanelKind::ProjectNotes => "Project Notes",
         }
     }
     pub fn id(self) -> String {
@@ -134,6 +142,16 @@ pub enum SplitSize {
     FixedB(f32),
 }
 
+impl SplitSize {
+    fn shared(self) -> SharedSplitSize {
+        match self {
+            Self::Ratio(value) => SharedSplitSize::Ratio(value),
+            Self::FixedA(value) => SharedSplitSize::FixedFirst(value),
+            Self::FixedB(value) => SharedSplitSize::FixedSecond(value),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DockNode {
     /// `vertical`: children stacked top/bottom; else side by side.
@@ -171,9 +189,6 @@ pub const WORKSPACES_FILE: &str = "workspaces.json";
 pub struct WorkspacePrefs {
     pub saved: Vec<SavedWorkspace>,
     pub current: String,
-    /// Each workspace as last arranged (panels moved, closed, undocked, resized), kept until
-    /// Reset to Saved Layout or Save Changes: what a workspace reopens with, at launch too.
-    pub live: Vec<SavedWorkspace>,
 }
 
 /// A named layout. `layout` is a [`DockNode`] kept as JSON, so one unreadable entry (a panel a
@@ -183,31 +198,24 @@ pub struct WorkspacePrefs {
 pub struct SavedWorkspace {
     pub name: String,
     pub layout: serde_json::Value,
-    /// Undocked panel groups ([`FloatingGroup`]s), JSON for the same reason.
+    /// Kept raw for the same per-workspace failure isolation as the dock tree.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub floating: serde_json::Value,
-}
-
-impl SavedWorkspace {
-    pub fn new(name: &str, dock: &DockNode, floating: &[FloatingGroup]) -> Self {
-        SavedWorkspace {
-            name: name.to_string(),
-            layout: serde_json::to_value(dock).unwrap_or_default(),
-            floating: serde_json::to_value(floating).unwrap_or_default(),
-        }
-    }
-    /// The dock tree (None when it can't be read).
-    pub fn dock(&self) -> Option<DockNode> {
-        serde_json::from_value(self.layout.clone()).ok()
-    }
-    /// The undocked groups (none when there are none or they can't be read).
-    pub fn floating(&self) -> Vec<FloatingGroup> {
-        serde_json::from_value(self.floating.clone()).unwrap_or_default()
-    }
 }
 
 impl WorkspacePrefs {
     pub fn load(path: &std::path::Path) -> Self {
-        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        use std::io::Read as _;
+        // Preferences are untrusted; bound reading before JSON can allocate from it.
+        const MAX_BYTES: u64 = 4 * 1024 * 1024;
+        let Some(bytes) = std::fs::File::open(path).ok().and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+            (bytes.len() as u64 <= MAX_BYTES).then_some(bytes)
+        }) else {
+            return Self::default();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_default()
     }
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(d) = path.parent() {
@@ -248,18 +256,55 @@ pub fn find(prefs: &WorkspacePrefs, query: &str) -> Option<String> {
 
 /// The saved layout of a workspace: the user's saved version, else the built-in default.
 pub fn saved_layout(prefs: &WorkspacePrefs, name: &str) -> DockNode {
-    prefs.saved.iter().find(|s| s.name == name).and_then(SavedWorkspace::dock).unwrap_or_else(|| workspace(name))
+    saved_docking(prefs, name).root
 }
 
-/// A workspace as it opens: as last arranged, else its saved layout (dock and undocked groups).
-pub fn current_layout(prefs: &WorkspacePrefs, name: &str) -> (DockNode, Vec<FloatingGroup>) {
-    if let Some(l) = prefs.live.iter().find(|s| s.name == name)
-        && let Some(d) = l.dock()
-    {
-        return (d, l.floating());
+pub fn saved_docking(prefs: &WorkspacePrefs, name: &str) -> Layout {
+    let saved = prefs.saved.iter().find(|saved| saved.name == name).and_then(|saved| {
+        let mut layout = Layout {
+            root: serde_json::from_value(saved.layout.clone()).ok()?,
+            floating: if saved.floating.is_null() { vec![] } else { serde_json::from_value(saved.floating.clone()).ok()? },
+        };
+        if layout.floating.is_empty() {
+            migrate_legacy_effects(&mut layout.root);
+        }
+        layout.validate().ok().map(|()| layout)
+    });
+    saved.unwrap_or_else(|| Layout { root: workspace(name), floating: vec![] })
+}
+
+/// Older Effects workspaces stored the same Effect Controls panel twice: selected beside
+/// Source, and an inactive duplicate beside Essential Graphics. Remove only that known
+/// duplicate shape; unrelated malformed or ambiguous saved layouts still fail validation.
+fn migrate_legacy_effects(root: &mut DockNode) {
+    let Ok(shared) = crate::dock_shared::encode(root, &[]) else { return };
+    if shared.panels().iter().filter(|panel| ***panel == PanelKind::EffectControls).count() != 2 {
+        return;
     }
-    let floating = prefs.saved.iter().find(|s| s.name == name).map(SavedWorkspace::floating).unwrap_or_default();
-    (saved_layout(prefs, name), floating)
+    fn selected_source(node: &DockNode) -> bool {
+        match node {
+            DockNode::Tabs { panels, active } => {
+                panels.contains(&PanelKind::Source) && panels.contains(&PanelKind::AudioClipMixer) && panels.get(*active) == Some(&PanelKind::EffectControls)
+            }
+            DockNode::Split { a, b, .. } => selected_source(a) || selected_source(b),
+        }
+    }
+    fn remove_inactive(node: &mut DockNode) {
+        match node {
+            DockNode::Tabs { panels, active } if panels.as_slice() == [PanelKind::EffectControls, PanelKind::EssentialGraphics] && *active == 1 => {
+                panels.remove(0);
+                *active = 0;
+            }
+            DockNode::Split { a, b, .. } => {
+                remove_inactive(a);
+                remove_inactive(b);
+            }
+            DockNode::Tabs { .. } => {}
+        }
+    }
+    if selected_source(root) {
+        remove_inactive(root);
+    }
 }
 
 /// The default layout of a named workspace.
@@ -293,7 +338,7 @@ pub fn workspace(name: &str) -> DockNode {
                 hsplit(Ratio(0.5), tabs(&[Source, EffectControls, AudioClipMixer], 1), tabs(&[Program], 0)),
                 hsplit(Ratio(0.3), tabs(&[Project, MediaBrowser, Info, Markers, History], 0), bottom_editing()),
             ),
-            vsplit(Ratio(0.5), tabs(&[Effects], 0), tabs(&[EffectControls, EssentialGraphics], 1)),
+            vsplit(Ratio(0.5), tabs(&[Effects], 0), tabs(&[EssentialGraphics], 0)),
         ),
         "Audio" => hsplit(
             FixedB(320.0),
@@ -302,7 +347,7 @@ pub fn workspace(name: &str) -> DockNode {
                 hsplit(Ratio(0.5), tabs(&[AudioTrackMixer, Source, AudioClipMixer, EffectControls], 0), tabs(&[Program], 0)),
                 hsplit(Ratio(0.3), tabs(&[Project, MediaBrowser, Effects, Markers, History], 0), bottom_editing()),
             ),
-            tabs(&[EssentialSound], 0),
+            tabs(&[EssentialSound, TextToSpeech], 0),
         ),
         "Captions and Graphics" => hsplit(
             FixedB(330.0),
@@ -318,7 +363,7 @@ pub fn workspace(name: &str) -> DockNode {
             hsplit(
                 Ratio(0.5),
                 tabs(&[Source, EffectControls, AudioClipMixer, Metadata, LumetriScopes, Text], 0),
-                hsplit(Ratio(0.6), tabs(&[Program], 0), tabs(&[LumetriColor, EssentialGraphics, EssentialSound, Properties, AudioTrackMixer], 0)),
+                hsplit(Ratio(0.6), tabs(&[Program], 0), tabs(&[LumetriColor, EssentialGraphics, EssentialSound, TextToSpeech, Properties, AudioTrackMixer], 0)),
             ),
             hsplit(Ratio(0.26), tabs(&[Project, MediaBrowser, Libraries, Info, Effects, Markers, History], 0), bottom_editing()),
         ),
@@ -358,17 +403,7 @@ impl DockNode {
     }
     /// Make `p` the active tab of its group. Returns false if not present.
     pub fn activate(&mut self, p: PanelKind) -> bool {
-        match self {
-            DockNode::Split { a, b, .. } => a.activate(p) || b.activate(p),
-            DockNode::Tabs { panels, active } => {
-                if let Some(i) = panels.iter().position(|x| *x == p) {
-                    *active = i;
-                    true
-                } else {
-                    false
-                }
-            }
-        }
+        crate::dock_shared::apply_tree(self, craft_ui::docking::Action::Activate { panel: p })
     }
     pub fn is_visible(&self, p: PanelKind) -> bool {
         match self {
@@ -378,19 +413,7 @@ impl DockNode {
     }
     /// Close a panel (remove its tab; empty groups collapse their split).
     pub fn close(&mut self, p: PanelKind) {
-        if let DockNode::Split { a, b, .. } = self {
-            a.close(p);
-            b.close(p);
-            let empty = |n: &DockNode| matches!(n, DockNode::Tabs { panels, .. } if panels.is_empty());
-            if empty(a) {
-                *self = (**b).clone();
-            } else if empty(b) {
-                *self = (**a).clone();
-            }
-        } else if let DockNode::Tabs { panels, active } = self {
-            panels.retain(|x| *x != p);
-            *active = (*active).min(panels.len().saturating_sub(1));
-        }
+        crate::dock_shared::apply_tree(self, craft_ui::docking::Action::Close { panel: p });
     }
     /// Put the Timeline panel back where the workspaces keep it (left of the audio meters) after
     /// it was closed, so opening a sequence always has somewhere to show it.
@@ -414,70 +437,44 @@ impl DockNode {
     }
     /// Add a panel as a tab next to `near` (or into the first group).
     pub fn open_near(&mut self, p: PanelKind, near: PanelKind) {
-        if self.contains(p) {
-            self.activate(p);
+        if crate::dock_shared::encode(self, &[]).is_err() {
             return;
         }
-        fn add(n: &mut DockNode, p: PanelKind, near: PanelKind) -> bool {
-            match n {
-                DockNode::Split { a, b, .. } => add(a, p, near) || add(b, p, near),
-                DockNode::Tabs { panels, active } => {
-                    if panels.contains(&near) {
-                        panels.push(p);
-                        *active = panels.len() - 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-        }
-        if !add(self, p, near) && !add(self, p, PanelKind::Project) {
-            add(self, p, PanelKind::Program);
-        }
+        let anchor = [near, PanelKind::Project, PanelKind::Program].into_iter().find(|panel| self.contains(*panel)).or_else(|| {
+            let mut panels = Vec::new();
+            self.panels(&mut panels);
+            panels.first().copied()
+        });
+        crate::dock_shared::apply_tree(self, craft_ui::docking::Action::Open { panel: p, anchor });
     }
 }
 
-/// Where dragged panels land on a tab group (or on the dock area's outer edge): as tabs of the
-/// group, or beside it in a new split.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Zone {
-    Center,
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-impl Zone {
-    pub fn from_name(s: &str) -> Option<Zone> {
-        Some(match s.to_ascii_lowercase().as_str() {
-            "center" | "centre" | "tab" | "tabs" => Zone::Center,
-            "left" => Zone::Left,
-            "right" => Zone::Right,
-            "top" => Zone::Top,
-            "bottom" => Zone::Bottom,
-            _ => return None,
-        })
-    }
-}
-
-/// A panel group undocked into a window of its own (Premiere's Undock Panel / Undock Panel Group).
+/// A floating group retains the same panel identities as docked tabs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct FloatingGroup {
-    /// Stable id of its window.
-    pub id: u64,
+pub struct Floating {
     pub panels: Vec<PanelKind>,
     pub active: usize,
-    /// Window size (points).
-    pub size: [f32; 2],
+    /// [x, y, width, height] in logical points.
+    pub rect: [f32; 4],
 }
 
-impl Default for FloatingGroup {
-    fn default() -> Self {
-        FloatingGroup { id: 0, panels: Vec::new(), active: 0, size: [640.0, 420.0] }
+/// App persistence shape; all mutations pass through the shared docking model.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Layout {
+    pub root: DockNode,
+    #[serde(default)]
+    pub floating: Vec<Floating>,
+}
+
+impl Layout {
+    pub fn apply(&mut self, action: craft_ui::docking::Action<PanelKind>) -> Result<(), String> {
+        crate::dock_shared::apply(self, action)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        crate::dock_shared::encode(&self.root, &self.floating)?.validate().map_err(|error| error.to_string())
+    }
+    pub fn contains(&self, panel: PanelKind) -> bool {
+        self.root.contains(panel) || self.floating.iter().any(|group| group.panels.contains(&panel))
     }
 }
 
@@ -488,118 +485,6 @@ impl DockNode {
             DockNode::Split { a, b, .. } => a.group_of(p).or_else(|| b.group_of(p)),
             DockNode::Tabs { panels, active } => panels.contains(&p).then(|| (panels.clone(), *active)),
         }
-    }
-
-    /// Whether the dock holds no panel at all.
-    pub fn is_empty(&self) -> bool {
-        let mut v = Vec::new();
-        self.panels(&mut v);
-        v.is_empty()
-    }
-
-    /// Insert `panels` (not in the tree) at `zone` of the group holding `target`; `index` places
-    /// them among the group's tabs (Center; None = after the last). `active` is the one shown.
-    fn insert_at(&mut self, panels: &[PanelKind], active: usize, target: PanelKind, zone: Zone, index: Option<usize>) -> bool {
-        match self {
-            DockNode::Split { a, b, .. } => a.insert_at(panels, active, target, zone, index) || b.insert_at(panels, active, target, zone, index),
-            DockNode::Tabs { panels: here, active: here_active } => {
-                if !here.contains(&target) {
-                    return false;
-                }
-                let shown = panels.get(active).or(panels.first()).copied();
-                if zone == Zone::Center {
-                    let at = index.unwrap_or(here.len()).min(here.len());
-                    for (k, p) in panels.iter().enumerate() {
-                        here.insert(at + k, *p);
-                    }
-                    *here_active = shown.and_then(|s| here.iter().position(|x| *x == s)).unwrap_or(*here_active);
-                    return true;
-                }
-                let new = tabs(panels, active.min(panels.len().saturating_sub(1)));
-                let old = std::mem::replace(self, tabs(&[], 0));
-                let (a, b) = if matches!(zone, Zone::Left | Zone::Top) { (new, old) } else { (old, new) };
-                *self = DockNode::Split { vertical: matches!(zone, Zone::Top | Zone::Bottom), size: SplitSize::Ratio(0.5), a: Box::new(a), b: Box::new(b) };
-                true
-            }
-        }
-    }
-
-    /// Where `p` sits, as a place to put it back: a panel of its group and Center when it shares
-    /// the group, else a panel of the neighbouring part of the layout and the side `p` is on.
-    pub fn home_of(&self, p: PanelKind) -> Option<(PanelKind, Zone)> {
-        fn first(n: &DockNode) -> Option<PanelKind> {
-            match n {
-                DockNode::Split { a, b, .. } => first(a).or_else(|| first(b)),
-                DockNode::Tabs { panels, .. } => panels.first().copied(),
-            }
-        }
-        fn find(n: &DockNode, p: PanelKind) -> Option<(PanelKind, Zone)> {
-            match n {
-                DockNode::Tabs { panels, .. } => panels.iter().copied().find(|x| *x != p).filter(|_| panels.contains(&p)).map(|x| (x, Zone::Center)),
-                DockNode::Split { vertical, a, b, .. } => {
-                    let alone = |c: &DockNode| matches!(c, DockNode::Tabs { panels, .. } if panels.as_slice() == [p]);
-                    if alone(a) {
-                        return first(b).map(|x| (x, if *vertical { Zone::Top } else { Zone::Left }));
-                    }
-                    if alone(b) {
-                        return first(a).map(|x| (x, if *vertical { Zone::Bottom } else { Zone::Right }));
-                    }
-                    find(a, p).or_else(|| find(b, p))
-                }
-            }
-        }
-        find(self, p)
-    }
-
-    /// Move `moving` (one panel, or a whole group with `active` shown) to `zone` of the group
-    /// holding `target`. Panels not in the tree (a floating group) are docked. Returns false and
-    /// leaves the layout as it was when there is nothing to do (the target is among the moved
-    /// panels, or it is not in the dock).
-    pub fn move_panels(&mut self, moving: &[PanelKind], active: usize, target: PanelKind, zone: Zone, index: Option<usize>) -> bool {
-        if moving.is_empty() || moving.contains(&target) || !self.contains(target) {
-            return false;
-        }
-        // a tab moved along its own group: the index counts the tabs as they were
-        let mut index = index;
-        if let (Some(i), Some((group, _))) = (index, self.group_of(target)) {
-            let before = group.iter().take(i).filter(|p| moving.contains(p)).count();
-            index = Some(i - before);
-        }
-        let mut t = self.clone();
-        for p in moving {
-            t.close(*p);
-        }
-        if !t.insert_at(moving, active, target, zone, index) {
-            return false;
-        }
-        *self = t;
-        true
-    }
-
-    /// Move `moving` to an outer edge of the dock area: a full-height column (Left / Right) or a
-    /// full-width row (Top / Bottom); Center docks them as a tab group beside the first group.
-    pub fn move_to_edge(&mut self, moving: &[PanelKind], active: usize, zone: Zone) -> bool {
-        if moving.is_empty() {
-            return false;
-        }
-        let mut t = self.clone();
-        for p in moving {
-            t.close(*p);
-        }
-        let new = tabs(moving, active.min(moving.len() - 1));
-        if t.is_empty() {
-            *self = new;
-            return true;
-        }
-        let (vertical, size, first) = match zone {
-            Zone::Left => (false, SplitSize::Ratio(0.25), true),
-            Zone::Right => (false, SplitSize::Ratio(0.75), false),
-            Zone::Top => (true, SplitSize::Ratio(0.3), true),
-            Zone::Bottom | Zone::Center => (true, SplitSize::Ratio(0.7), false),
-        };
-        let (a, b) = if first { (new, t) } else { (t, new) };
-        *self = DockNode::Split { vertical, size, a: Box::new(a), b: Box::new(b) };
-        true
     }
 }
 
@@ -616,6 +501,7 @@ pub struct Group {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DockAction {
     Activate(PanelKind),
+    BeginDrag(PanelKind),
     Focus(PanelKind),
     Close(PanelKind),
     PanelMenu(PanelKind, egui::Pos2),
@@ -624,27 +510,42 @@ pub enum DockAction {
     CloseSequence(u64),
     /// A sequence tab was dragged past a neighbour: its new place among the sequence tabs.
     MoveSequence(u64, usize),
-    /// A tab (or a whole group, by the empty part of its strip) started being dragged to a new
-    /// place: the panels and the one shown.
-    StartDrag(Vec<PanelKind>, usize),
-}
-
-/// Size of a split's first child in `avail` points: the requested size, keeping both children at
-/// least 20 points when there is room (and never more than `avail`). Must not panic for any size:
-/// a tiny window (or browser canvas) gives splits less than 40 points.
-fn split_first(size: SplitSize, avail: f32) -> f32 {
-    let want = match size {
-        SplitSize::Ratio(r) => avail * r,
-        SplitSize::FixedA(px) => px,
-        SplitSize::FixedB(px) => avail - px,
-    };
-    let lo = 20.0_f32.min(avail * 0.5);
-    let hi = (avail - 20.0).max(lo);
-    want.clamp(lo, hi)
 }
 
 /// Lay out the tree into group rects (with `gap` gutters) and handle gutter dragging.
 pub fn layout(ui: &mut egui::Ui, node: &mut DockNode, rect: Rect, t: &Tokens, path: &str, out: &mut Vec<Group>, reg: &mut crate::automation::Registry) {
+    let mut actions = Vec::new();
+    layout_with_actions(ui, node, rect, t, path, out, reg, &mut actions);
+    for action in actions {
+        crate::dock_shared::apply_tree(node, action);
+    }
+}
+
+/// Lay out chrome while returning mutations for the application's UI command route.
+pub fn layout_with_actions(
+    ui: &mut egui::Ui,
+    node: &mut DockNode,
+    rect: Rect,
+    t: &Tokens,
+    path: &str,
+    out: &mut Vec<Group>,
+    reg: &mut crate::automation::Registry,
+    actions: &mut Vec<craft_ui::docking::Action<PanelKind>>,
+) {
+    layout_inner(ui, node, rect, t, path, &[], out, reg, actions);
+}
+
+fn layout_inner(
+    ui: &mut egui::Ui,
+    node: &mut DockNode,
+    rect: Rect,
+    t: &Tokens,
+    path: &str,
+    tree_path: &[bool],
+    out: &mut Vec<Group>,
+    reg: &mut crate::automation::Registry,
+    actions: &mut Vec<craft_ui::docking::Action<PanelKind>>,
+) {
     match node {
         DockNode::Tabs { panels, active } => {
             let tab_h = if panels.len() == 1 && panels[0].compact() { 8.0 } else { t.tab_h };
@@ -652,45 +553,24 @@ pub fn layout(ui: &mut egui::Ui, node: &mut DockNode, rect: Rect, t: &Tokens, pa
             out.push(Group { path: path.to_string(), rect, content, panels: panels.clone(), active: *active });
         }
         DockNode::Split { vertical, size, a, b } => {
-            let g = t.gap;
-            let total = if *vertical { rect.height() } else { rect.width() };
-            let avail = (total - g).max(0.0);
-            let first = split_first(*size, avail);
-            let (ra, gutter, rb) = if *vertical {
-                (
-                    Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + first)),
-                    Rect::from_min_max(pos2(rect.min.x, rect.min.y + first), pos2(rect.max.x, rect.min.y + first + g)),
-                    Rect::from_min_max(pos2(rect.min.x, rect.min.y + first + g), rect.max),
-                )
-            } else {
-                (
-                    Rect::from_min_max(rect.min, pos2(rect.min.x + first, rect.max.y)),
-                    Rect::from_min_max(pos2(rect.min.x + first, rect.min.y), pos2(rect.min.x + first + g, rect.max.y)),
-                    Rect::from_min_max(pos2(rect.min.x + first + g, rect.min.y), rect.max),
-                )
-            };
-            // gutter drag (a slightly larger hit area than the visible gap)
-            let hit = gutter.expand2(if *vertical { vec2(0.0, 3.0) } else { vec2(3.0, 0.0) });
+            let axis = if *vertical { SplitAxis::Vertical } else { SplitAxis::Horizontal };
+            let Some(split) = split_rect(rect, axis, size.shared(), t.gap, 20.0) else { return };
             let id = egui::Id::new(("dock-gutter", path.to_string()));
-            let resp = ui.interact(hit, id, Sense::drag());
-            reg.add(&format!("dock.gutter.{path}"), hit, "gutter");
-            if resp.hovered() || resp.dragged() {
-                ui.ctx().set_cursor_icon(if *vertical { egui::CursorIcon::ResizeVertical } else { egui::CursorIcon::ResizeHorizontal });
+            let handle_style = ResizeHandleStyle { hovered: t.focus.gamma_multiply(0.4), dragged: t.focus.gamma_multiply(0.9), focused: t.focus };
+            let label = if *vertical { tl!("Height:") } else { tl!("Width:") };
+            let response = ResizeHandle::new(id, axis, split.divider, label, handle_style).value(split.first_size(), 0.0..=split.available()).show(ui);
+            reg.add_response(&format!("dock.gutter.{path}"), &response.response, "gutter");
+            if response.delta != 0.0
+                && let Some(resized) = split.resized(size.shared(), response.delta, 40.0)
+            {
+                actions.push(craft_ui::docking::Action::ResizeSplit { path: tree_path.to_vec(), size: resized });
             }
-            if resp.dragged() {
-                let d = if *vertical { resp.drag_delta().y } else { resp.drag_delta().x };
-                let nf = (first + d).clamp(40.0, (avail - 40.0).max(40.0));
-                *size = match *size {
-                    SplitSize::Ratio(_) => SplitSize::Ratio(nf / avail.max(1.0)),
-                    SplitSize::FixedA(_) => SplitSize::FixedA(nf),
-                    SplitSize::FixedB(_) => SplitSize::FixedB(avail - nf),
-                };
-            }
-            if resp.dragged() || resp.hovered() {
-                ui.painter().rect_filled(gutter, 0.0, t.focus.gamma_multiply(if resp.dragged() { 0.9 } else { 0.4 }));
-            }
-            layout(ui, a, ra, t, &format!("{path}a"), out, reg);
-            layout(ui, b, rb, t, &format!("{path}b"), out, reg);
+            let mut first_path = tree_path.to_vec();
+            first_path.push(false);
+            let mut second_path = tree_path.to_vec();
+            second_path.push(true);
+            layout_inner(ui, a, split.first, t, &format!("{path}a"), &first_path, out, reg, actions);
+            layout_inner(ui, b, split.second, t, &format!("{path}b"), &second_path, out, reg, actions);
         }
     }
 }
@@ -710,39 +590,61 @@ pub fn draw_group_chrome(
     seqs: &SeqTabs,
     t: &Tokens,
     reg: &mut crate::automation::Registry,
-) -> (Vec<DockAction>, Vec<(PanelKind, Rect)>) {
+) -> Vec<DockAction> {
+    let chrome = draw_group_chrome_details(ui, g, seqs, t, reg);
+    paint_group_focus(ui, g, focused, t);
+    chrome.actions
+}
+
+#[derive(Default)]
+pub struct Chrome {
+    pub actions: Vec<DockAction>,
+    pub tabs: Vec<(PanelKind, Rect)>,
+}
+
+pub fn draw_group_chrome_details(ui: &mut egui::Ui, g: &Group, seqs: &SeqTabs, t: &Tokens, reg: &mut crate::automation::Registry) -> Chrome {
     let mut actions = Vec::new();
-    let mut drawn: Vec<(PanelKind, Rect)> = Vec::new();
+    let mut tab_rects: Vec<(PanelKind, Rect)> = Vec::new();
     let painter = ui.painter().clone();
     painter.rect_filled(g.rect, t.radius, t.panel_bg);
     let active_panel = g.panels.get(g.active).copied();
     let compact = g.panels.len() == 1 && g.panels[0].compact();
+    // A narrow header grip moves the entire panel, including Timeline panels whose tabs
+    // separately reorder open sequences.
+    let mut grip = None;
+    if let Some(panel) = active_panel {
+        let r = Rect::from_min_size(g.rect.min, vec2(if compact { g.rect.width() } else { 10.0 }, if compact { 8.0 } else { t.tab_h }));
+        // (a compact panel's grip also takes a right-click: its panel menu)
+        let response = ui.interact(r, egui::Id::new(("panel-drag", g.path.clone())), if compact { Sense::click_and_drag() } else { Sense::drag() });
+        reg.add_response(&format!("panel.drag.{}", panel.id()), &response, "Move panel");
+        if response.drag_started() {
+            actions.push(DockAction::BeginDrag(panel));
+        }
+        grip = Some(response);
+    }
     if compact {
         // grip dots: drag the panel to a new place
         let c = pos2(g.rect.center().x, g.rect.min.y + 4.0);
-        let grip = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), 8.0));
-        let gr = ui.interact(grip, egui::Id::new(("group-grip", g.path.clone())), Sense::click_and_drag());
-        let gr = gr.on_hover_text("Drag to move this panel; right-click for its panel menu");
-        reg.add(&format!("panel.grip.{}", g.panels.first().map(|p| p.id()).unwrap_or_default()), grip, "move panel");
-        if gr.hovered() {
+        let hot = grip.as_ref().is_some_and(|gr| gr.hovered());
+        if hot {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
-        if gr.drag_started() {
-            actions.push(DockAction::StartDrag(g.panels.clone(), g.active));
-        }
         for dx in [-4.0, 0.0, 4.0] {
-            painter.circle_filled(c + vec2(dx, 0.0), 1.0, if gr.hovered() { t.tab_text_active } else { t.text_faint });
+            painter.circle_filled(c + vec2(dx, 0.0), 1.0, if hot { t.tab_text_active } else { t.text_faint });
         }
         if let Some(p) = g.panels.first().copied() {
             // right-click: the panel menu (Close Panel, Undock Panel, …), as on a tab
-            if gr.secondary_clicked() {
+            if let Some(gr) = grip.filter(|gr| gr.secondary_clicked()) {
                 actions.push(DockAction::Focus(p));
-                actions.push(DockAction::PanelMenu(p, gr.interact_pointer_pos().unwrap_or(grip.left_bottom())));
+                actions.push(DockAction::PanelMenu(p, gr.interact_pointer_pos().unwrap_or(gr.rect.left_bottom())));
             }
             // × at the right end of the grip, shown while the pointer is over the panel's top
-            let cr = Rect::from_center_size(pos2(grip.max.x - 7.0, grip.center().y), vec2(6.0, 6.0));
-            let cresp = ui.interact(cr.expand(3.0), egui::Id::new(("grip-x", g.path.clone())), Sense::click());
-            reg.add(&format!("panel.close.{}", p.id()), cr.expand(3.0), "close panel");
+            let r = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), 8.0));
+            let cr = Rect::from_center_size(pos2(r.max.x - 7.0, r.center().y), vec2(6.0, 6.0));
+            // pointer-only, like a tab's × (not a keyboard focus stop)
+            let cresp = ui.interact(cr.expand(3.0), egui::Id::new(("grip-x", g.path.clone())), Sense::CLICK);
+            cresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, cresp.enabled(), "close panel"));
+            reg.add_response(&format!("panel.close.{}", p.id()), &cresp, "close panel");
             let near = ui.rect_contains_pointer(Rect::from_min_max(g.rect.min, pos2(g.rect.max.x, g.rect.min.y + 24.0)));
             if near || cresp.hovered() {
                 let cc = if cresp.hovered() { t.tab_text_active } else { t.tab_text };
@@ -769,9 +671,9 @@ pub fn draw_group_chrome(
                 tabs.extend(seqs.open.iter().map(|(id, name)| Tab { panel: *p, seq: Some(*id), title: name.clone(), active: seqs.active == Some(*id) }));
             } else if *p == PanelKind::Timeline {
                 let name = seqs.open.iter().find(|(id, _)| seqs.active == Some(*id)).map(|(_, n)| n.clone());
-                tabs.push(Tab { panel: *p, seq: None, title: name.unwrap_or_else(|| "Timeline: (no sequences)".into()), active });
+                tabs.push(Tab { panel: *p, seq: None, title: name.unwrap_or_else(|| tl!("Timeline: (no sequences)").into()), active });
             } else {
-                tabs.push(Tab { panel: *p, seq: None, title: p.title().to_string(), active });
+                tabs.push(Tab { panel: *p, seq: None, title: crate::i18n::t(p.title()).to_string(), active });
             }
         }
         let activate = |tab: &Tab, actions: &mut Vec<DockAction>| match tab.seq {
@@ -812,15 +714,33 @@ pub fn draw_group_chrome(
         if let Some(r) = more {
             let resp = ui.interact(r, egui::Id::new(("tab-overflow", g.path.clone())), Sense::click());
             let name = if g.panels.contains(&PanelKind::Timeline) { "timeline.tabs.more".to_string() } else { format!("panel.tabs.more.{}", g.path) };
-            reg.add(&name, r, "more tabs");
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, resp.enabled(), "more tabs"));
+            reg.add_response(&name, &resp, "more tabs");
             let c = if resp.hovered() { t.tab_text_active } else { t.tab_text };
             icons::paint(&painter, r.shrink(4.0).translate(vec2(-2.0, 0.0)), Icon::ChevronRight, c);
             icons::paint(&painter, r.shrink(4.0).translate(vec2(2.0, 0.0)), Icon::ChevronRight, c);
+            paint_widget_focus(&painter, &resp, t);
             if resp.clicked() {
                 let open = ui.ctx().data(|d| d.get_temp::<bool>(list_id)).unwrap_or(false);
                 ui.ctx().data_mut(|d| d.insert_temp(list_id, !open));
                 list_opened = !open;
             }
+        }
+        // The wheel over the strip steps through the tabs: down = next, up = previous, one tab
+        // per wheel notch (trackpad scrolling adds up to a notch first), stopping at the ends.
+        let wheel_id = egui::Id::new(("tab-wheel", g.path.clone()));
+        if ui.rect_contains_pointer(strip) && !tabs.is_empty() {
+            const NOTCH: f32 = 40.0;
+            let total = ui.ctx().data(|d| d.get_temp::<f32>(wheel_id)).unwrap_or(0.0) + crate::panels::timeline::wheel_input(ui.ctx()).delta.y;
+            let steps = (total / NOTCH).trunc();
+            ui.ctx().data_mut(|d| d.insert_temp(wheel_id, total - steps * NOTCH));
+            let to = (active_at as i64).saturating_sub(steps as i64).clamp(0, tabs.len() as i64 - 1) as usize;
+            if let Some(tab) = tabs.get(to).filter(|_| to != active_at) {
+                activate(tab, &mut actions);
+                actions.push(DockAction::Focus(tab.panel));
+            }
+        } else {
+            ui.ctx().data_mut(|d| d.remove::<f32>(wheel_id));
         }
         let mut x = strip.min.x + 12.0;
         // sequence tabs as drawn (for dragging one past its neighbours), and the one being dragged
@@ -836,29 +756,46 @@ pub fn draw_group_chrome(
             // a sequence tab keeps its identity when the tabs are reordered under the pointer
             let resp = match tab.seq {
                 Some(id) => ui.interact(tab_rect, egui::Id::new(("tab-seq", g.path.clone(), id)), Sense::click_and_drag()),
-                None => ui.interact(tab_rect, egui::Id::new(("tab", g.path.clone(), p.id())), Sense::click_and_drag()),
+                None => ui.interact(tab_rect, egui::Id::new(("tab", g.path.clone(), i)), Sense::click_and_drag()),
             };
-            drawn.push((*p, tab_rect));
             if tab.seq.is_none() && resp.drag_started() {
-                actions.push(DockAction::StartDrag(vec![*p], 0));
+                actions.push(DockAction::BeginDrag(*p));
             }
+            if let Some((_, rect)) = tab_rects.iter_mut().find(|(panel, _)| panel == p) {
+                *rect = rect.union(tab_rect);
+            } else {
+                tab_rects.push((*p, tab_rect));
+            }
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, resp.enabled(), is_active, &tab.title));
+            ui.ctx().accesskit_node_builder(resp.id, |node| {
+                node.set_role(egui::accesskit::Role::Tab);
+                node.set_selected(is_active);
+            });
+            paint_widget_focus(&painter, &resp, t);
             if let Some(id) = tab.seq {
                 seq_rects.push((id, tab_rect));
                 if resp.dragged() {
                     dragged = Some(id);
-                    // pulled out of the strip: the Timeline panel itself moves
-                    if let Some(py) = ui.input(|i| i.pointer.latest_pos()).map(|p| p.y)
-                        && (py > strip.max.y + 24.0 || py < strip.min.y - 12.0)
-                    {
-                        actions.push(DockAction::StartDrag(vec![*p], 0));
-                    }
+                }
+                // Escape puts a dragged tab back where it was (egui ends the drag on Escape, #580)
+                let home = egui::Id::new(("tab-seq-home", id));
+                if resp.drag_started()
+                    && let Some(at) = seqs.open.iter().position(|(s, _)| *s == id)
+                {
+                    ui.data_mut(|d| d.insert_temp(home, at));
+                }
+                if resp.drag_stopped()
+                    && let Some(at) = ui.data_mut(|d| d.remove_temp::<usize>(home))
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    actions.push(DockAction::MoveSequence(id, at));
                 }
             }
             if let Some(id) = tab.seq {
-                reg.add(&format!("timeline.tab.{id}"), tab_rect, &tab.title);
+                reg.add_response(&format!("timeline.tab.{id}"), &resp, &tab.title);
             }
             if tab.seq.is_none() || is_active {
-                reg.add(&format!("panel.tab.{}", p.id()), tab_rect, p.title());
+                reg.add_response(&format!("panel.tab.{}", p.id()), &resp, p.title());
             }
             let label_x = tab_rect.min.x + 8.0 + close_w;
             let label_w = galley.size().x;
@@ -868,13 +805,17 @@ pub fn draw_group_chrome(
             if tab.seq.is_none() {
                 // × closes the panel (shown on the active tab and under the pointer)
                 let cr = Rect::from_center_size(pos2(tab_rect.max.x - CLOSE_W / 2.0 - 2.0, text_y), vec2(7.0, 7.0));
-                let cresp = ui.interact(cr.expand(4.0), egui::Id::new(("tab-x", g.path.clone(), p.id())), Sense::click());
-                reg.add(&format!("panel.close.{}", p.id()), cr.expand(4.0), "close panel");
+                // pointer-only (`Sense::CLICK`, not focusable): Tab moves between the tabs
+                // themselves; the keyboard closes a panel from its ≡ menu
+                let cresp = ui.interact(cr.expand(4.0), egui::Id::new(("tab-x", g.path.clone(), p.id())), Sense::CLICK);
+                cresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, cresp.enabled(), "close panel"));
+                reg.add_response(&format!("panel.close.{}", p.id()), &cresp, "close panel");
                 if is_active || resp.hovered() || cresp.hovered() {
                     let cc = if cresp.hovered() { t.tab_text_active } else { t.tab_text };
                     painter.line_segment([cr.left_top(), cr.right_bottom()], Stroke::new(1.1, cc));
                     painter.line_segment([cr.right_top(), cr.left_bottom()], Stroke::new(1.1, cc));
                 }
+                paint_widget_focus(&painter, &cresp, t);
                 if cresp.clicked() {
                     actions.push(DockAction::Close(*p));
                     closed = true;
@@ -884,10 +825,12 @@ pub fn draw_group_chrome(
                 // × closes the sequence's tab (the sequence stays in the project)
                 let cr = Rect::from_center_size(pos2(tab_rect.min.x + 10.0, text_y), vec2(8.0, 8.0));
                 let cresp = ui.interact(cr.expand(4.0), egui::Id::new(("tab-close", g.path.clone(), id)), Sense::click());
-                reg.add(&format!("timeline.tab.{id}.close"), cr.expand(4.0), "close sequence");
+                cresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, cresp.enabled(), "close sequence"));
+                reg.add_response(&format!("timeline.tab.{id}.close"), &cresp, "close sequence");
                 let cc = if cresp.hovered() { t.tab_text_active } else { t.tab_text };
                 painter.line_segment([cr.left_top(), cr.right_bottom()], Stroke::new(1.2, cc));
                 painter.line_segment([cr.right_top(), cr.left_bottom()], Stroke::new(1.2, cc));
+                paint_widget_focus(&painter, &cresp, t);
                 if cresp.clicked() {
                     actions.push(DockAction::CloseSequence(id));
                     closed = true;
@@ -896,12 +839,14 @@ pub fn draw_group_chrome(
             if is_active {
                 let mr = Rect::from_center_size(pos2(label_x + label_w + 12.0, text_y), vec2(12.0, 10.0));
                 let mresp = ui.interact(mr.expand(3.0), egui::Id::new(("tab-menu", g.path.clone())), Sense::click());
-                reg.add(&format!("panel.menu.{}", p.id()), mr, "panel menu");
+                mresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, mresp.enabled(), "panel menu"));
+                reg.add_response(&format!("panel.menu.{}", p.id()), &mresp, "panel menu");
                 let mc = if mresp.hovered() { t.tab_text_active } else { t.tab_text };
                 icons::paint(&painter, Rect::from_center_size(mr.center(), vec2(16.0, 16.0)), Icon::Hamburger, mc);
                 // 1 pt underline spanning label + ≡, 23 pt below the frame top
                 let uy = strip.min.y + 23.0;
                 painter.line_segment([pos2(label_x, uy), pos2(mr.max.x, uy)], Stroke::new(1.0, t.tab_text_active));
+                paint_widget_focus(&painter, &mresp, t);
                 if mresp.clicked() {
                     actions.push(DockAction::PanelMenu(*p, mr.left_bottom()));
                 }
@@ -926,16 +871,6 @@ pub fn draw_group_chrome(
                 }
             }
             x += w + 8.0;
-        }
-        // the strip right of the tabs: drag the whole group to a new place
-        let grip_end = more.map_or(strip.max.x, |r| r.min.x - 2.0);
-        if grip_end - x > 12.0 {
-            let grip = Rect::from_min_max(pos2(x, strip.min.y), pos2(grip_end, strip.max.y));
-            let gr = ui.interact(grip, egui::Id::new(("group-grip", g.path.clone())), Sense::drag());
-            reg.add(&format!("panel.grip.{}", g.panels.get(g.active).map(|p| p.id()).unwrap_or_default()), grip, "move panel group");
-            if gr.drag_started() {
-                actions.push(DockAction::StartDrag(g.panels.clone(), g.active));
-            }
         }
         // Dragging a sequence tab sideways: it changes places with a neighbour when the pointer
         // passes that neighbour's middle.
@@ -967,8 +902,8 @@ pub fn draw_group_chrome(
                                 let label = if tab.active { format!("✓ {}", tab.title) } else { tab.title.clone() };
                                 let resp = ui.button(label);
                                 match tab.seq {
-                                    Some(id) => reg.add(&format!("timeline.tabs.list.{id}"), resp.rect, &tab.title),
-                                    None => reg.add(&format!("panel.tabs.list.{}", tab.panel.id()), resp.rect, &tab.title),
+                                    Some(id) => reg.add_response(&format!("timeline.tabs.list.{id}"), &resp, &tab.title),
+                                    None => reg.add_response(&format!("panel.tabs.list.{}", tab.panel.id()), &resp, &tab.title),
                                 }
                                 if resp.clicked() {
                                     picked = Some(tab);
@@ -989,101 +924,37 @@ pub fn draw_group_chrome(
             ui.ctx().data_mut(|d| d.remove::<bool>(list_id));
         }
     }
-    // focus outline
-    if active_panel == Some(focused) {
-        painter.rect_stroke(g.rect, 0.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
-    }
-    // clicking anywhere in the panel focuses it
+    // Activating presses focus their tab immediately, rather than the group's old active panel.
+    // Otherwise entering an inspector can briefly reactivate a stale Project/Timeline selection.
+    // Middle-click closes a tab, so it keeps the active panel as the focus target.
     if let Some(p) = active_panel
         && ui.rect_contains_pointer(g.rect)
         && ui.input(|i| i.pointer.any_pressed())
     {
-        actions.push(DockAction::Focus(p));
+        let panel = ui
+            .input(|i| i.pointer.interact_pos().filter(|_| i.pointer.primary_pressed() || i.pointer.secondary_pressed()))
+            .and_then(|pos| tab_rects.iter().find(|(_, rect)| rect.contains(pos)).map(|(panel, _)| *panel))
+            .unwrap_or(p);
+        actions.push(DockAction::Focus(panel));
     }
-    (actions, drawn)
+    Chrome { actions, tabs: tab_rects }
+}
+
+/// Paint once after the group's contents so child backgrounds cannot hide its focus (#1075).
+pub(crate) fn paint_group_focus(ui: &egui::Ui, group: &Group, focused: PanelKind, tokens: &Tokens) {
+    if group.panels.get(group.active).copied() == Some(focused) {
+        ui.painter().rect_stroke(group.rect, 0.0, Stroke::new(1.0, tokens.focus), StrokeKind::Inside);
+    }
+}
+
+fn paint_widget_focus(painter: &egui::Painter, response: &egui::Response, tokens: &Tokens) {
+    if response.has_focus() {
+        painter.rect_stroke(response.rect.shrink(2.0), 2.0, Stroke::new(1.5, tokens.focus), StrokeKind::Inside);
+    }
 }
 
 /// Room for a tab's close ×.
 const CLOSE_W: f32 = 14.0;
-
-/// What a dragged panel or group would dock onto at the pointer.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum DropTarget {
-    /// `zone` of the group holding `target` (`index`: the tab position in its strip).
-    Group { target: PanelKind, zone: Zone, index: Option<usize>, highlight: Rect },
-    /// An outer edge of the dock area.
-    Edge { zone: Zone, highlight: Rect },
-}
-
-/// Pointer within this many points of the dock area's outer edge docks to the edge.
-pub const EDGE_BAND: f32 = 14.0;
-
-/// The drop target at `pos`: the dock area's outer edge, a group's tab strip (a tab at the
-/// position between its tabs), or the group's centre / one of its four sides (the outer quarter
-/// of each side, as Premiere's drop zones). `tab_rects` are the tabs drawn per group path.
-/// None over nothing, or over the dragged group itself (`moving` = its panels).
-pub fn drop_target(
-    groups: &[Group],
-    area: Rect,
-    pos: egui::Pos2,
-    tab_h: f32,
-    tab_rects: &[(String, Vec<(PanelKind, Rect)>)],
-    moving: &[PanelKind],
-) -> Option<DropTarget> {
-    if !area.contains(pos) {
-        return None;
-    }
-    let edge = |zone: Zone| {
-        let h = match zone {
-            Zone::Left => Rect::from_min_max(area.min, pos2(area.min.x + area.width() * 0.25, area.max.y)),
-            Zone::Right => Rect::from_min_max(pos2(area.max.x - area.width() * 0.25, area.min.y), area.max),
-            Zone::Top => Rect::from_min_max(area.min, pos2(area.max.x, area.min.y + area.height() * 0.3)),
-            _ => Rect::from_min_max(pos2(area.min.x, area.max.y - area.height() * 0.3), area.max),
-        };
-        DropTarget::Edge { zone, highlight: h }
-    };
-    if pos.x < area.min.x + EDGE_BAND {
-        return Some(edge(Zone::Left));
-    }
-    if pos.x > area.max.x - EDGE_BAND {
-        return Some(edge(Zone::Right));
-    }
-    if pos.y > area.max.y - EDGE_BAND {
-        return Some(edge(Zone::Bottom));
-    }
-    let g = groups.iter().find(|g| g.rect.contains(pos) && !g.panels.is_empty())?;
-    let whole = !moving.is_empty() && g.panels.iter().all(|p| moving.contains(p));
-    let target = g.panels.iter().copied().find(|p| !moving.contains(p))?;
-    let strip = Rect::from_min_max(g.rect.min, pos2(g.rect.max.x, g.rect.min.y + tab_h));
-    if strip.contains(pos) {
-        if whole {
-            return None;
-        }
-        let tabs = tab_rects.iter().find(|(path, _)| *path == g.path).map(|(_, t)| t.as_slice()).unwrap_or(&[]);
-        // before the first tab whose middle is right of the pointer, else after the last
-        let index = tabs.iter().find(|(_, r)| pos.x < r.center().x).and_then(|(p, _)| g.panels.iter().position(|x| x == p)).unwrap_or(g.panels.len());
-        return Some(DropTarget::Group { target, zone: Zone::Center, index: Some(index), highlight: strip });
-    }
-    let r = g.content;
-    let (w, h) = (r.width().max(1.0), r.height().max(1.0));
-    let d =
-        [(Zone::Left, (pos.x - r.min.x) / w), (Zone::Right, (r.max.x - pos.x) / w), (Zone::Top, (pos.y - r.min.y) / h), (Zone::Bottom, (r.max.y - pos.y) / h)];
-    let (zone, near) = d.iter().copied().fold((Zone::Center, f32::INFINITY), |acc, (z, v)| if v < acc.1 { (z, v) } else { acc });
-    let zone = if near < 0.25 { zone } else { Zone::Center };
-    if whole {
-        // a group cannot dock beside or into itself
-        return None;
-    }
-    let rr = g.rect;
-    let highlight = match zone {
-        Zone::Center => r,
-        Zone::Left => Rect::from_min_max(rr.min, pos2(rr.center().x, rr.max.y)),
-        Zone::Right => Rect::from_min_max(pos2(rr.center().x, rr.min.y), rr.max),
-        Zone::Top => Rect::from_min_max(rr.min, pos2(rr.max.x, rr.center().y)),
-        Zone::Bottom => Rect::from_min_max(pos2(rr.min.x, rr.center().y), rr.max),
-    };
-    Some(DropTarget::Group { target, zone, index: None, highlight })
-}
 
 /// Placeholder body for panels that are not implemented yet.
 pub fn placeholder(ui: &mut egui::Ui, rect: Rect, t: &Tokens, text: &str) {
@@ -1096,6 +967,9 @@ mod tests {
 
     #[test]
     fn split_first_never_panics_on_tiny_areas() {
+        let split_first = |size: SplitSize, avail: f32| {
+            split_rect(Rect::from_min_size(egui::Pos2::ZERO, vec2(avail, 100.0)), SplitAxis::Horizontal, size.shared(), 0.0, 20.0).unwrap().first_size()
+        };
         for avail in [0.0, 1.0, 15.0, 20.0, 35.0, 39.9, 40.0, 100.0, 2000.0] {
             for size in [
                 SplitSize::Ratio(0.0),
@@ -1135,145 +1009,24 @@ mod tests {
         assert_eq!(back, d);
     }
 
-    use PanelKind::*;
-
-    fn group(d: &DockNode, p: PanelKind) -> Vec<PanelKind> {
-        d.group_of(p).unwrap().0
-    }
-
+    /// #284: with Project and Program closed (or every panel closed) a panel still opens.
     #[test]
-    fn a_tab_moves_into_another_group_at_a_position() {
+    fn open_near_falls_back_to_the_first_group() {
         let mut d = workspace("Editing");
-        assert!(d.move_panels(&[Effects], 0, Program, Zone::Center, Some(0)));
-        assert_eq!(group(&d, Program), [Effects, Program]);
-        assert!(d.is_visible(Effects), "the moved tab is shown");
-        assert!(!group(&d, Project).contains(&Effects));
-        // reordering inside a group: Libraries before Project
-        let mut d = workspace("Editing");
-        assert!(d.move_panels(&[Libraries], 0, Project, Zone::Center, Some(0)));
-        assert_eq!(&group(&d, Project)[..3], &[Libraries, Project, MediaBrowser]);
-        // to the end of its own group (index counts the tabs as they were)
-        let mut d = workspace("Editing");
-        let n = group(&d, Project).len();
-        assert!(d.move_panels(&[Project], 0, History, Zone::Center, Some(n)));
-        assert_eq!(group(&d, History).last(), Some(&Project));
-    }
-
-    #[test]
-    fn a_tab_dropped_on_a_side_splits_that_group() {
-        let mut d = workspace("Editing");
-        assert!(d.move_panels(&[Effects], 0, Timeline, Zone::Top, None));
-        assert_eq!(group(&d, Effects), [Effects]);
-        assert_eq!(group(&d, Timeline), [Timeline]);
-        // the Timeline's place in the tree is now a vertical split with Effects above it
-        fn find(n: &DockNode) -> bool {
-            match n {
-                DockNode::Split { vertical: true, a, b, .. } if **a == tabs(&[Effects], 0) && **b == tabs(&[Timeline], 0) => true,
-                DockNode::Split { a, b, .. } => find(a) || find(b),
-                _ => false,
-            }
-        }
-        assert!(find(&d), "{d:?}");
-        // a panel taken from a group of two beside the other one
-        let mut d = DockNode::Tabs { panels: vec![Source, Program], active: 1 };
-        assert!(d.move_panels(&[Source], 0, Program, Zone::Left, None));
-        assert_eq!(d, hsplit(SplitSize::Ratio(0.5), tabs(&[Source], 0), tabs(&[Program], 0)));
-    }
-
-    #[test]
-    fn whole_groups_move_and_empty_splits_collapse() {
-        let mut d = workspace("Editing");
-        let (props, _) = d.group_of(Properties).unwrap();
-        let before = d.clone();
-        assert!(d.move_panels(&props, 1, Timeline, Zone::Right, None));
-        assert_eq!(group(&d, Properties), props, "the group keeps its tabs");
-        assert!(d.is_visible(EssentialGraphics), "and the tab it showed");
         let mut all = Vec::new();
         d.panels(&mut all);
-        let mut was = Vec::new();
-        before.panels(&mut was);
-        all.sort_by_key(|p| p.id());
-        was.sort_by_key(|p| p.id());
-        assert_eq!(all, was, "no panel lost or duplicated");
-        // nothing to do: onto itself, onto a panel that is not docked
-        let mut d = workspace("Editing");
-        let same = d.clone();
-        assert!(!d.move_panels(&[Program], 0, Program, Zone::Left, None));
-        assert!(!d.move_panels(&[Program], 0, LumetriColor, Zone::Left, None));
-        assert!(!d.move_panels(&[], 0, Program, Zone::Left, None));
-        assert_eq!(d, same);
-    }
-
-    #[test]
-    fn edges_of_the_dock_area_take_full_columns_and_rows() {
-        let mut d = workspace("Editing");
-        assert!(d.move_to_edge(&[Effects], 0, Zone::Left));
-        let DockNode::Split { vertical: false, a, .. } = &d else { panic!("{d:?}") };
-        assert_eq!(**a, tabs(&[Effects], 0));
-        assert!(d.move_to_edge(&[History], 0, Zone::Bottom));
-        let DockNode::Split { vertical: true, b, .. } = &d else { panic!("{d:?}") };
-        assert_eq!(**b, tabs(&[History], 0));
-        // docking a floating panel back into an empty dock
-        let mut e = DockNode::Tabs { panels: vec![], active: 0 };
-        assert!(e.is_empty());
-        assert!(e.move_to_edge(&[Program], 0, Zone::Right));
-        assert_eq!(e, tabs(&[Program], 0));
-    }
-
-    #[test]
-    fn drop_targets_follow_the_pointer() {
-        let a = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 600.0));
-        let ga = Group {
-            path: "a".into(),
-            rect: Rect::from_min_max(pos2(0.0, 0.0), pos2(500.0, 600.0)),
-            content: Rect::from_min_max(pos2(0.0, 30.0), pos2(500.0, 600.0)),
-            panels: vec![Source, EffectControls],
-            active: 0,
-        };
-        let gb = Group {
-            path: "b".into(),
-            rect: Rect::from_min_max(pos2(504.0, 0.0), pos2(1000.0, 600.0)),
-            content: Rect::from_min_max(pos2(504.0, 30.0), pos2(1000.0, 600.0)),
-            panels: vec![Program],
-            active: 0,
-        };
-        let groups = [ga, gb];
-        let strips = vec![(
-            "a".to_string(),
-            vec![(Source, Rect::from_min_max(pos2(10.0, 0.0), pos2(80.0, 30.0))), (EffectControls, Rect::from_min_max(pos2(90.0, 0.0), pos2(200.0, 30.0)))],
-        )];
-        let at = |x: f32, y: f32, moving: &[PanelKind]| drop_target(&groups, a, pos2(x, y), 30.0, &strips, moving);
-        // centre of Program, its left quarter, its top quarter
-        assert!(matches!(at(750.0, 300.0, &[Source]), Some(DropTarget::Group { target: Program, zone: Zone::Center, .. })));
-        assert!(matches!(at(530.0, 300.0, &[Source]), Some(DropTarget::Group { target: Program, zone: Zone::Left, .. })));
-        assert!(matches!(at(750.0, 60.0, &[Source]), Some(DropTarget::Group { target: Program, zone: Zone::Top, .. })));
-        // the tab strip: between the two tabs, after the last
-        assert!(matches!(at(85.0, 10.0, &[Program]), Some(DropTarget::Group { zone: Zone::Center, index: Some(1), .. })));
-        assert!(matches!(at(400.0, 10.0, &[Program]), Some(DropTarget::Group { zone: Zone::Center, index: Some(2), .. })));
-        // the outer edge of the dock area
-        assert!(matches!(at(4.0, 300.0, &[Program]), Some(DropTarget::Edge { zone: Zone::Left, .. })));
-        assert!(matches!(at(996.0, 300.0, &[Source]), Some(DropTarget::Edge { zone: Zone::Right, .. })));
-        // a group over itself, a single panel over its own group: nothing
-        assert_eq!(at(750.0, 300.0, &[Program]), None);
-        assert_eq!(at(250.0, 300.0, &[Source, EffectControls]), None);
-        // one tab of a group over the rest of it: beside it
-        assert!(matches!(at(20.0 + 14.0, 300.0, &[Source]), Some(DropTarget::Group { target: EffectControls, zone: Zone::Left, .. })));
-        assert_eq!(at(1200.0, 300.0, &[Source]), None);
-    }
-
-    #[test]
-    fn a_panel_remembers_its_place() {
-        let d = workspace("Editing");
-        // in a shared group: back into it
-        assert_eq!(d.home_of(Effects), Some((Project, Zone::Center)));
-        // alone: beside its neighbour, on its side
-        assert_eq!(d.home_of(Program), Some((Source, Zone::Right)));
-        assert_eq!(d.home_of(AudioMeters), Some((Timeline, Zone::Right)));
-        // closing then putting it back there restores the layout
-        let mut e = d.clone();
-        e.close(Program);
-        assert!(e.move_panels(&[Program], 0, Source, Zone::Right, None));
-        assert_eq!(e, d);
-        assert_eq!(d.home_of(LumetriColor), None);
+        for p in all {
+            d.close(p);
+        }
+        assert_eq!(d, DockNode::Tabs { panels: vec![], active: 0 });
+        d.open_near(PanelKind::Program, PanelKind::Project);
+        assert!(d.is_visible(PanelKind::Program));
+        d.restore_timeline();
+        assert!(d.is_visible(PanelKind::Timeline));
+        // a tree without Project or Program: the panel joins the first group
+        let mut d = hsplit(SplitSize::Ratio(0.5), tabs(&[PanelKind::Effects], 0), tabs(&[PanelKind::Markers], 0));
+        d.open_near(PanelKind::Info, PanelKind::Source);
+        assert!(d.is_visible(PanelKind::Info));
+        assert_eq!(d, hsplit(SplitSize::Ratio(0.5), tabs(&[PanelKind::Effects, PanelKind::Info], 1), tabs(&[PanelKind::Markers], 0)));
     }
 }

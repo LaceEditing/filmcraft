@@ -1,6 +1,6 @@
 //! Effect Controls editing beyond one parameter at a time: several keyframes at once (delete,
-//! move, interpolation), copy / paste of keyframes and of effects between clips, removing several
-//! effects and reordering them.
+//! interpolation; moving them is `effects.moveKeyframes`), copy / paste of keyframes and of effects
+//! between clips, removing several effects and reordering them.
 //!
 //! Keyframes are addressed as `{"effect": index, "param": id, "mask": n?, "mediaTime": ticks}`
 //! (the media time the keyframe is stored at). Every edit is one undo step.
@@ -64,12 +64,6 @@ fn spec(id: &'static str, label: &'static str, params: &'static str, run: Run) -
 pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
         spec("effects.deleteKeyframes", "Delete Keyframes", r#"{"clip":id,"keys":[{"effect":index,"param":str,"mask":n?,"mediaTime":ticks}]}"#, delete_keys),
-        spec(
-            "effects.moveKeyframes",
-            "Move Keyframes",
-            r#"{"clip":id,"keys":[{"effect":index,"param":str,"mask":n?,"mediaTime":ticks}],"by":ticks (media time)}"#,
-            move_keys,
-        ),
         spec(
             "effects.setKeyframesInterpolation",
             "Keyframe Interpolation",
@@ -161,35 +155,6 @@ fn delete_keys(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(n)
     })?;
     Ok(json!({"deleted": n}))
-}
-
-fn move_keys(s: &mut Session, p: &Value) -> Result<Value> {
-    let c = clip_p(p, "clip").ok_or_else(|| bad("effects.moveKeyframes", "need `clip`"))?;
-    let keys = keys_p(p, "effects.moveKeyframes")?;
-    let by = Tick(p.get("by").and_then(Value::as_i64).ok_or_else(|| bad("effects.moveKeyframes", "need `by` (media ticks)"))?);
-    let moved = s.edit_sequence("Move Keyframes", |q, _, _| {
-        let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
-        let mut moved = Vec::new();
-        for ((effect, mask, pid), times) in by_param(&keys) {
-            let Some(prm) = param_mut(it, effect, mask, &pid) else { continue };
-            // lift the moving keyframes out, then put them back shifted (replacing a keyframe
-            // that sits where one lands)
-            let (go, stay): (Vec<Keyframe>, Vec<Keyframe>) = std::mem::take(&mut prm.keyframes).into_iter().partition(|k| times.contains(&k.time));
-            prm.keyframes = stay;
-            for mut k in go {
-                k.time = Tick(k.time.0.saturating_add(by.0));
-                prm.keyframes.retain(|x| x.time != k.time);
-                let at = prm.keyframes.partition_point(|x| x.time < k.time);
-                moved.push(key_json(effect, mask, &pid, k.time));
-                prm.keyframes.insert(at, k);
-            }
-        }
-        if moved.is_empty() {
-            return Err(bad("effects.moveKeyframes", "none of those keyframes exist"));
-        }
-        Ok(moved)
-    })?;
-    Ok(json!({"keys": moved}))
 }
 
 fn interp_keys(s: &mut Session, p: &Value) -> Result<Value> {

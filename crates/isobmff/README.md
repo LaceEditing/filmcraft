@@ -60,6 +60,7 @@ Boxes with 64-bit sizes and with size 0 (runs to the end of the file) are suppor
 | `jpeg mjpa mjpb` | `Jpeg { fourcc }` |
 | `AVdn AVdh` | `Dnx { fourcc }` |
 | `mp4a` + `esds` (in `wave` too) | `Aac(AacConfig)`: ASC bytes + decoded object type/rate/channels; `Mp3` for OTI 0x69/0x6B |
+| `.mp3`/`.mp2` | `Mp3`: MPEG-1/2 audio of any layer (each frame header names it) |
 | PCM fourccs | `Pcm(PcmConfig)`: bits, float, endianness (`enda`, lpcm flags, `pcmC`), channels, rate |
 | `alac` | `Alac { cookie }` |
 | `Opus` + `dOps` | `Opus(OpusConfig)` |
@@ -69,7 +70,8 @@ Boxes with 64-bit sizes and with size 0 (runs to the end of the file) are suppor
 | anything else | `Unknown { fourcc, raw }` |
 
 Video entries also parse `colr` (`nclx`/`nclc`/ICC), `pasp`, `clap`, `fiel`, `gama` and `btrt` into
-`VideoParams`. Audio entries parse QuickTime sound description v0/v1/v2 into `AudioParams`.
+`VideoParams`. The MP4 source in `filmcraft-codecs` crops every frame to `clap`'s clean aperture
+before the track's display rotation, and reports that size. Audio entries parse QuickTime sound description v0/v1/v2 into `AudioParams`.
 
 ### Robustness
 The parser does not panic on malformed input; every error comes back as an `Error`. Table counts are
@@ -116,18 +118,18 @@ let bytes = w.finish_faststart()?.into_inner(); // or finish() for moov-at-end
 ## Tests
 - Unit tests cover the box reader and hand-built `stbl` edge cases (stz2, co64, ctts v1, empty edits,
   64-bit and size-0 boxes, uuid/wide/skip), codec config round-trips, and allocation guards.
-- Property tests (`tests/roundtrip.rs`) write random multi-track files, both progressive (MP4/MOV,
+- Property tests (`tests/it/roundtrip.rs`) write random multi-track files, both progressive (MP4/MOV,
   faststart, PCM, edits) and fragmented, then read them back and compare sample tables and bytes.
-- ffprobe oracle tests (`tests/oracle_demux.rs`) run on ffmpeg-generated fixtures in
+- ffprobe oracle tests (`tests/it/oracle_demux.rs`) run on ffmpeg-generated fixtures in
   `target/fixtures/isobmff/`: H.264 with B-frames (MP4 and MOV), HEVC, ProRes 422/4444, MJPEG, DNxHR, PCM
   s16le/s16be/s24le/f32le, AAC, ALAC, FLAC, Opus, AC-3, VP9, AV1, fragmented (with and without
   default-base-is-moof), faststart, an edit-list cut, `tmcd` at 29.97 DF and 23.976, and colr/pasp. They
   compare packet offsets, sizes, pts/dts, durations and key flags, plus stream parameters. Tests skip
   with a message when ffmpeg or an encoder is missing.
-- Muxer oracle tests (`tests/oracle_mux.rs`) remux fixtures with our writers. They check that
+- Muxer oracle tests (`tests/it/oracle_mux.rs`) remux fixtures with our writers. They check that
   `ffmpeg -v error -f null` reports nothing, that ffprobe packets and stream parameters match the source,
   and that timecode, the AAC priming edit, ipcm and fMP4 output are correct.
-- Mutation fuzzing (`tests/fuzz.rs`) uses a deterministic seed to mutate and truncate synthetic and
+- Mutation fuzzing (`tests/it/fuzz.rs`) uses a deterministic seed to mutate and truncate synthetic and
   ffmpeg files, and checks that nothing panics.
 
 ## Limitations / not yet supported

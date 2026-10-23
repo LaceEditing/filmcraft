@@ -9,12 +9,12 @@
 
 use filmcraft_geom::Vec2;
 use filmcraft_project::graphic::{self, LayerContent, SHAPE_OPTS, eval_layer, layer_display_name, layer_indices, new_shape_layer, new_text_layer};
-use filmcraft_project::{ClipId, ItemId, ItemKind, Label, ParamValue, Sequence, TrackKind};
-use filmcraft_render::graphic_clip::{item_layer_specs, layer_local_bounds, layer_quad};
+use filmcraft_project::{ClipId, EffectInstance, ItemId, ItemKind, Label, Param, ParamValue, Sequence, TrackKind};
+use filmcraft_render::graphic_clip::{item_layer_specs, layer_local_bounds, layer_quad, text_layout};
 use filmcraft_time::{Tick, TimeRange};
 use serde_json::{Value, json};
 
-use crate::commands::{CommandSpec, always, bad, f64_p, has_seq, str_p, time_p, u64_p};
+use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, str_p, time_p, u64_p};
 use crate::{EngineError, Result, Session};
 
 type Run = fn(&mut Session, &Value) -> Result<Value>;
@@ -96,18 +96,25 @@ pub(crate) fn graphic_source(p: &mut filmcraft_project::Project, w: u32, h: u32,
 
 /// Place a new graphic clip holding `layer` at the playhead: on the first video track above the
 /// topmost clip at the playhead that is free for the duration (a track is added if needed).
-fn new_graphic_clip(s: &mut Session, layer: filmcraft_project::EffectInstance, name: &str, p: &Value) -> Result<ClipId> {
+fn new_graphic_clip(s: &mut Session, cmd: &str, layer: filmcraft_project::EffectInstance, name: &str, p: &Value) -> Result<ClipId> {
     let seconds = f64_p(p, "seconds").unwrap_or(5.0).max(0.01);
-    place_video_clip(s, name, p, "New Graphic", vec![layer], move |pr, (w, h, rate)| {
+    // Here `seconds` is duration, not the generic time parser's placement alias.
+    let mut placement = p.clone();
+    if let Some(params) = placement.as_object_mut() {
+        params.remove("seconds");
+    }
+    place_video_clip(s, cmd, name, &placement, "New Graphic", vec![layer], move |pr, (w, h, rate)| {
         let src = graphic_source(pr, w, h, rate);
         (src, rate.snap_nearest(Tick::from_seconds_f64(seconds)).max(rate.frame_duration()))
     })
 }
 
 /// Place a video clip of the item `source` returns (with its duration) at the playhead (or
-/// `time`), above the clips there, as one undo step; selects it.
+/// `time`), above the clips there, as one undo step; selects it. `cmd` is the command that asked,
+/// for its errors.
 pub(crate) fn place_video_clip(
     s: &mut Session,
+    cmd: &str,
     name: &str,
     p: &Value,
     label: &str,
@@ -124,13 +131,15 @@ pub(crate) fn place_video_clip(
             (q.settings.width, q.settings.height, q.settings.frame_rate)
         };
         let (src, dur) = source(pr, (w, h, rate));
+        // an imported picture (`graphics.newFromFile`) keeps its own size: centre its anchor in it
+        let src_size = pr.source_size(src).unwrap_or((w, h));
         let t = rate.snap(t);
         let dur = dur.max(rate.frame_duration());
-        let mut ti = pr.make_track_item(src, TrackKind::Video, t, TimeRange::new(Tick::ZERO, dur), rate).ok_or_else(|| bad("graphics.newText", "bad item"))?;
+        let mut ti = pr.make_track_item(src, TrackKind::Video, t, TimeRange::new(Tick::ZERO, dur), rate).ok_or_else(|| bad(cmd, "bad item"))?;
         ti.name = name;
         ti.effects.extend(extra);
         for e in &mut ti.effects {
-            filmcraft_project::resolve_auto_points(e, (w, h), (w, h));
+            filmcraft_project::resolve_auto_points(e, (w, h), src_size);
         }
         let id = ti.id;
         let track_id = filmcraft_project::TrackId(pr.alloc_id());
@@ -139,7 +148,7 @@ pub(crate) fn place_video_clip(
         let free = |tr: &filmcraft_project::Track| !tr.items.iter().any(|i| i.range().overlaps(&range));
         let idx = match want_track {
             Some(i) if i < q.video_tracks.len() && free(&q.video_tracks[i]) => i,
-            Some(i) if i < q.video_tracks.len() => return Err(bad("graphics.newText", format!("V{} is not free here", i + 1))),
+            Some(i) if i < q.video_tracks.len() => return Err(bad(cmd, format!("V{} is not free here", i + 1))),
             _ => {
                 let top = q.video_tracks.iter().rposition(|tr| tr.item_at(t).is_some()).map_or(0, |k| k + 1);
                 match (top..q.video_tracks.len()).find(|&i| free(&q.video_tracks[i]) && !q.video_tracks[i].locked) {
@@ -183,6 +192,10 @@ fn param_id(k: &str) -> &str {
         "fontSize" => "size",
         "fontStyle" | "style" => "font_style",
         "fillColor" | "color" => "fill_color",
+        "fillKind" => "fill_kind",
+        "gradientStart" => "gradient_start",
+        "gradientEnd" => "gradient_end",
+        "gradientAngle" => "gradient_angle",
         "strokeColor" => "stroke_color",
         "strokeWidth" => "stroke_width",
         "backgroundColor" => "background_color",
@@ -206,6 +219,7 @@ pub(crate) fn to_param(template: &ParamValue, id: &str, v: &Value) -> Option<Par
             "align" => graphic::ALIGN_OPTS,
             "caps" => graphic::CAPS_OPTS,
             "stroke_type" | "stroke2_type" => graphic::STROKE_OPTS,
+            "fill_kind" => graphic::FILL_KIND_OPTS,
             "shape" => SHAPE_OPTS,
             _ => &[],
         };
@@ -216,32 +230,146 @@ pub(crate) fn to_param(template: &ParamValue, id: &str, v: &Value) -> Option<Par
     crate::commands::json_to_param(template, v)
 }
 
+/// Parameter `id` of a layer, created from the layer definition when the layer was saved before
+/// the parameter existed.
+fn param_entry<'a>(e: &'a mut EffectInstance, id: &str) -> Option<&'a mut Param> {
+    if !e.params.contains_key(id) {
+        let d = filmcraft_project::find_effect(&e.effect)?.param(id)?.default.clone();
+        e.params.insert(id.to_string(), Param::new(d));
+    }
+    e.params.get_mut(id)
+}
+
+/// Set properties `props` on layer `e` (keyframe-aware at media time `mt`). Changing the text
+/// keeps per-character styles on their characters.
+fn apply_props(e: &mut EffectInstance, props: &serde_json::Map<String, Value>, mt: Tick) -> Result<()> {
+    for (k, v) in props {
+        if k == "enabled" {
+            e.enabled = v.as_bool().unwrap_or(true);
+            continue;
+        }
+        let id = param_id(k);
+        let prm = param_entry(e, id).ok_or_else(|| bad("graphics.set", format!("no property `{k}`")))?;
+        let pv = to_param(&prm.value, id, v).ok_or_else(|| bad("graphics.set", format!("`{k}`: value has the wrong type")))?;
+        let old = prm.value_at(mt);
+        prm.set_at(mt, pv.clone());
+        if let (ParamValue::Text(a), ParamValue::Text(b), "text") = (&old, &pv, id)
+            && let Some(x) = e.layer.as_mut()
+        {
+            x.runs = filmcraft_project::graphic_design::adjust_runs(a, b, &x.runs);
+        }
+    }
+    Ok(())
+}
+
 /// Set properties `props` on a layer (keyframe-aware at time `tl`). Changing the text keeps
-/// per-character styles on their characters.
-pub(crate) fn set_props(s: &mut Session, clip: ClipId, eidx: usize, props: &serde_json::Map<String, Value>, tl: Tick, label: &str) -> Result<()> {
+/// per-character styles on their characters. `merge` folds consecutive calls with the same key
+/// into one undo step (a drag is one undoable change, like `effects.setParam`).
+pub(crate) fn set_props(
+    s: &mut Session,
+    clip: ClipId,
+    eidx: usize,
+    props: &serde_json::Map<String, Value>,
+    tl: Tick,
+    label: &str,
+    merge: Option<&str>,
+) -> Result<()> {
     let props = props.clone();
-    s.edit_sequence(label, |q, _, _| {
+    s.edit_sequence_as(label, merge, |q, _, _| {
         let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
         let mt = it.source_time_at(tl.clamp(it.start, it.end() - Tick(1)));
         let e = it.effects.get_mut(eidx).ok_or_else(|| bad("graphics.set", "no such layer"))?;
-        for (k, v) in &props {
-            if k == "enabled" {
-                e.enabled = v.as_bool().unwrap_or(true);
-                continue;
-            }
-            let id = param_id(k);
-            let prm = e.params.get_mut(id).ok_or_else(|| bad("graphics.set", format!("no property `{k}`")))?;
-            let pv = to_param(&prm.value, id, v).ok_or_else(|| bad("graphics.set", format!("`{k}`: value has the wrong type")))?;
-            let old = prm.value_at(mt);
-            prm.set_at(mt, pv.clone());
-            if let (ParamValue::Text(a), ParamValue::Text(b), "text") = (&old, &pv, id)
-                && let Some(x) = e.layer.as_mut()
-            {
-                x.runs = filmcraft_project::graphic_design::adjust_runs(a, b, &x.runs);
-            }
-        }
+        apply_props(e, &props, mt)?;
         Ok(())
     })
+}
+
+/// Turn a text layer into point text (no box; the lines the box wrapped become real lines) or
+/// paragraph text (a box fitted to the text). The text stays where it is: the layer's origin
+/// moves between the first baseline and the box's top-left corner, and the anchor point is
+/// renumbered to stay on the same spot.
+fn set_text_type(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "graphics.setTextType";
+    let clip = target_clip(s, p).ok_or_else(|| bad(ID, "no graphic clip"))?;
+    let (layer, ei) = layer_effect_index(s, clip, p)?;
+    let to_paragraph = match str_p(p, "type").map(str::to_ascii_lowercase).as_deref() {
+        Some("paragraph" | "paragraph text") => true,
+        Some("point" | "point text") => false,
+        _ => return Err(bad(ID, "need `type`: point or paragraph")),
+    };
+    let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let (_, it) = seq.find_item(clip).ok_or_else(|| bad(ID, "no such clip"))?;
+    let size = match s.project.item(it.item).map(|p| &p.kind) {
+        Some(ItemKind::Graphic { width, height, .. }) => (*width, *height),
+        _ => (seq.settings.width, seq.settings.height),
+    };
+    let ph = s.playhead();
+    let mt = it.source_time_at(ph.clamp(it.start, it.end() - Tick(1)));
+    let spec = it.effects.get(ei).and_then(|e| eval_layer(e, mt, size)).ok_or_else(|| bad(ID, "no such layer"))?;
+    let LayerContent::Text(tp) = &spec.content else { return Err(bad(ID, "not a text layer")) };
+    if tp.vertical {
+        return Err(bad(ID, "vertical text is always point text"));
+    }
+    let name = |paragraph: bool| if paragraph { "paragraph" } else { "point" };
+    if (tp.box_width > 0.0) == to_paragraph {
+        return Ok(json!({"clip": clip.0, "layer": layer, "type": name(to_paragraph), "changed": false}));
+    }
+    // where point text's origin (its alignment point on the first baseline) sits in a box `w` wide
+    let origin_x = |w: f32| match tp.align {
+        1 => w / 2.0,
+        2 => w,
+        _ => 0.0,
+    };
+    // a layer measured from its top-left corner (`top_left_origin`, as Premiere measures titles)
+    // has its origin where the new layout puts that corner: the anchor follows the origin too
+    let layer_origin =
+        |t: graphic::TextProps| filmcraft_render::graphic_clip::layer_origin(&graphic::LayerSpec { content: LayerContent::Text(t), ..spec.clone() });
+    let o0 = layer_origin(tp.clone());
+    let mut props = serde_json::Map::new();
+    // what to add to the anchor so that it stays on the same spot of the picture
+    let (shift, o1) = if to_paragraph {
+        let widest = text_layout(tp).lines.iter().map(|l| l.width).fold(0.0, f32::max);
+        // a little slack, so that no line wraps
+        let w = (widest.ceil() + 1.0).clamp(1.0, 100_000.0);
+        let boxed = text_layout(&graphic::TextProps { box_width: w, box_height: 0.0, ..tp.clone() });
+        let h = (boxed.bounds[3].ceil() + 1.0).clamp(1.0, 100_000.0);
+        props.insert("box_width".into(), json!(w));
+        props.insert("box_height".into(), json!(h));
+        let o1 = layer_origin(graphic::TextProps { box_width: w, box_height: h, ..tp.clone() });
+        ((origin_x(w), boxed.lines.first().map_or(0.0, |l| l.baseline)), o1)
+    } else {
+        // every line, also those the box hides
+        let all = text_layout(&graphic::TextProps { box_height: 0.0, ..tp.clone() });
+        let mut text = String::with_capacity(tp.text.len());
+        for (i, l) in all.lines.iter().enumerate() {
+            let line = tp.text.get(l.range.clone()).unwrap_or_default();
+            // a wrapped line ends where the next begins: its trailing space becomes the line break
+            let wrapped = all.lines.get(i + 1).is_some_and(|n| n.range.start == l.range.end);
+            text.push_str(if wrapped { line.trim_end() } else { line });
+            if i + 1 < all.lines.len() {
+                text.push('\n');
+            }
+        }
+        props.insert("text".into(), json!(text));
+        props.insert("box_width".into(), json!(0.0));
+        props.insert("box_height".into(), json!(0.0));
+        let o1 = layer_origin(graphic::TextProps { text, box_width: 0.0, box_height: 0.0, ..tp.clone() });
+        ((-origin_x(tp.box_width), -all.lines.first().map_or(0.0, |l| l.baseline)), o1)
+    };
+    let shift = (shift.0 + o0.0 - o1.0, shift.1 + o0.1 - o1.1);
+    s.edit_sequence("Text Layer Type", |q, _, _| {
+        let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+        let e = it.effects.get_mut(ei).ok_or_else(|| bad(ID, "no such layer"))?;
+        apply_props(e, &props, mt)?;
+        if let Some(a) = param_entry(e, "anchor") {
+            a.map_values(|v| match v.as_vec2() {
+                Some(a) => ParamValue::Vec2(Vec2::new(a.x + shift.0 as f64, a.y + shift.1 as f64)),
+                None => v,
+            });
+        }
+        Ok(())
+    })?;
+    Ok(json!({"clip": clip.0, "layer": layer, "type": name(to_paragraph), "changed": true}))
 }
 
 /// Layers of a graphic clip with their evaluated bounds (sequence/canvas pixels).
@@ -267,6 +395,14 @@ fn list_layers(s: &Session, clip: ClipId) -> Result<Value> {
                 LayerContent::Text(t) => ("text", Some(t.text.clone())),
                 LayerContent::Shape(sh) => (SHAPE_OPTS.get(sh.shape as usize).copied().unwrap_or("Shape"), None),
             };
+            // point text has no box; paragraph text wraps in one and hides what does not fit
+            let (text_type, text_box, overflow) = match &sp.content {
+                LayerContent::Text(t) if t.box_width > 0.0 && !t.vertical => {
+                    (Some("paragraph"), Some([t.box_width, t.box_height]), Some(text_layout(t).overflow))
+                }
+                LayerContent::Text(_) => (Some("point"), None, None),
+                LayerContent::Shape(_) => (None, None, None),
+            };
             Some(json!({
                 "layer": i,
                 "effectIndex": ei,
@@ -274,11 +410,17 @@ fn list_layers(s: &Session, clip: ClipId) -> Result<Value> {
                 "kind": kind,
                 "text": text,
                 "enabled": e.enabled,
+                "textType": text_type,
+                "box": text_box,
+                "overflow": overflow,
                 "position": [sp.transform.position.x, sp.transform.position.y],
+                "anchor": [sp.transform.anchor.x, sp.transform.anchor.y],
+                "scale": sp.transform.scale.y * 100.0,
+                "scaleWidth": sp.transform.scale.x * 100.0,
                 "uid": extra.map_or(0, |x| x.uid),
                 "pin": extra.and_then(|x| x.pin.as_ref()).map(|p| serde_json::to_value(p).unwrap_or_default()),
                 "styles": extra.map(|x| serde_json::to_value(&x.runs).unwrap_or_default()).unwrap_or(json!([])),
-                "localBounds": layer_local_bounds(&sp),
+                "localBounds": origin_bounds(&sp),
                 "quad": q.iter().map(|p| [p.x, p.y]).collect::<Vec<_>>(),
             }))
         })
@@ -288,6 +430,24 @@ fn list_layers(s: &Session, clip: ClipId) -> Result<Value> {
     Ok(
         json!({"clip": clip.0, "name": it.name, "start": it.start.0, "duration": it.duration.0, "canvas": [size.0, size.1], "layers": layers, "graphic": meta, "sourceGraphic": source}),
     )
+}
+
+/// A layer's content box `[x0, y0, x1, y1]` in its own pixels, measured from its origin (where its
+/// anchor point is measured from too): for text placed by its top-left corner, that corner is 0, 0.
+fn origin_bounds(sp: &graphic::LayerSpec) -> [f32; 4] {
+    let (ox, oy) = filmcraft_render::graphic_clip::layer_origin(sp);
+    // a paragraph box from its corner and size, so that a box placed by its corner is exactly
+    // [0, 0, width, height]
+    if let LayerContent::Text(t) = &sp.content {
+        let lay = text_layout(t);
+        if let Some(top) = filmcraft_render::graphic_clip::paragraph_top(t, &lay) {
+            let (x0, y0) = (lay.bounds[0] - ox, top - oy);
+            let h = if t.box_height > 0.0 { t.box_height } else { lay.bounds[3] - lay.bounds[1] };
+            return [x0, y0, x0 + t.box_width, y0 + h];
+        }
+    }
+    let b = layer_local_bounds(sp);
+    [b[0] - ox, b[1] - oy, b[2] - ox, b[3] - oy]
 }
 
 fn quad_bounds(q: &[Vec2; 4]) -> [f64; 4] {
@@ -381,8 +541,79 @@ fn union_box(boxes: &[(usize, Vec2, [f64; 4])]) -> [f64; 4] {
     boxes.iter().fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |a, b| [a[0].min(b.2[0]), a[1].min(b.2[1]), a[2].max(b.2[2]), a[3].max(b.2[3])])
 }
 
-/// Graphics ▸ Align to Video Frame / Align to Video Frame as Group / Align to Selection.
+/// Video clips (not graphics) the align commands move by their Motion ▸ Position (#1081): `clip`,
+/// else the selected ones. Empty when a graphic clip is named or selected: its layers align.
+fn align_target_clips(s: &Session, p: &Value) -> Vec<ClipId> {
+    let Some(seq) = s.active_sequence() else { return Vec::new() };
+    let video = |c: &ClipId| seq.find_item(*c).is_some_and(|(t, _)| seq.track(t).is_some_and(|t| t.kind == TrackKind::Video)) && !is_graphic(s, seq, *c);
+    match u64_p(p, "clip").map(ClipId) {
+        Some(c) => [c].into_iter().filter(video).collect(),
+        None if s.state.selection.iter().any(|c| is_graphic(s, seq, *c)) => Vec::new(),
+        None => s.state.selection.iter().copied().filter(video).collect(),
+    }
+}
+
+fn has_graphic_or_clip(s: &Session) -> std::result::Result<(), String> {
+    has_seq(s)?;
+    if align_target_clips(s, &Value::Null).is_empty() { has_graphic(s).map_err(|_| "select a graphic or video clip".into()) } else { Ok(()) }
+}
+
+/// Align video clips to the frame (each, as a group, or to their union) by moving Motion ▸
+/// Position only, from the clip's scaled and rotated bounds at the playhead. Position gets a
+/// keyframe there only when it is already animated, as typing a value would.
+fn align_clips(s: &mut Session, clips: &[ClipId], how: &str, mode: AlignTo) -> Result<Value> {
+    let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let t = s.playhead();
+    let at = |it: &filmcraft_project::TrackItem| it.source_time_at(t.min(it.end() - Tick(1)).max(it.start));
+    let frame = [0.0, 0.0, seq.settings.width as f64, seq.settings.height as f64];
+    let mut boxes = Vec::new();
+    for (i, &c) in clips.iter().enumerate() {
+        let Some((_, it)) = seq.find_item(c) else { continue };
+        let Some(src) = s.project.source_size(it.item) else { continue };
+        let Some(motion) = it.effect("motion") else { continue };
+        let mt = at(it);
+        let m = filmcraft_render::motion_matrix(seq, it, src, s.project.source_par(it.item), mt);
+        let (w, h) = (src.0 as f64, src.1 as f64);
+        let corners = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)].map(|(x, y)| m.apply(Vec2::new(x, y)));
+        let b = corners.iter().fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |b, p| [b[0].min(p.x), b[1].min(p.y), b[2].max(p.x), b[3].max(p.y)]);
+        let pos = motion.vec2_at("position", mt);
+        let pos = if pos.x.is_nan() { Vec2::new(frame[2] / 2.0, frame[3] / 2.0) } else { pos };
+        boxes.push((i, pos, b));
+    }
+    if boxes.is_empty() {
+        return Err(bad("graphics.align", "the selected clips have no picture to align"));
+    }
+    let union = union_box(&boxes);
+    let group = align_delta(how, frame, union)?;
+    let mut moves = Vec::new();
+    for (i, pos, b) in &boxes {
+        let (dx, dy) = match mode {
+            AlignTo::Frame => align_delta(how, frame, *b)?,
+            AlignTo::FrameGroup => group,
+            AlignTo::Selection => align_delta(how, union, *b)?,
+        };
+        moves.extend(clips.get(*i).map(|c| (*c, Vec2::new(pos.x + dx, pos.y + dy))));
+    }
+    s.edit_sequence("Align Clips", |q, _, _| {
+        for (c, pos) in &moves {
+            let Some((_, it)) = q.find_item_mut(*c) else { continue };
+            let mt = at(it);
+            if let Some(prm) = it.effects.iter_mut().find(|e| e.effect == "motion").and_then(|e| e.params.get_mut("position")) {
+                prm.set_at(mt, ParamValue::Vec2(*pos));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(json!({"clips": moves.iter().map(|(c, _)| c.0).collect::<Vec<_>>()}))
+}
+
+/// Graphics ▸ Align to Video Frame / Align to Video Frame as Group / Align to Selection. With video
+/// clips selected instead of a graphic, the clips align (#1081).
 fn align_layers(s: &mut Session, p: &Value, how: &str, mode: AlignTo) -> Result<Value> {
+    let clips = align_target_clips(s, p);
+    if !clips.is_empty() {
+        return align_clips(s, &clips, how, mode);
+    }
     let clip = target_clip(s, p).ok_or_else(|| bad("graphics.align", "no graphic clip"))?;
     let layers = layers_p(s, clip, p)?;
     let (boxes, size) = layer_boxes(s, clip, &layers)?;
@@ -536,7 +767,7 @@ fn has_graphics_in_seq(s: &Session) -> std::result::Result<(), String> {
     if graphic_clips(s).is_empty() { Err("the sequence has no graphics".into()) } else { Ok(()) }
 }
 
-const ALIGN_PARAMS: &str = r#"{"clip":id?,"layers":[n]? (default: the selected layers)}"#;
+const ALIGN_PARAMS: &str = r#"{"clip":id?,"layers":[n]? (default: the selected layers; selected video clips move by Motion Position)}"#;
 
 macro_rules! align_cmd {
     ($id:literal, $label:literal, $menu:expr, $how:literal, $mode:expr, $en:expr) => {
@@ -586,7 +817,7 @@ fn menu_commands() -> Vec<CommandSpec> {
             "Rectangle",
             &["Graphics and Titles", "New Layer"],
             Some("Cmd+Alt+R"),
-            r#"{"position":[x,y]?,"size":[w,h]=[400,200],"clip":id?}"#,
+            r#"{"position":[x,y]?,"size":[w,h]=[400,200],"clip":id?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| new_shape_cmd(s, p, "rectangle"),
         ),
@@ -595,7 +826,7 @@ fn menu_commands() -> Vec<CommandSpec> {
             "Ellipse",
             &["Graphics and Titles", "New Layer"],
             Some("Cmd+Alt+E"),
-            r#"{"position":[x,y]?,"size":[w,h]=[400,200],"clip":id?}"#,
+            r#"{"position":[x,y]?,"size":[w,h]=[400,200],"clip":id?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| new_shape_cmd(s, p, "ellipse"),
         ),
@@ -604,7 +835,7 @@ fn menu_commands() -> Vec<CommandSpec> {
             "Polygon",
             &["Graphics and Titles", "New Layer"],
             None,
-            r#"{"position":[x,y]?,"size":[w,h]=[300,300],"sides":n=6,"clip":id?}"#,
+            r#"{"position":[x,y]?,"size":[w,h]=[300,300],"sides":n=6,"clip":id?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| {
                 let mut q = if p.is_object() { p.clone() } else { json!({}) };
@@ -620,7 +851,7 @@ fn menu_commands() -> Vec<CommandSpec> {
                     props.insert("sides".into(), json!(n));
                     let ph = s.playhead();
                     let before = s.history.undo.len();
-                    set_props(s, clip, ei, &props, ph, "Change Graphic Property")?;
+                    set_props(s, clip, ei, &props, ph, "Change Graphic Property", None)?;
                     if s.history.undo.len() > before {
                         s.history.undo.pop();
                     }
@@ -649,17 +880,17 @@ fn menu_commands() -> Vec<CommandSpec> {
                     return Err(bad("graphics.newFromFile", "the file has no picture"));
                 }
                 let (name, dur) = (pi.name.clone(), pi.duration());
-                let clip = place_video_clip(s, &name, p, "New Layer from File", Vec::new(), move |_, _| (item, dur))?;
+                let clip = place_video_clip(s, "graphics.newFromFile", &name, p, "New Layer from File", Vec::new(), move |_, _| (item, dur))?;
                 s.state.graphic_layers.clear();
                 Ok(json!({"clip": clip.0, "item": item.0}))
             },
         ),
-        align_cmd!("graphics.alignFrame.left", "Left", F, "left", AlignTo::Frame, has_graphic),
-        align_cmd!("graphics.alignFrame.hcenter", "Center Horizontally", F, "hcenter", AlignTo::Frame, has_graphic),
-        align_cmd!("graphics.alignFrame.right", "Right", F, "right", AlignTo::Frame, has_graphic),
-        align_cmd!("graphics.alignFrame.top", "Top", F, "top", AlignTo::Frame, has_graphic),
-        align_cmd!("graphics.alignFrame.vcenter", "Center Vertically", F, "vcenter", AlignTo::Frame, has_graphic),
-        align_cmd!("graphics.alignFrame.bottom", "Bottom", F, "bottom", AlignTo::Frame, has_graphic),
+        align_cmd!("graphics.alignFrame.left", "Left", F, "left", AlignTo::Frame, has_graphic_or_clip),
+        align_cmd!("graphics.alignFrame.hcenter", "Center Horizontally", F, "hcenter", AlignTo::Frame, has_graphic_or_clip),
+        align_cmd!("graphics.alignFrame.right", "Right", F, "right", AlignTo::Frame, has_graphic_or_clip),
+        align_cmd!("graphics.alignFrame.top", "Top", F, "top", AlignTo::Frame, has_graphic_or_clip),
+        align_cmd!("graphics.alignFrame.vcenter", "Center Vertically", F, "vcenter", AlignTo::Frame, has_graphic_or_clip),
+        align_cmd!("graphics.alignFrame.bottom", "Bottom", F, "bottom", AlignTo::Frame, has_graphic_or_clip),
         align_cmd!("graphics.alignGroup.left", "Left", G, "left", AlignTo::FrameGroup, has_two_layers),
         align_cmd!("graphics.alignGroup.hcenter", "Center Horizontally", G, "hcenter", AlignTo::FrameGroup, has_two_layers),
         align_cmd!("graphics.alignGroup.right", "Right", G, "right", AlignTo::FrameGroup, has_two_layers),
@@ -753,7 +984,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Text",
             &["Graphics and Titles", "New Layer"],
             Some("Cmd+T"),
-            r#"{"text":str="New Text","position":[x,y]?,"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"boxWidth":px?,"topLeft":bool?,"seconds":f64=5,"track":index?,"time":ticks?} (boxWidth: paragraph text wrapping at that width; topLeft: position is the text's top-left corner, as a box dragged with the Type tool)"#,
+            r#"{"text":str="New Text","position":[x,y]? (point text: its alignment point on the first baseline; with `box`: the box's top-left corner),"box":[w,h]? (paragraph text wrapped in a box this size),"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"boxWidth":px?,"topLeft":bool?,"seconds":f64=5,"track":index?,"time":ticks?} (boxWidth: paragraph text wrapping at that width, as tall as its lines; topLeft: position is the text's top-left corner as Premiere measures it, as a box dragged with the Type tool)"#,
             has_seq,
             |s, p| {
                 let text = str_p(p, "text").unwrap_or("New Text").to_string();
@@ -763,26 +994,31 @@ pub fn commands() -> Vec<CommandSpec> {
                 let (w, h) = s.active_sequence().map(|q| (q.settings.width, q.settings.height)).unwrap_or((1920, 1080));
                 let pos = vec2_p(p, "position").unwrap_or(Vec2::new(w as f64 / 2.0, h as f64 / 2.0));
                 let size = f64_p(p, "size").unwrap_or(100.0);
-                let mut layer = if p.get("vertical").and_then(Value::as_bool) == Some(true) {
-                    graphic::new_vertical_text_layer(&text, pos, size)
-                } else {
-                    new_text_layer(&text, pos, size)
-                };
-                layer.params.insert("ligatures".into(), filmcraft_project::Param::new(ParamValue::Bool(gp.ligatures)));
+                let vertical = p.get("vertical").and_then(Value::as_bool) == Some(true);
+                let mut layer = if vertical { graphic::new_vertical_text_layer(&text, pos, size) } else { new_text_layer(&text, pos, size) };
+                // paragraph text in a box this size, its position the box's top-left corner: the
+                // layer is measured from that corner, as Premiere places a text box
+                if let Some(b) = vec2_p(p, "box").filter(|_| !vertical) {
+                    for (id, v) in [("box_width", b.x), ("box_height", b.y)] {
+                        layer.params.insert(id.into(), Param::new(ParamValue::Float(v.clamp(1.0, 100_000.0))));
+                    }
+                    layer.params.insert("top_left_origin".into(), Param::new(ParamValue::Bool(true)));
+                }
+                layer.params.insert("ligatures".into(), Param::new(ParamValue::Bool(gp.ligatures)));
                 if !gp.default_font.trim().is_empty() {
-                    layer.params.insert("font".into(), filmcraft_project::Param::new(ParamValue::Text(gp.default_font.trim().into())));
+                    layer.params.insert("font".into(), Param::new(ParamValue::Text(gp.default_font.trim().into())));
                 }
                 for (k, id) in [("font", "font"), ("fontStyle", "font_style")] {
                     if let Some(v) = str_p(p, k) {
-                        layer.params.insert(id.into(), filmcraft_project::Param::new(ParamValue::Text(v.into())));
+                        layer.params.insert(id.into(), Param::new(ParamValue::Text(v.into())));
                     }
                 }
                 // a text box (Type tool drag): paragraph text, its position the box's top-left corner
                 if let Some(w) = f64_p(p, "boxWidth").filter(|w| w.is_finite() && *w > 0.0) {
-                    layer.params.insert("box_width".into(), filmcraft_project::Param::new(ParamValue::Float(w.min(100_000.0))));
+                    layer.params.insert("box_width".into(), Param::new(ParamValue::Float(w.min(100_000.0))));
                 }
                 if p.get("topLeft").and_then(Value::as_bool) == Some(true) {
-                    layer.params.insert("top_left_origin".into(), filmcraft_project::Param::new(ParamValue::Bool(true)));
+                    layer.params.insert("top_left_origin".into(), Param::new(ParamValue::Bool(true)));
                 }
                 let into = if p.get("newClip").and_then(Value::as_bool) == Some(true) { None } else { u64_p(p, "clip").map(ClipId) };
                 let into = into.filter(|c| s.active_sequence().is_some_and(|q| is_graphic(s, q, *c)));
@@ -790,7 +1026,7 @@ pub fn commands() -> Vec<CommandSpec> {
                     Some(c) => (c, add_layer(s, c, layer)?),
                     None => {
                         let name = text.lines().next().filter(|l| !l.trim().is_empty()).unwrap_or("Graphic").to_string();
-                        (new_graphic_clip(s, layer, &name, p)?, 0)
+                        (new_graphic_clip(s, "graphics.newText", layer, &name, p)?, 0)
                     }
                 };
                 Ok(json!({"clip": clip.0, "layer": layer_i}))
@@ -801,7 +1037,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Shape",
             &[],
             None,
-            r#"{"shape":"rectangle|ellipse|polygon|path","position":[x,y]?,"size":[w,h]=[400,200],"points":[[x,y],…]?,"clip":id?,"seconds":f64=5}"#,
+            r#"{"shape":"rectangle|ellipse|polygon|path","position":[x,y]? (the shape's centre),"size":[w,h]=[400,200],"points":[[x,y],…]?,"clip":id? (add the shape to this graphic),"seconds":f64=5,"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| {
                 let shape = str_p(p, "shape").unwrap_or("rectangle").to_ascii_lowercase();
@@ -824,7 +1060,7 @@ pub fn commands() -> Vec<CommandSpec> {
                 let into = u64_p(p, "clip").map(ClipId).filter(|c| s.active_sequence().is_some_and(|q| is_graphic(s, q, *c)));
                 let (clip, layer_i) = match into {
                     Some(c) => (c, add_layer(s, c, layer)?),
-                    None => (new_graphic_clip(s, layer, "Shape", p)?, 0),
+                    None => (new_graphic_clip(s, "graphics.newShape", layer, "Shape", p)?, 0),
                 };
                 Ok(json!({"clip": clip.0, "layer": layer_i}))
             },
@@ -844,7 +1080,7 @@ pub fn commands() -> Vec<CommandSpec> {
                 let mut props = serde_json::Map::new();
                 props.insert("text".into(), Value::String(text));
                 let ph = s.playhead();
-                set_props(s, clip, ei, &props, ph, "Edit Text")?;
+                set_props(s, clip, ei, &props, ph, "Edit Text", None)?;
                 if merge && s.history.undo.len() >= 2 {
                     // keep the snapshot from before the typing session
                     s.history.undo.pop();
@@ -857,16 +1093,30 @@ pub fn commands() -> Vec<CommandSpec> {
             "Set Graphic Properties",
             &[],
             None,
-            r##"{"clip":id?,"layer":n|name?,"props":{"font":"Inter","font_style":"Bold","size":120,"align":"center","tracking":50,"leading":0,"fill_color":"#ffcc00","stroke":true,"stroke_width":6,"background":true,"shadow":true,"position":[x,y],"scale":100,"rotation":0,"opacity":100,…},"time":ticks?}"##,
+            r##"{"clip":id?,"layer":n|name?,"props":{"font":"Inter","font_style":"Bold","size":120,"align":"center","tracking":50,"leading":0,"fill_color":"#ffcc00","stroke":true,"stroke_width":6,"background":true,"shadow":true,"position":[x,y],"scale":100,"rotation":0,"opacity":100,…},"time":ticks?,"merge":bool?,"begin":bool?}"##,
             has_graphic,
             |s, p| {
                 let clip = target_clip(s, p).ok_or_else(|| bad("graphics.set", "no graphic clip"))?;
                 let (_, ei) = layer_effect_index(s, clip, p)?;
                 let props = p.get("props").and_then(Value::as_object).ok_or_else(|| bad("graphics.set", "need `props`"))?.clone();
                 let tl = time_p(s, p, "").unwrap_or_else(|| s.playhead());
-                set_props(s, clip, ei, &props, tl, "Change Graphic Property")?;
+                // `merge`: a drag of a property is one undo step; `begin` starts a new one (#201)
+                let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("graphics.set:{}:{ei}", clip.0));
+                if bool_p(p, "begin").unwrap_or(false) {
+                    s.history.merge_key = None;
+                }
+                set_props(s, clip, ei, &props, tl, "Change Graphic Property", merge.as_deref())?;
                 Ok(Value::Null)
             },
+        ),
+        spec(
+            "graphics.setTextType",
+            "Text Layer Type",
+            &[],
+            None,
+            r#"{"clip":id?,"layer":n|name?,"type":"point|paragraph" (point: no box, handles scale the text; paragraph: the text wraps in a box that handles resize)}"#,
+            has_graphic,
+            set_text_type,
         ),
         spec("graphics.selectLayer", "Select Graphic Layer", &[], None, r#"{"clip":id?,"layers":[n]}"#, has_graphic, |s, p| {
             let clip = target_clip(s, p).ok_or_else(|| bad("graphics.selectLayer", "no graphic clip"))?;
