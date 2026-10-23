@@ -137,6 +137,33 @@ fn pan_laws() {
     assert!(close(l[5], 0.5 * bl, 1e-6) && close(r[5], 0.5 * br, 1e-6) && br == 1.0 && bl < 0.6);
 }
 
+/// A mono clip on a stereo track pans as Premiere's mono clip Panner does: 3 dB down on each side
+/// when centred, 0 dB on one side when hard left or right (Round 5 B3: a centred −20 dBFS mono
+/// tone plays at −23.01 dB per side). On a mono track only the track pans, once.
+#[test]
+fn mono_clips_pan_with_the_constant_power_law() {
+    let centre = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+    let mut r = Rig::with_channels(&[dc], 1);
+    let [l, rr] = r.mix(0, 64);
+    assert!(close(l[5], centre, 1e-6) && close(rr[5], centre, 1e-6), "{} {}", l[5], rr[5]);
+    let balance = |r: &mut Rig, v: f64| r.track(0).items[0].effect_mut("panner").and_then(|e| e.param_mut("balance")).unwrap().value = ParamValue::Float(v);
+    balance(&mut r, -100.0);
+    let [l, rr] = r.mix(0, 64);
+    assert!(close(l[5], 0.5, 1e-6) && rr[5].abs() < 1e-6, "{} {}", l[5], rr[5]);
+    // a mono track pans its sum with the same law, and the clip is not panned again
+    balance(&mut r, 0.0);
+    r.track(0).channels = AudioChannels::Mono;
+    let [l, rr] = r.mix(0, 64);
+    assert!(close(l[5], centre, 1e-6) && close(rr[5], centre, 1e-6), "{} {}", l[5], rr[5]);
+    // a stereo clip is balanced (unity at the centre); one channel of it picked is a mono clip
+    let mut s = Rig::new(&[dc]);
+    let [l, rr] = s.mix(0, 64);
+    assert!(close(l[5], 0.5, 1e-7) && close(rr[5], 0.5, 1e-7));
+    s.track(0).items[0].source_channels = vec![1];
+    let [l, rr] = s.mix(0, 64);
+    assert!(close(l[5], centre, 1e-6) && close(rr[5], centre, 1e-6), "{} {}", l[5], rr[5]);
+}
+
 #[test]
 fn volume_automation_is_sample_accurate_and_block_invariant() {
     let mut r = Rig::new(&[dc]);

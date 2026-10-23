@@ -6,7 +6,9 @@
 //! Rs): their clips play the source's first six channels (or the six `source_channels` picked with
 //! Modify ▸ Audio Channels); mono and stereo sources on a 5.1 track are upmixed onto the front
 //! speakers ([`filmcraft_audio_dsp::channels`]). The clip Panner (stereo balance) does not apply to
-//! 5.1 clips, and Channel Volume's left/right levels apply to L and R.
+//! 5.1 clips, and Channel Volume's left/right levels apply to L and R. On a stereo track the Panner
+//! of a mono clip pans it with the −3 dB law (as Premiere does: a centred mono clip plays 3 dB down
+//! on each side), that of a stereo clip balances it (unity at the centre).
 
 use std::collections::HashMap;
 
@@ -97,8 +99,12 @@ pub(crate) fn track_input_at(
     depth: u32,
 ) -> AudioBuffer {
     let w = crate::mixer::width_of(track.channels);
-    let live =
-        ClipLive { vol: ovs.get(&(track.id, CLIP_LANE_VOLUME.to_string())).copied(), pan: ovs.get(&(track.id, CLIP_LANE_PAN.to_string())).copied(), depth };
+    let live = ClipLive {
+        vol: ovs.get(&(track.id, CLIP_LANE_VOLUME.to_string())).copied(),
+        pan: ovs.get(&(track.id, CLIP_LANE_PAN.to_string())).copied(),
+        mono_law: track.channels == AudioChannels::Stereo,
+        depth,
+    };
     let range = TimeRange::from_bounds(Tick::from_units(start, sr as i64), Tick::from_units(start + frames as i64, sr as i64));
     let mut tbuf = AudioBuffer::silence(sr, w, frames);
     for item in track.items.iter().filter(|i| i.enabled && i.range().overlaps(&range)) {
@@ -170,6 +176,8 @@ fn with_handles(item: &TrackItem, t0: Tick, t1: Tick) -> TrackItem {
 struct ClipLive {
     vol: Option<Override>,
     pan: Option<Override>,
+    /// Whether mono clips pan with the −3 dB law (on a stereo track; a mono track pans its sum).
+    mono_law: bool,
     /// How many nested sequences deep this track is ([`crate::MAX_NEST_DEPTH`] ends the descent).
     depth: u32,
 }
@@ -207,6 +215,10 @@ fn mix_item(
     }
     let w = out.channels.len();
     let n = (a1 - a0) as usize;
+    // a mono clip (one source channel on both sides) on a stereo track pans as Premiere's mono
+    // clip Panner does, along the −3 dB constant-power curve: −3 dB on each side when centred,
+    // 0 dB on one side when hard left or right
+    let mut mono = false;
     let buf = if let Some(nested) = project.sequence(item.item) {
         // Past the depth limit a nest is silent, like its picture is empty, so a sequence that
         // contains itself (a damaged project; the editor refuses to make one) cannot recurse
@@ -230,8 +242,15 @@ fn mix_item(
         if !src.info().has_audio() {
             return;
         }
+        mono = w == 2
+            && live.mono_law
+            && src.info().audio_streams.get(item.audio_stream).is_some_and(|s| {
+                let (left, right) = source_pair(item, s.channels as usize);
+                left == right
+            });
         effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, w)
     };
+    let law = if mono { crate::mixer::pan_law_mono } else { pan_gains };
     // gains: clip gain × Volume (keyframed, per 64-sample block) × channel volume × panner
     let clip_gain = db_to_gain(item.gain_db);
     let vol = item.effect("volume").filter(|e| e.enabled && !e.param("bypass").and_then(|p| p.value.as_bool()).unwrap_or(false));
@@ -255,8 +274,8 @@ fn mix_item(
         let (cl, cr) = chv.map(|e| (db_to_gain(e.f64_at("left", mt)), db_to_gain(e.f64_at("right", mt)))).unwrap_or((1.0, 1.0));
         let balance = |auto: f64| live.pan.map(|o| o.at(t_tl, auto)).unwrap_or(auto);
         let (pl, pr) = match pan {
-            Some(e) => pan_gains((balance(e.f64_at("balance", mt)) / 100.0) as f32),
-            None if live.pan.is_some() => pan_gains((balance(0.0) / 100.0) as f32),
+            Some(e) => law((balance(e.f64_at("balance", mt)) / 100.0) as f32),
+            None if live.pan.is_some() || mono => law((balance(0.0) / 100.0) as f32),
             None => (1.0, 1.0),
         };
         let g = clip_gain * v * extra;

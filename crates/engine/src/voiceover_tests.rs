@@ -33,6 +33,11 @@ fn mix(s: &Session, start: i64, n: usize) -> Vec<Vec<f32>> {
     filmcraft_render::audio::mix_sequence(&s.project, s.active_sequence().unwrap(), start, n, &provider).channels
 }
 
+/// The gain a take (recorded mono) plays at, centred on a stereo track: the −3 dB pan law.
+fn centre() -> f32 {
+    filmcraft_render::mixer::pan_law_mono(0.0).0
+}
+
 fn track_clips(s: &Session, i: usize) -> Vec<filmcraft_project::TrackItem> {
     s.active_sequence().unwrap().audio_tracks[i].items.clone()
 }
@@ -54,7 +59,7 @@ fn a_failed_recording_save_keeps_the_take_for_retry() {
     assert!(!s.voiceover.recording());
     assert_eq!(track_clips(&s, index).len(), 1);
     let audio = mix(&s, 0, 48000);
-    assert!(audio[0][0] > 0.49, "retry retained the first captured sample");
+    assert!(audio[0][0] > 0.49 * centre(), "retry retained the first captured sample");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -130,7 +135,7 @@ fn recording_lands_sample_accurately_after_the_preroll() {
     let m = mix(&s, 90_000, 84_000);
     for (i, &x) in m[0].iter().enumerate() {
         let t = 90_000 + i as i64;
-        let want = if (96_000..168_000).contains(&t) && (t - 48_000) % 12_000 == 0 { 0.5 } else { 0.0 };
+        let want = if (96_000..168_000).contains(&t) && (t - 48_000) % 12_000 == 0 { 0.5 * centre() } else { 0.0 };
         assert!((x - want).abs() < 1e-6, "sample {t}: {x} vs {want}");
     }
     // undo / redo
@@ -166,7 +171,7 @@ fn punch_in_records_between_in_and_out_only() {
     // clip sample 0 = capture sample 24 000 (0.5 s pre-roll)
     let m = mix(&s, 48_000, 48_000);
     for (i, &x) in m[0].iter().enumerate().step_by(997) {
-        assert!((x - (24_000 + i) as f32 * 1e-6).abs() < 1e-6, "sample {i}: {x}");
+        assert!((x - (24_000 + i) as f32 * 1e-6 * centre()).abs() < 1e-6, "sample {i}: {x}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

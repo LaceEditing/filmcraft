@@ -13,9 +13,9 @@
 //! Mapped: the bin tree, media (path, picture size, frame rate, sample rate, channels), sequences
 //! (frame size, rate, sample rate, track names), clips (position, source in point, speed,
 //! reverse, frame holds), nested sequences, video/audio links, transitions, Motion, Opacity and
-//! clip volume with keyframes and easing, effects FilmCraft has under the same name (their numeric,
-//! boolean and point parameters), and markers on media and sequences. Everything else is listed
-//! in the [`Report`].
+//! clip volume with keyframes and easing, clip pan, audio tracks' channel format, volume and pan,
+//! the Mix volume, effects FilmCraft has under the same name (their numeric, boolean and point
+//! parameters), and markers on media and sequences. Everything else is listed in the [`Report`].
 //!
 //! For round trips, every clip remembers the Premiere track item it came from
 //! ([`filmcraft_project::TrackItem::origin`]), media items and sequences their Premiere UIDs in
@@ -586,7 +586,16 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                     t.name = name.to_string();
                 }
                 self.track(&mut seq, kind, ti, track, frame);
+                if kind == TrackKind::Audio {
+                    self.track_mix(&mut seq, ti, track);
+                }
             }
+        }
+        // the Mix's fader
+        if let Some(mix) = prproj_graph::track_group(&self.ix, node, "AudioTrackGroup").and_then(|g| self.ix.follow(g, &["MasterTrack"]))
+            && let Some(db) = self.fader_db(mix)
+        {
+            seq.master_volume_db = db;
         }
         if seq.video_tracks.is_empty() {
             self.b.ensure_tracks(&mut seq, TrackKind::Video, 1);
@@ -622,6 +631,45 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         for t in transitions {
             self.transition(seq, kind, ti, t);
         }
+    }
+
+    /// An audio track's Audio Track Mixer settings: its channel format (a mono track pans its sum
+    /// with the −3 dB law), its fader and its pan.
+    fn track_mix(&mut self, seq: &mut Sequence, ti: usize, track: Node<'a, 'i>) {
+        let volume = self.fader_db(track);
+        let pan = self.ix.follow(track, &["AudioTrack", "Panner"]).and_then(|p| pan_param(&self.ix, p));
+        if pan.as_ref().is_some_and(|p| !p.keyframes.is_empty()) {
+            self.report.info("track pan automation was imported as its first value");
+        }
+        let Some(t) = seq.audio_tracks.get_mut(ti) else { return };
+        // a track's `ChannelType` is saved only for a mono track (0); the others are stereo
+        if path_text(track, &["AudioTrack", "ChannelType"]).map(str::trim) == Some("0") {
+            t.channels = filmcraft_project::AudioChannels::Mono;
+        }
+        if let Some(db) = volume {
+            t.volume_db = db;
+        }
+        if let Some(ParamValue::Float(v)) = pan.map(|p| p.value) {
+            t.pan = v;
+        }
+    }
+
+    /// The level of a track's (or the Mix's) fader in dB: its `Volume`, saved as a linear gain
+    /// (1 is 0 dB and, as every audio setting at 1, is saved with no value). `None` at 0 dB.
+    fn fader_db(&mut self, track: Node<'a, 'i>) -> Option<f64> {
+        let chain = self.ix.follow(track, &["AudioTrack", "ComponentOwner", "Components"])?;
+        let fader = prproj_fx::chain(&self.ix, chain).into_iter().find(|c| c.node.has_tag_name("AudioFader"))?;
+        let volume = fader.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim() == "Volume"))?;
+        let c = prproj_fx::decode(volume, prproj_fx::Conv::Float)?;
+        if !c.keys.is_empty() {
+            self.report.info("track volume automation was imported as its first value");
+        }
+        let gain = match c.keys.first().map_or(&c.value, |k| &k.v) {
+            prproj_fx::Val::F(g) => *g,
+            _ => return None,
+        };
+        let db = if gain > 0.0 { 20.0 * gain.log10() } else { f64::NEG_INFINITY };
+        Some(db.clamp(filmcraft_project::mixer::FADER_MIN_DB, filmcraft_project::mixer::FADER_MAX_DB))
     }
 
     fn clip(&mut self, item: Node<'a, 'i>, kind: TrackKind, frame: (f64, f64)) -> Option<filmcraft_project::TrackItem> {
@@ -688,6 +736,14 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let ctx = Ctx { speed: ti.speed, frame, src: self.source_frame(target).unwrap_or(frame) };
         if let Some(chain) = self.ix.follow(item, &["ClipTrackItem", "ComponentOwner", "Components"]) {
             self.components(&mut ti, chain, &ctx);
+        }
+        // the clip's Panner (Balance of a stereo clip, Pan of a mono one); a clip whose pan was
+        // never changed has none
+        if kind == TrackKind::Audio
+            && let Some(p) = self.ix.follow(item, &["Panner"]).and_then(|n| pan_param(&self.ix, n))
+            && (!p.keyframes.is_empty() || p.value != ParamValue::Float(0.0))
+        {
+            set_param(&mut ti, "panner", "balance", p);
         }
         Some(ti)
     }
@@ -979,6 +1035,18 @@ pub(crate) fn label_props(label: Label) -> (String, u32) {
     };
     let [r, g, b] = label.rgb();
     (format!("BE.Prefs.LabelColors.{n}"), seen.unwrap_or(u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16))
+}
+
+/// A Premiere panner's setting (`Balance` of a `StereoToStereoPanProcessor`, `Pan` of a
+/// `MonoToStereoPanProcessor`) on FilmCraft's −100…100. Saved 0…1 with the centre at 0.5; hard
+/// right (1) is saved with no value, as every audio setting at the top of its range.
+fn pan_param<'a, 'i>(ix: &Index<'a, 'i>, panner: Node<'a, 'i>) -> Option<Param> {
+    const PAN: prproj_fx::Conv = prproj_fx::Conv::Lin(-100.0, 100.0);
+    let c = prproj_fx::component(ix, child(panner, "PanProcessor")?)?;
+    let p = c.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| matches!(n.trim(), "Balance" | "Pan")))?;
+    let canon = prproj_fx::decode(p, PAN)?;
+    // (a pan is a number: no frame size is used)
+    Some(prproj_fx::to_param(&canon, PAN, &Ctx { speed: 1.0, frame: (0.0, 0.0), src: (0.0, 0.0) }))
 }
 
 pub(crate) fn clip_gain_db(clip: Node<'_, '_>) -> f64 {
