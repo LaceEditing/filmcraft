@@ -540,6 +540,9 @@ pub(crate) struct Key {
     pub kind: (u8, u8),
     /// (in, out) influence.
     pub infl: (f64, f64),
+    /// (in, out) speed relative to the straight line of the segment on that side (1 = its own
+    /// speed, 0 = flat): Premiere stores speeds in the value's units per second (`f4`, `f6`).
+    pub slope: (Option<f64>, Option<f64>),
     /// The key's original text, reused when the key is written back unchanged.
     pub raw: Option<String>,
 }
@@ -641,12 +644,25 @@ pub(crate) fn decode(p: Node<'_, '_>, conv: Conv) -> Option<Canon> {
                 v,
                 kind: (code(2), code(3)),
                 infl: (num_at(5).unwrap_or(0.0), num_at(7).unwrap_or(0.0)),
+                // the stored speeds for now; made relative to their segments below
+                slope: (num_at(4), num_at(6)),
                 raw: Some(raw.trim().to_string()),
             });
         }
     }
     keys.sort_by_key(|k| k.t);
     keys.dedup_by_key(|k| k.t);
+    let unit = speed_unit(p);
+    let slopes: Vec<_> = (0..keys.len())
+        .map(|i| {
+            let (key, before, after) = (keys.get(i), i.checked_sub(1).and_then(|j| keys.get(j)), keys.get(i + 1));
+            let side = |speed: Option<f64>, a: Option<&Key>, b: Option<&Key>| speed.zip(a.zip(b)).and_then(|(s, (a, b))| segment_slope(s, unit, a, b));
+            key.map_or((None, None), |k| (side(k.slope.0, before, Some(k)), side(k.slope.1, Some(k), after)))
+        })
+        .collect();
+    for (k, s) in keys.iter_mut().zip(slopes) {
+        k.slope = s;
+    }
     // an audio effect setting at 1 (the top of its 0…1 range) is saved with no value at all
     let audio_top = || {
         (matches!(conv, Conv::Lin(..) | Conv::Sq(..) | Conv::Ratio | Conv::FxDb | Conv::Flag(_) | Conv::Slope)
@@ -657,8 +673,42 @@ pub(crate) fn decode(p: Node<'_, '_>, conv: Conv) -> Option<Canon> {
     Some(Canon { value, keys })
 }
 
+/// The units Premiere stores a parameter's keyframe speeds in, per second: the value's own, except
+/// Motion's Scale, whose speeds are tenths (a straight 100 → 300 % ramp over 2 s stores 10).
+fn speed_unit(p: Node<'_, '_>) -> f64 {
+    match child_text(p, "Name").map(str::trim) {
+        Some("Scale" | "Scale Width") => 10.0,
+        _ => 1.0,
+    }
+}
+
+/// How far apart two keyframe values are: a number's difference, a point's distance.
+fn distance(a: &Val, b: &Val) -> Option<f64> {
+    match (a, b) {
+        (Val::F(x), Val::F(y)) => Some((y - x).abs()),
+        (Val::P(x1, y1), Val::P(x2, y2)) => Some((x2 - x1).hypot(y2 - y1)),
+        _ => None,
+    }
+}
+
+/// A stored `speed` (in `unit`s per second) on the segment from `a` to `b`, relative to the
+/// segment's straight-line speed. Speeds point along the segment (their sign is not used).
+fn segment_slope(speed: f64, unit: f64, a: &Key, b: &Key) -> Option<f64> {
+    let dt = b.t.saturating_sub(a.t) as f64 / crate::prproj_graph::TICKS_PER_SECOND as f64;
+    let dv = distance(&a.v, &b.v)?;
+    (dt > 0.0 && dv > 1e-12).then(|| speed.abs() * unit * dt / dv).filter(|m| m.is_finite())
+}
+
+/// The inverse of [`segment_slope`]: the speed Premiere stores for `slope` on that segment.
+fn segment_speed(slope: f64, unit: f64, a: &Key, b: &Key) -> f64 {
+    let dt = b.t.saturating_sub(a.t) as f64 / crate::prproj_graph::TICKS_PER_SECOND as f64;
+    let speed = distance(&a.v, &b.v).map_or(0.0, |dv| slope * dv / dt / unit);
+    if dt > 0.0 && speed.is_finite() { speed } else { 0.0 }
+}
+
 fn interp_of(kind: (u8, u8)) -> Interpolation {
     match kind {
+        (4, _) => Interpolation::Hold,
         (5, 2) => Interpolation::AutoBezier,
         (5, 4) => Interpolation::ContinuousBezier,
         (5, _) => Interpolation::Bezier,
@@ -668,7 +718,8 @@ fn interp_of(kind: (u8, u8)) -> Interpolation {
 
 fn kind_of(i: Interpolation) -> (u8, u8) {
     match i {
-        Interpolation::Linear | Interpolation::Hold => (0, 0),
+        Interpolation::Linear => (0, 0),
+        Interpolation::Hold => (4, 0),
         Interpolation::Bezier | Interpolation::EaseIn | Interpolation::EaseOut => (5, 0),
         Interpolation::AutoBezier => (5, 2),
         Interpolation::ContinuousBezier => (5, 4),
@@ -737,6 +788,11 @@ pub(crate) fn to_param(c: &Canon, conv: Conv, ctx: &Ctx) -> Param {
                 kf.out_influence = k.infl.1.min(1.0);
             }
         }
+        // a Bézier key's handles carry its speeds (Auto and Continuous Bézier speeds are
+        // Premiere's own to work out again, so theirs are not used)
+        if kf.interp == Interpolation::Bezier {
+            (kf.in_slope, kf.out_slope) = k.slope;
+        }
         p.keyframes.push(kf);
     }
     p.keyframes.sort_by_key(|k| k.time);
@@ -757,6 +813,14 @@ pub(crate) fn from_param(p: &Param, conv: Conv, ctx: &Ctx) -> Option<Canon> {
             v: from_value(&k.value, conv, ctx)?,
             kind: kind_of(k.interp),
             infl: if k.interp == Interpolation::Linear { (0.0, 0.0) } else { (k.in_influence, k.out_influence) },
+            slope: match k.interp {
+                Interpolation::Bezier => (k.in_slope, k.out_slope),
+                // FilmCraft's presets as Premiere Bézier keys: flat on the eased side, the line's
+                // own speed on the other
+                Interpolation::EaseIn => (Some(0.0), Some(1.0)),
+                Interpolation::EaseOut => (Some(1.0), Some(0.0)),
+                _ => (None, None),
+            },
             raw: None,
         });
     }
@@ -779,7 +843,9 @@ fn same_val(a: &Val, b: &Val) -> bool {
 }
 
 fn same_key(a: &Key, b: &Key, tol: i64) -> bool {
-    let kinds = (a.kind.0 == 5) == (b.kind.0 == 5) && (a.kind.0 != 5 || a.kind.1 == b.kind.1);
+    // Hold (4) and Bézier (5) are told apart; other codes all read as Linear
+    let family = |k: &Key| if matches!(k.kind.0, 4 | 5) { k.kind.0 } else { 0 };
+    let kinds = family(a) == family(b) && (a.kind.0 != 5 || a.kind.1 == b.kind.1);
     let infl = a.kind.0 != 5 || (close(a.infl.0, b.infl.0) && close(a.infl.1, b.infl.1));
     (a.t - b.t).abs() <= tol && same_val(&a.v, &b.v) && kinds && infl
 }
@@ -861,13 +927,39 @@ pub(crate) fn encode(original: Node<'_, '_>, pr: Option<&Canon>, fc: &Canon, ctx
         }
         None => format!("{STATIC_TIME},{},0,0,0,0,0,0", fmt_key_val(value, float)),
     };
+    let unit = speed_unit(original);
     let keyframes = (!fc.keys.is_empty()).then(|| {
         let mut s = String::new();
-        for k in &fc.keys {
+        for (i, k) in fc.keys.iter().enumerate() {
             let reuse = pr.and_then(|pr| pr.keys.iter().find(|o| same_key(o, k, ctx.tolerance()))).and_then(|o| o.raw.clone());
+            // the handles' speeds, from their slopes on the segments either side (none: flat)
+            let speed = |slope: Option<f64>, a: Option<&Key>, b: Option<&Key>| match (slope, a, b) {
+                (Some(m), Some(a), Some(b)) => segment_speed(m, unit, a, b),
+                _ => 0.0,
+            };
+            let before = i.checked_sub(1).and_then(|j| fc.keys.get(j));
+            let (s_in, s_out) = (speed(k.slope.0, before, Some(k)), speed(k.slope.1, Some(k), fc.keys.get(i + 1)));
+            // a slope is relative to its segment, a stored speed absolute: when a neighbouring key
+            // moved, the unchanged key's text no longer holds its speed
+            let reuse = reuse.filter(|raw| {
+                let f: Vec<&str> = raw.split(',').collect();
+                let stored = |i: usize| f.get(i).and_then(|x| x.trim().parse::<f64>().ok()).unwrap_or(0.0);
+                let holds = |slope: Option<f64>, i: usize, want: f64| slope.is_none() || (stored(i).abs() - want.abs()).abs() <= 1e-6 * want.abs().max(1.0);
+                holds(k.slope.0, 4, s_in) && holds(k.slope.1, 6, s_out)
+            });
             match reuse {
                 Some(raw) => s.push_str(&raw),
-                None => s.push_str(&format!("{},{},{},{},0,{},0,{}", k.t, fmt_key_val(&k.v, float), k.kind.0, k.kind.1, num(k.infl.0), num(k.infl.1))),
+                None => s.push_str(&format!(
+                    "{},{},{},{},{},{},{},{}",
+                    k.t,
+                    fmt_key_val(&k.v, float),
+                    k.kind.0,
+                    k.kind.1,
+                    num(s_in),
+                    num(k.infl.0),
+                    num(s_out),
+                    num(k.infl.1)
+                )),
             }
             s.push(';');
         }

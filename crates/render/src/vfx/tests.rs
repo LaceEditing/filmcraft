@@ -676,6 +676,8 @@ fn write_on_follows_the_animated_brush() {
             interp: Interpolation::Linear,
             out_influence: 1.0 / 3.0,
             in_influence: 1.0 / 3.0,
+            out_slope: None,
+            in_slope: None,
         },
         Keyframe {
             time: Tick::from_seconds_f64(1.0),
@@ -683,6 +685,8 @@ fn write_on_follows_the_animated_brush() {
             interp: Interpolation::Linear,
             out_influence: 1.0 / 3.0,
             in_influence: 1.0 / 3.0,
+            out_slope: None,
+            in_slope: None,
         },
     ];
     // half way: painted from x=5 to x=20, not beyond

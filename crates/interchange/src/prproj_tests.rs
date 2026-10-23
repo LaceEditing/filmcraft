@@ -284,6 +284,47 @@ fn keyframes_of_a_stopped_stopwatch_do_not_play() {
     assert!(db[0].abs() < 1e-6 && (db[1] + 20.0).abs() < 1e-6, "{db:?}");
 }
 
+/// Premiere's keyframe handles carry a speed (in Scale's case, tenths of a percent per second):
+/// a Bézier key at the straight line's speed plays as a line, one with no speed on the arriving
+/// side eases in, and Hold holds. Written back, a key gets its speed recomputed for its segment.
+#[test]
+fn keyframe_speeds_and_hold_come_in_as_premiere_plays_them() {
+    let (t0, t1) = (10 * S, 12 * S);
+    let scale_keys = format!("<Keyframes>{t0},100,0,0,0,0.1,1.5,0.1;{t1},120,0,0,1.5,0.1,0,0.1;</Keyframes>");
+    let base = doc();
+    assert!(base.contains(&scale_keys));
+    let sixth = 1.0 / 6.0;
+    let with = |keys: String| base.replace(&scale_keys, &format!("<Keyframes>{keys}</Keyframes>"));
+    let scale_at = |doc: &str, secs: f64| {
+        let (imp, _) = import(doc.as_bytes(), Some("/edits/show"));
+        let seq = imp.project.sequences().next().and_then(|i| i.as_sequence()).unwrap();
+        let a = &seq.video_tracks[0].items[0];
+        let p = a.effect("motion").and_then(|e| e.params.get("scale")).unwrap();
+        p.f64_at(a.effect_time_at(a.start + Tick::from_seconds_f64(secs)))
+    };
+    // 20 % over 2 s is 10 %/s, stored as 1
+    let line = with(format!("{t0},100,5,0,0,{sixth},1,{sixth};{t1},120,5,0,1,{sixth},0,{sixth};"));
+    assert!((scale_at(&line, 1.0) - 110.0).abs() < 1e-6 && (scale_at(&line, 0.5) - 105.0).abs() < 1e-6, "{}", scale_at(&line, 0.5));
+    let ease_in = with(format!("{t0},100,5,0,0,{sixth},1,{sixth};{t1},120,5,0,0,0.33333333333333331,0,{sixth};"));
+    let half = scale_at(&ease_in, 1.0);
+    assert!((half - (100.0 + 20.0 * 0.635)).abs() < 0.2, "{half}");
+    let hold = with(format!("{t0},100,4,0,0,{sixth},0,{sixth};{t1},120,4,0,0,{sixth},0,{sixth};"));
+    assert_eq!((scale_at(&hold, 1.0), scale_at(&hold, 1.99)), (100.0, 100.0));
+
+    // edited in FilmCraft (the second key to 140): the line stays a line, its speed now 20 %/s
+    let (mut imp, _) = import(line.as_bytes(), Some("/edits/show"));
+    let sid = imp.project.sequences().next().map(|i| i.id).unwrap();
+    let a = &mut imp.project.sequence_mut(sid).unwrap().video_tracks[0].items[0];
+    let p = a.effect_mut("motion").and_then(|e| e.params.get_mut("scale")).unwrap();
+    p.keyframes[1].value = ParamValue::Float(140.0);
+    let (out, _) = crate::prproj_write::export(&imp.project, line.as_bytes(), &[], None).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    let written = out.lines().find(|l| l.contains("<Name>Scale</Name>")).unwrap_or_default();
+    assert!(written.contains(&format!("{t0},100,5,0,0,{sixth},2,")), "the leaving speed is now 2 (20 %/s) too: {written}");
+    assert!(written.contains(&format!("{t1},140,5,0,2,")), "the arriving speed is 2: {written}");
+    assert!((scale_at(&out, 1.0) - 120.0).abs() < 1e-6, "{}", scale_at(&out, 1.0));
+}
+
 #[test]
 fn media_without_a_project_folder_keeps_the_absolute_path() {
     let (imp, _) = import(doc().as_bytes(), None);

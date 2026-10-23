@@ -1,9 +1,10 @@
 //! Keyframed parameters.
 //!
 //! A parameter is a static value or a list of keyframes (at the clip's media time: where its
-//! `source_in` is, so trims leave them in place). Interpolation per
-//! keyframe governs the segment leaving it: Linear, Hold, Bezier (with influence/speed handles),
-//! Auto Bezier, Continuous Bezier, Ease In/Out (Bezier presets) — Premiere's temporal set.
+//! `source_in` is, so trims leave them in place). A keyframe's interpolation shapes both sides of
+//! it, as in Premiere (Hold: the segment leaving it holds): Linear, Hold, Bezier (with
+//! influence/speed handles), Auto Bezier, Continuous Bezier, Ease In/Out (Bezier presets) —
+//! Premiere's temporal set.
 
 use filmcraft_geom::Vec2;
 use filmcraft_time::Tick;
@@ -147,13 +148,20 @@ pub struct Keyframe {
     /// timeline time).
     pub time: Tick,
     pub value: ParamValue,
-    /// Interpolation of the segment leaving this keyframe.
+    /// Interpolation on both sides of this keyframe (Hold: of the segment leaving it).
     pub interp: Interpolation,
     /// Temporal ease: influence (0..1) of the outgoing/incoming handles.
     #[serde(default = "default_influence")]
     pub out_influence: f64,
     #[serde(default = "default_influence")]
     pub in_influence: f64,
+    /// Speed of the value leaving / reaching this keyframe, relative to the straight line between
+    /// it and the next / previous one (1 = the line's own speed, 0 = an ease: a flat handle). From
+    /// a Premiere project's Bézier keyframes, whose handles carry a speed; None is an ease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_slope: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_slope: Option<f64>,
 }
 
 fn default_influence() -> f64 {
@@ -162,7 +170,15 @@ fn default_influence() -> f64 {
 
 impl Keyframe {
     pub fn new(time: Tick, value: ParamValue) -> Self {
-        Self { time, value, interp: Interpolation::Linear, out_influence: default_influence(), in_influence: default_influence() }
+        Self {
+            time,
+            value,
+            interp: Interpolation::Linear,
+            out_influence: default_influence(),
+            in_influence: default_influence(),
+            out_slope: None,
+            in_slope: None,
+        }
     }
 }
 
@@ -328,19 +344,31 @@ impl Param {
     }
 }
 
-/// Temporal easing for u∈[0,1] between two keyframes (1D cubic Bezier in time/value space).
+/// Temporal easing for u∈[0,1] between two keyframes (1D cubic Bezier in time/value space). As in
+/// Premiere, a keyframe's interpolation shapes both of its sides: the segment leaves `a` as `a`
+/// says and reaches `b` as `b` says (a Bézier key followed by a Linear one arrives in a line).
 fn ease(a: &Keyframe, b: &Keyframe, u: f64) -> f64 {
     let out_ease = matches!(a.interp, Interpolation::Bezier | Interpolation::AutoBezier | Interpolation::ContinuousBezier | Interpolation::EaseOut);
-    let in_ease = matches!(b.interp, Interpolation::Bezier | Interpolation::AutoBezier | Interpolation::ContinuousBezier | Interpolation::EaseIn)
-        || matches!(a.interp, Interpolation::Bezier | Interpolation::ContinuousBezier);
+    let in_ease = matches!(b.interp, Interpolation::Bezier | Interpolation::AutoBezier | Interpolation::ContinuousBezier | Interpolation::EaseIn);
     if !out_ease && !in_ease {
         return u;
     }
-    // Control points in normalized (time, value) space; flat handles = ease (velocity 0).
-    let x1 = if out_ease { a.out_influence.clamp(0.01, 1.0) } else { 1.0 / 3.0 };
-    let y1 = if out_ease { 0.0 } else { 1.0 / 3.0 };
-    let x2 = if in_ease { 1.0 - b.in_influence.clamp(0.01, 1.0) } else { 2.0 / 3.0 };
-    let y2 = if in_ease { 1.0 } else { 2.0 / 3.0 };
+    // Control points in normalized (time, value) space: the influence along time, the speed
+    // relative to the straight line along the value (Premiere's and After Effects' handles); no
+    // speed is a flat handle, an ease.
+    let slope = |m: Option<f64>| m.filter(|m| m.is_finite()).map_or(0.0, |m| m.clamp(-10.0, 10.0));
+    let (x1, y1) = if out_ease {
+        let i = a.out_influence.clamp(0.01, 1.0);
+        (i, i * slope(a.out_slope))
+    } else {
+        (1.0 / 3.0, 1.0 / 3.0)
+    };
+    let (x2, y2) = if in_ease {
+        let i = b.in_influence.clamp(0.01, 1.0);
+        (1.0 - i, 1.0 - i * slope(b.in_slope))
+    } else {
+        (2.0 / 3.0, 2.0 / 3.0)
+    };
     cubic_bezier_y_for_x(x1, y1, x2, y2, u)
 }
 
@@ -405,6 +433,33 @@ mod tests {
             assert!(v >= last - 1e-9);
             last = v;
         }
+    }
+
+    /// Premiere's Bézier handles carry a speed: at the straight line's own speed a Bézier key plays
+    /// as a line, with no speed on the arriving side it eases in. The numbers are Premiere's
+    /// (a 2 s opacity ramp in the user's Round 5 tests: 0 → 100 %, 63.5 % half way with Ease In).
+    #[test]
+    fn bezier_handles_follow_premiere_speeds() {
+        let ramp = |out: (f64, Option<f64>), into: (f64, Option<f64>), interp_b: Interpolation| {
+            let mut p = Param::new(ParamValue::Float(0.0));
+            p.toggle_animation(Tick(0));
+            p.set_at(Tick(1000), ParamValue::Float(100.0));
+            let (a, b) = p.keyframes.split_at_mut(1);
+            (a[0].interp, a[0].out_influence, a[0].out_slope) = (Interpolation::Bezier, out.0, out.1);
+            (b[0].interp, b[0].in_influence, b[0].in_slope) = (interp_b, into.0, into.1);
+            p
+        };
+        let line = ramp((1.0 / 6.0, Some(1.0)), (1.0 / 6.0, Some(1.0)), Interpolation::Bezier);
+        for t in [100, 250, 500, 750, 900] {
+            assert!((line.f64_at(Tick(t)) - t as f64 / 10.0).abs() < 1e-6, "{t}: {}", line.f64_at(Tick(t)));
+        }
+        let ease_in = ramp((1.0 / 6.0, Some(1.0)), (1.0 / 3.0, Some(0.0)), Interpolation::Bezier);
+        let half = ease_in.f64_at(Tick(500));
+        assert!((half - 63.5).abs() < 0.5, "{half}");
+        // a Bézier key followed by a Linear one: eased out of the first, in a line into the second
+        let to_linear = ramp((1.0 / 3.0, Some(0.0)), (1.0 / 3.0, None), Interpolation::Linear);
+        let (early, late) = (to_linear.f64_at(Tick(100)), to_linear.f64_at(Tick(990)) - to_linear.f64_at(Tick(980)));
+        assert!(early < 10.0 && late > 0.5, "eased start, no ease at the end: {early} {late}");
     }
 
     #[test]
