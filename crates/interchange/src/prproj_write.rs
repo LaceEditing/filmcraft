@@ -30,7 +30,7 @@ use filmcraft_project::{ItemId, ItemKind, Project, Sequence, TrackItem, TrackKin
 use roxmltree::Node;
 
 use crate::common::scaled;
-use crate::prproj::{FRAME_HOLD_AT, META_MEDIA, META_SEQUENCE, parse_i64, source_frame, time};
+use crate::prproj::{FRAME_HOLD_AT, FRAME_HOLD_IN, META_MEDIA, META_SEQUENCE, parse_i64, source_frame, time};
 use crate::prproj_fx::{self, Ctx, Target};
 use crate::prproj_graph::{self, Index, TICKS_PER_SECOND};
 use crate::prproj_intrinsic as intrinsic;
@@ -1909,29 +1909,47 @@ impl<'a, 'i> Writer<'a, 'i> {
         if let Some(body) = child(clip, "Clip") {
             let old_in = time(child_text(body, "InPoint")).unwrap_or(0);
             let old_speed = child_text(body, "PlaybackSpeed").and_then(|s| s.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s != 0.0).unwrap_or(1.0);
-            let new_speed = if c.reverse { -c.speed } else { c.speed };
+            let old_backwards = child(body, "PlayBackwards");
+            let was_backwards = old_backwards.and_then(|n| n.text()).is_some_and(|t| t.trim() == "true");
+            // a clip of endless media (an adjustment layer, a graphic) extended left of where it
+            // was made has a negative In point in FilmCraft; Premiere's In points start at 0
+            let source_in = c.source_in.0.max(0);
+            let used = scaled(c.duration, c.speed).0;
+            // Reverse Speed is Premiere's `PlayBackwards`, with In and Out counted from the end of
+            // the media. A clip saved reversed with a negative speed (as FilmCraft wrote them
+            // before), or whose media length is unknown, keeps the negative speed.
+            let length = if c.reverse && old_speed > 0.0 { crate::prproj::media_duration(&self.ix, clip, kind) } else { None };
+            let backwards = length.is_some();
+            let new_speed = if c.reverse && !backwards { -c.speed } else { c.speed };
+            let (new_in, new_out) = match length {
+                Some(d) => ((d - source_in - used).max(0), d - source_in),
+                None => (source_in, source_in.saturating_add(used)),
+            };
             let old_dur = self
                 .ix
                 .at(obj, &["ClipTrackItem", "TrackItem"])
                 .map(|t| time(child_text(t, "End")).unwrap_or(0) - time(child_text(t, "Start")).unwrap_or(0))
                 .unwrap_or(0);
-            let timing_changed = old_in != c.source_in.0.max(0) || (old_speed - new_speed).abs() > 1e-12 || old_dur != c.duration.0;
-            // a clip of endless media (an adjustment layer, a graphic) extended left of where it
-            // was made has a negative In point in FilmCraft; Premiere's In points start at 0
-            let source_in = c.source_in.0.max(0);
-            if old_in != source_in {
-                self.set_child(clip_inst, body, "InPoint", &source_in.to_string());
+            let timing_changed = old_in != new_in || (old_speed - new_speed).abs() > 1e-12 || was_backwards != backwards || old_dur != c.duration.0;
+            if old_in != new_in {
+                self.set_child(clip_inst, body, "InPoint", &new_in.to_string());
             }
             if timing_changed {
-                let out = source_in.saturating_add(scaled(c.duration, c.speed).0);
-                self.set_child(clip_inst, body, "OutPoint", &out.to_string());
+                self.set_child(clip_inst, body, "OutPoint", &new_out.to_string());
             }
             if (old_speed - new_speed).abs() > 1e-12 {
                 self.set_child(clip_inst, body, "PlaybackSpeed", &crate::xml::num(new_speed));
             }
+            match (backwards, old_backwards) {
+                (true, _) if !was_backwards => self.set_child(clip_inst, body, "PlayBackwards", "true"),
+                (false, Some(n)) => self.remove(clip_inst, n),
+                _ => {}
+            }
         }
         if kind == TrackKind::Video {
             match c.frame_hold {
+                // Hold On: In Point, still on the clip's In point, stays as Premiere saved it
+                Some(at) if child_text(clip, "FrameHold").map(str::trim) == Some(FRAME_HOLD_IN) && at == c.source_in => {}
                 Some(at) => {
                     if child_text(clip, "FrameHold") != Some(FRAME_HOLD_AT) {
                         self.set_child(clip_inst, clip, "FrameHold", FRAME_HOLD_AT);

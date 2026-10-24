@@ -669,6 +669,42 @@ fn scale_to_frame_size_round_trips() {
     assert_eq!(String::from_utf8(prproj_graph::decompress(&off).unwrap().0).unwrap(), plain);
 }
 
+/// Reverse Speed is `PlayBackwards` with In and Out counted from the end of the media, and Frame
+/// Hold Options ▸ Hold On: In Point is `FrameHold` 1 (Round 5 B11): both come in, stay on an
+/// unchanged save, and a clip reversed in FilmCraft is saved that way.
+#[test]
+fn reverse_speed_and_the_in_point_hold_round_trip() {
+    let clip =
+        "<VideoClip ObjectID=\"42\"><Clip><Source ObjectRef=\"11\"/><InPoint>2540160000000</InPoint><OutPoint>3810240000000</OutPoint></Clip></VideoClip>";
+    let plain = doc();
+    assert!(plain.contains(clip), "the fixture changed");
+    let v1 = |p: &Project| p.sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[0].items[0].clone();
+    // In 10 s, Out 15 s of the 60 s media, played backwards: its 45 s → 50 s, from 50 s down
+    let reversed = plain.replace(clip, &clip.replace("</Clip>", "<PlayBackwards>true</PlayBackwards></Clip>"));
+    let (imp, _) = import(reversed.as_bytes(), None);
+    let c = v1(&imp.project);
+    assert!(c.reverse && c.source_in == Tick(45 * S), "{} {:?}", c.reverse, c.source_in);
+    let (same, _) = export(&imp.project, reversed.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&same).unwrap().0).unwrap(), reversed);
+    // reversed in FilmCraft: Premiere's encoding
+    let (imp, _) = import(plain.as_bytes(), None);
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    p.sequence_mut(sid).unwrap().video_tracks[0].items[0].reverse = true;
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(prproj_graph::decompress(&out).unwrap().0).unwrap();
+    let want = "<InPoint>11430720000000</InPoint><OutPoint>12700800000000</OutPoint><PlayBackwards>true</PlayBackwards></Clip>";
+    assert!(text.contains(want), "{report}");
+    let back = v1(&read(&out));
+    assert!(back.reverse && back.source_in == Tick(10 * S));
+    // Hold On: In Point holds the In point's frame
+    let held = plain.replace(clip, &clip.replace("</Clip></VideoClip>", "</Clip><FrameHold>1</FrameHold></VideoClip>"));
+    let (imp, _) = import(held.as_bytes(), None);
+    assert_eq!(v1(&imp.project).frame_hold, Some(Tick(10 * S)));
+    let (same, _) = export(&imp.project, held.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(prproj_graph::decompress(&same).unwrap().0).unwrap(), held);
+}
+
 /// A Custom Fade's Fade Shape (Effect Controls: Linear or Cosine) is saved as `FadeShapeType` 0
 /// for Linear and nothing for Cosine; it comes in, stays on an unchanged save, and goes back out
 /// before the `FadeShapeValue` as Premiere writes it.

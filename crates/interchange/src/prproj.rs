@@ -64,6 +64,8 @@ const MAX_DEPTH: usize = 64;
 pub(crate) const SPEED_RANGE: (f64, f64) = (0.001, 100.0);
 /// Premiere's `FrameHold` value for "hold on the frame at `FrameHoldStart`".
 pub(crate) const FRAME_HOLD_AT: &str = "4";
+/// Premiere's `FrameHold` value for Frame Hold Options ▸ Hold On: In Point.
+pub(crate) const FRAME_HOLD_IN: &str = "1";
 
 /// A time read from the document, clamped to `0..=MAX_TIME`.
 pub(crate) fn time(s: Option<&str>) -> Option<i64> {
@@ -713,6 +715,17 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         let mut ti = self.b.clip(target, kind, &name, Tick(start), Tick(duration), Tick(source_in));
         ti.speed = raw_speed.abs().clamp(SPEED_RANGE.0, SPEED_RANGE.1);
         ti.reverse = raw_speed < 0.0;
+        // Clip ▸ Speed/Duration ▸ Reverse Speed is `PlayBackwards` on the clip, whose In and Out
+        // then count from the end of its media (Round 5 B11: In 6 s, Out 10 s of a 10 s file plays
+        // its 4 s → 0 s)
+        if path_text(clip, &["Clip", "PlayBackwards"]).map(str::trim) == Some("true") {
+            ti.reverse = true;
+            let out = time(path_text(clip, &["Clip", "OutPoint"])).unwrap_or_else(|| source_in.saturating_add((duration as f64 * ti.speed).round() as i64));
+            match media_duration(&self.ix, clip, kind) {
+                Some(d) => ti.source_in = Tick(d.saturating_sub(out).max(0)),
+                None => self.report.info(format!("reversed clip \"{name}\": its media's length is not in the project, so it plays from its In point")),
+            }
+        }
         ti.origin = item.attribute("ObjectID").map(str::to_string);
         // the clip's own label (else its item's, as `Builder::clip` gave it)
         if let Some(l) = clip_label(clip) {
@@ -728,10 +741,12 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         if kind == TrackKind::Video && child_text(clip, "ScaleToFramePolicy").map(str::trim) == Some("1") {
             ti.scale_to_frame = true;
         }
-        if child_text(clip, "FrameHold") == Some(FRAME_HOLD_AT)
-            && let Some(at) = time(child_text(clip, "FrameHoldStart"))
-        {
-            ti.frame_hold = Some(Tick(at));
+        match child_text(clip, "FrameHold").map(str::trim) {
+            Some(FRAME_HOLD_AT) => ti.frame_hold = time(child_text(clip, "FrameHoldStart")).map(Tick),
+            // Frame Hold Options ▸ Hold On: In Point (Round 5 B11)
+            Some(FRAME_HOLD_IN) => ti.frame_hold = Some(ti.source_in),
+            Some(other) => self.report.info(format!("clip \"{name}\": frame hold option {other} is not read; the clip plays")),
+            None => {}
         }
         if let Some(id) = item.attribute("ObjectID")
             && let Some(g) = self.links.get(id)
@@ -1048,6 +1063,13 @@ pub(crate) fn label_props(label: Label) -> (String, u32) {
     };
     let [r, g, b] = label.rgb();
     (format!("BE.Prefs.LabelColors.{n}"), seen.unwrap_or(u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16))
+}
+
+/// The length of a clip's media as Premiere has it: its video or audio stream's `Duration`.
+pub(crate) fn media_duration<'a, 'i>(ix: &Index<'a, 'i>, clip: Node<'a, 'i>, kind: TrackKind) -> Option<i64> {
+    let media = prproj_graph::clip_media(ix, clip)?;
+    let stream = ix.follow(media, &[if kind == TrackKind::Video { "VideoStream" } else { "AudioStream" }])?;
+    time(child_text(stream, "Duration")).filter(|d| *d > 0)
 }
 
 /// A Premiere panner's setting (`Balance` of a `StereoToStereoPanProcessor`, `Pan` of a
