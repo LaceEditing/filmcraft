@@ -40,6 +40,8 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
                 d.set_param("ratio", f(e, "ratio", t));
                 d.set_param("attack", f(e, "attack", t));
                 d.set_param("release", f(e, "release", t));
+                d.set_param("detector", f(e, "detect", t));
+                d.set_param("makeup", f(e, "output", t));
             },
         },
         "hard_limiter" => Mapping {

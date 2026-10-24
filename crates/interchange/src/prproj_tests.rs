@@ -785,3 +785,60 @@ fn track_mix_master_and_clip_pan_are_read() {
     assert!(seq.audio_tracks[0].items[0].effect("panner").and_then(|e| e.param("balance")).is_none_or(|p| p.value == ParamValue::Float(0.0)));
     assert_eq!(seq.master_volume_db, 0.0);
 }
+
+/// Dynamics Processing's transfer curve (Round 5 B2.4: X/Y pairs in dB = 100·n − 100; a value of 1
+/// is saved with none) comes in as a threshold / ratio compressor when it is one; any other curve
+/// keeps the effect switched off.
+#[test]
+fn dynamics_processing_curves_come_in_as_compressors() {
+    let class = "a714635e-a628-4b27-9d59-77eba47dbc1a";
+    let with_settings = |points: &[(f64, f64)], output: f64, peak_rms: f64| {
+        let mut params = vec![
+            ("Input Gain", Some(0.5)),
+            ("Output Gain", Some(output)),
+            ("Peak/RMS", (peak_rms < 1.0).then_some(peak_rms)),
+            ("Number of X/Y Pairs", Some(points.len() as f64 / 7.0)),
+        ];
+        let names: Vec<(String, String)> = (1..=points.len()).map(|i| (format!("Location{i}"), format!("Value{i}"))).collect();
+        for (i, (l, v)) in points.iter().enumerate() {
+            // a 1 is saved with no value
+            params.push((names[i].0.as_str(), (*l < 1.0).then_some(*l)));
+            params.push((names[i].1.as_str(), (*v < 1.0).then_some(*v)));
+        }
+        let refs: String = (0..params.len()).map(|i| format!("<Param Index=\"{i}\" ObjectRef=\"{}\"/>", 951 + i)).collect();
+        let objs: String = params
+            .iter()
+            .enumerate()
+            .map(|(i, (name, v))| {
+                let value = v.map(|v| format!("<StartKeyframe>-91445760000000000,{v},0,0,0,0,0,0</StartKeyframe>")).unwrap_or_default();
+                format!("  <AudioComponentParam ObjectID=\"{}\" ClassID=\"{class}\">{value}<Name>{name}</Name></AudioComponentParam>\n", 951 + i)
+            })
+            .collect();
+        let text = doc()
+            .replace("<Component Index=\"0\" ObjectRef=\"74\"/></Components>", "<Component Index=\"0\" ObjectRef=\"74\"/><Component Index=\"1\" ObjectRef=\"950\"/></Components>")
+            .replace(
+                "</PremiereData>",
+                &format!("  <AudioFilterComponent ObjectID=\"950\"><AudioComponent><Component><Params>{refs}</Params></Component></AudioComponent><FilterMatchName>f76dad9c-77da-477a-9939-eefefc5c23bd</FilterMatchName></AudioFilterComponent>\n{objs}</PremiereData>"),
+            );
+        let (imp, _) = import(text.as_bytes(), None);
+        let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+        seq.audio_tracks[0].items[0].effect("dynamics").cloned().expect("Dynamics Processing")
+    };
+    let with_curve = |points: &[(f64, f64)]| {
+        let e = with_settings(points, 0.5, 1.0);
+        (e.enabled, e.f64_at("threshold", Tick::ZERO), e.f64_at("ratio", Tick::ZERO))
+    };
+    // "4:1 above −20 dB": (0,0) (0.8,0.8) (1,0.85)
+    let (on, threshold, ratio) = with_curve(&[(0.0, 0.0), (0.8, 0.8), (1.0, 0.85)]);
+    assert!(on && (threshold + 20.0).abs() < 1e-6 && (ratio - 4.0).abs() < 1e-6, "{on} {threshold} {ratio}");
+    // the RMS detector (Peak/RMS 0) and Output Gain (n 0.6 = +9.6 dB) come with it
+    let e = with_settings(&[(0.0, 0.0), (0.8, 0.8), (1.0, 0.85)], 0.6, 0.0);
+    assert_eq!(e.param("detect").map(|p| p.value.clone()), Some(ParamValue::Choice(1)));
+    assert!((e.f64_at("output", Tick::ZERO) - 9.6).abs() < 1e-6, "{}", e.f64_at("output", Tick::ZERO));
+    // the default identity line compresses nothing
+    let (on, _, ratio) = with_curve(&[(0.0, 0.0), (0.8, 0.8), (1.0, 1.0)]);
+    assert!(on && ratio == 1.0);
+    // an expander below −30 dB is not a compressor: off
+    let (on, ..) = with_curve(&[(0.4, 0.1), (0.7, 0.7), (1.0, 1.0)]);
+    assert!(!on);
+}

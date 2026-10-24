@@ -792,6 +792,14 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                             .is_some_and(|v| v == "true" || v == "1");
                         if bypassed {
                             e.enabled = false;
+                        } else if def.id == "dynamics"
+                            && let Some(d) = prproj_fx::dynamics_curve(c)
+                        {
+                            // Dynamics Processing whose curve is a compressor's (else it is off)
+                            e.params.insert("threshold".into(), Param::new(ParamValue::Float(d.threshold)));
+                            e.params.insert("ratio".into(), Param::new(ParamValue::Float(d.ratio)));
+                            e.params.insert("detect".into(), Param::new(ParamValue::Choice(u32::from(d.rms))));
+                            e.params.insert("output".into(), Param::new(ParamValue::Float(d.output)));
                         } else if !prproj_fx::audio_effect_read(def.id) {
                             e.enabled = false;
                             *self.audio_off.entry(def.name.to_string()).or_insert(0) += 1;

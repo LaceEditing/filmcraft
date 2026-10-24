@@ -248,6 +248,8 @@ pub(super) fn defs() -> Vec<EffectDef> {
                 num("ratio", "Ratio", 4.0, 1.0, 30.0, ":1", 1),
                 ms("attack", "Attack", 10.0, 0.1, 500.0),
                 fs("release", "Release", 100.0, (1.0, 5000.0), (1.0, 5000.0), "ms", 0),
+                ch("detect", "Detection", &["Peak", "RMS"], 0),
+                db("output", "Output Gain", 0.0, -40.0, 40.0),
             ],
         ),
         audio(

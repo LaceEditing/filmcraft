@@ -196,6 +196,10 @@ pub(crate) const AUDIO_PARAMS: &[(&str, &str, &str, Conv)] = &[
     ("declicker", "Threshold", "threshold", Conv::Lin(1.0, 100.0)),
     ("declicker", "Complexity", "complexity", Conv::Lin(1.0, 100.0)),
     ("denoise", "Amount", "amount", Conv::Lin(0.0, 100.0)),
+    // Amount n as n·100 %: FilmCraft's DeReverb then comes within 0.3–0.7 dB of Premiere's level
+    // and 1–2 dB per third octave on the Round 5 B2 speech, closer than off at every Amount (its
+    // display is normalised in Premiere; Auto Gain, Make-Up and the shelf are not read)
+    ("dereverb", "Amount", "amount", Conv::Lin(0.0, 100.0)),
     ("dynamics_rack", "AutoGate Enabled", "gate_on", Conv::Flag(1)),
     ("dynamics_rack", "AutoGate Threshold", "gate_threshold", Conv::Lin(-60.0, 0.0)),
     ("dynamics_rack", "Compressor Enabled", "comp_on", Conv::Flag(1)),
@@ -283,6 +287,58 @@ fn nearest_slope(saved: f64) -> usize {
 
 /// Class of an audio effect's numeric settings; one at 1.0 is saved without a value.
 const AUDIO_PARAM_CLASS: &str = "a714635e";
+
+/// Premiere's Dynamics Processing as FilmCraft's compressor ([`dynamics_curve`]).
+pub(crate) struct Dynamics {
+    pub threshold: f64,
+    pub ratio: f64,
+    /// The RMS detector (Premiere's `Peak/RMS` 0; 1, the default, is Peak).
+    pub rms: bool,
+    /// Output Gain in dB: 96·n − 48 (Round 5 B2.4: n 0.6 is +9.6 dB).
+    pub output: f64,
+}
+
+/// Premiere's Dynamics Processing as FilmCraft's threshold / ratio compressor, when its transfer
+/// curve is one. The curve is `Number of X/Y Pairs` (n·7) points `Location…` → `Value…`, both in
+/// dB = 100·n − 100 (Round 5 B2.4: the default (0,0) (0.8,0.8) (1,1) is the identity line). It maps
+/// when it follows the identity line up to a knee and one straight segment above it, unanimated,
+/// with Input Gain at 0 dB (n 0.5). `None` for any other curve (an expander, several knees) or
+/// Input Gain, which FilmCraft cannot play.
+pub(crate) fn dynamics_curve(c: &Component) -> Option<Dynamics> {
+    let value = |name: &str| -> Option<f64> {
+        let p = c.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim().eq_ignore_ascii_case(name)))?;
+        match decode(p, Conv::Lin(0.0, 1.0))? {
+            Canon { value: Val::F(v), keys } if keys.is_empty() => Some(v),
+            _ => None,
+        }
+    };
+    if value("Input Gain").is_none_or(|v| (v - 0.5).abs() > 1e-3) {
+        return None;
+    }
+    let output = (96.0 * value("Output Gain")? - 48.0).clamp(-40.0, 40.0);
+    let rms = value("Peak/RMS").is_some_and(|v| v < 0.5);
+    let dynamics = |threshold: f64, ratio: f64| Dynamics { threshold, ratio, rms, output };
+    let n = (value("Number of X/Y Pairs")? * 7.0).round() as usize;
+    if !(2..=7).contains(&n) {
+        return None;
+    }
+    let db = |v: f64| 100.0 * v - 100.0;
+    let mut pts = Vec::with_capacity(n);
+    for i in 1..=n {
+        pts.push((db(value(&format!("Location{i}"))?), db(value(&format!("Value{i}"))?)));
+    }
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let knee = pts.iter().take_while(|p| (p.0 - p.1).abs() < 0.05).count();
+    let (threshold, _) = *pts.get(knee.checked_sub(1)?)?;
+    if knee == pts.len() {
+        // the identity line: nothing is compressed
+        return Some(dynamics(threshold.clamp(-60.0, 0.0), 1.0));
+    }
+    let slope = |p: &(f64, f64)| (p.0 - threshold > 1e-6).then(|| (p.1 - threshold) / (p.0 - threshold));
+    let s = slope(pts.last()?)?;
+    let straight = pts[knee..].iter().all(|p| slope(p).is_some_and(|k| (k - s).abs() < 1e-3));
+    (straight && (0.0..1.0).contains(&s) && (-60.0..=0.0).contains(&threshold)).then(|| dynamics(threshold, (1.0 / s.max(1.0 / 30.0)).min(30.0)))
+}
 
 /// Whether FilmCraft reads this audio effect's settings (else it comes in switched off).
 pub(crate) fn audio_effect_read(id: &str) -> bool {

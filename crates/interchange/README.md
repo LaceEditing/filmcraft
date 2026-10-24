@@ -147,7 +147,29 @@ committed).
   (some projects save it as 0); they are read opaque. Clip volume is the
   `Internal Volume …` component's `Level`, linear gain where `0.177828` (the value on every untouched
   clip) is 0 dB: `dB = 20·log10(level / 0.177828)` (an observed convention). A clip can carry a second
-  Motion / Opacity / volume; only the first maps.
+  Motion / Opacity / volume; only the first maps. Premiere plays Level keyframes linearly in that
+  linear gain, not in dB (halfway along 0 → −20 dB is −5.2 dB).
+- Keyframes play only while a video parameter's stopwatch is on, `IsTimeVarying` true: with it
+  off (absent or false) Premiere keeps `Keyframes` in the file but plays the `StartKeyframe` value.
+  Audio parameters never write the flag, and their keyframes always play. Key codes (`f2`, `f3`):
+  `4, 0` is Hold. Bézier speeds (`f4`, `f6`) are in the value's units per second (Motion's Scale in
+  tenths); with the influences (`f5`, `f7`) they are After Effects' temporal handles, so a key
+  whose speed is the straight line's plays linear (Round 5 B6).
+- Audio effect settings are all saved 0…1, and a setting at 1 is saved with **no value** (no
+  `StartKeyframe` and no `CurrentValue`; parameter class `a714635e-…`). Scales measured in
+  Premiere 26.5 are in `prproj_fx::AUDIO_PARAMS`. Dynamics Processing's transfer curve is
+  `Number of X/Y Pairs` (n·7) points `Location1…7` → `Value1…7`, both in dB = 100·n − 100; one that
+  is the identity line up to a knee and straight above it comes in as a threshold / ratio
+  compressor, with `Peak/RMS` (1 Peak, 0 RMS) and Output Gain (96·n − 48 dB).
+- Pan and the mixer: a clip's pan is its own `AudioClipTrackItem/Panner` → `StereoToStereoPanProcessor`
+  (parameter `Balance`) or `MonoToStereoPanProcessor` (`Pan`), both 0…1 with the centre at 0.5 and
+  `IsInverted` true; a clip whose pan was never changed has no `Panner`. Each `AudioClipTrack`'s
+  `AudioTrack` has the track's chain (`ComponentOwner/Components` → an `AudioFader` with `Volume`,
+  linear, 1 = 0 dB, and `Mute`) and its `Panner`; `AudioTrack/ChannelType` 0 is a mono track (stereo
+  tracks write none). The Mix is the audio group's `MasterTrack` → `AudioMixTrack`, laid out the
+  same way. Premiere pans a mono clip on a stereo track with the −3 dB constant-power law (Round 5
+  B3), as FilmCraft now does.
+- Clip ▸ Video Options ▸ Scale to Frame Size is `ScaleToFramePolicy` 1 on the track item's clip.
 - Other effects map onto the FilmCraft effect of the same name (`Gaussian Blur (Legacy)` →
   Gaussian Blur): their numeric, angle, boolean and point parameters by name. A name an effect
   uses for several parameters (Lumetri's "Intensity") is not mapped. Choices, colours and the rest
@@ -205,7 +227,11 @@ committed).
   `FadeShapeValue` −100…100 (the curve's bend; every one of 422 in the user's projects carries
   one). Such a fade can run a frame past its clip; `Alignment` (0 or the duration) says which
   edge it belongs to. It is FilmCraft's clip fade (`custom_fade`), written back with its shape;
-  new ones are built from scratch when the project has none to copy.
+  new ones are built from scratch when the project has none to copy. `FadeShapeType` 0 is the
+  Linear family (absent: Cosine). Measured gains: Cosine `u = 1 − (1 − t)^(10^(−s/100))`,
+  `g = (1 + cos πu) / 2`; Linear `a = −v/10`, `g = (e^(−at) − e^(−a)) / (1 − e^(−a))`; Constant
+  Power is Cosine 19, Constant Gain Linear 0, Exponential Fade Linear −35, a fade-in the mirror
+  of the fade-out (Round 5 B1).
 
 ### Writing back
 
