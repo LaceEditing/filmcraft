@@ -122,6 +122,8 @@ pub fn text_styles(t: &TextProps) -> (TextStyle, ParagraphStyle) {
             height: (t.box_width > 0.0 && t.box_height > 0.0 && !t.vertical).then_some(t.box_height),
             rtl: None,
             vertical: t.vertical,
+            // titles space their lines as Premiere's do
+            auto_leading: true,
         },
     )
 }

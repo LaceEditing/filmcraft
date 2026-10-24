@@ -84,8 +84,12 @@ impl Default for TextStyle {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParagraphStyle {
     pub align: Align,
-    /// Extra line spacing in pixels added to the font's natural line height (Premiere's Leading).
+    /// Extra line spacing in pixels added to the line pitch (Premiere's Leading).
     pub leading: f32,
+    /// The line pitch is Adobe's Auto leading, [`AUTO_LEADING`] × the largest font size on the line
+    /// (Premiere's titles: Arial 70 lines are 84 px apart), instead of the font's natural line
+    /// height (ascent + descent + line gap).
+    pub auto_leading: bool,
     /// Wrap width (area text); None = point text.
     pub width: Option<f32>,
     /// Box height (area text only): lines that end below it are left out, except the first.
@@ -97,6 +101,9 @@ pub struct ParagraphStyle {
     /// left. Alignment applies along the column (Left = top, Center, Right = bottom).
     pub vertical: bool,
 }
+
+/// Auto leading: the line pitch as a multiple of the font size (Round 5 A3, measured in Premiere).
+pub const AUTO_LEADING: f32 = 1.2;
 
 fn hf(h: &mut impl Hasher, v: f32) {
     v.to_bits().hash(h);
@@ -121,6 +128,7 @@ impl Hash for ParagraphStyle {
         self.height.map(f32::to_bits).hash(h);
         self.rtl.hash(h);
         self.vertical.hash(h);
+        self.auto_leading.hash(h);
     }
 }
 
@@ -635,7 +643,8 @@ pub fn layout_uncached(text: &str, style: &TextStyle, para: &ParagraphStyle) -> 
 pub fn layout_rich_uncached(text: &str, style: &TextStyle, runs: &[StyleRun], para: &ParagraphStyle) -> Layout {
     let sty = Styles::new(text, style, runs);
     let pm = fonts::face(sty.prim[0].face).metrics(style.size);
-    let line_h = (pm.ascent + pm.descent + pm.line_gap).max(style.size * 0.5) + para.leading;
+    let natural = if para.auto_leading { AUTO_LEADING * style.size } else { (pm.ascent + pm.descent + pm.line_gap).max(style.size * 0.5) };
+    let line_h = natural + para.leading;
     let mut lay = Layout { missing_font: sty.prim.iter().any(|p| p.missing), text_len: text.len(), ..Default::default() };
     if para.vertical {
         return layout_vertical(text, &sty, para, line_h, lay);
@@ -659,8 +668,15 @@ pub fn layout_rich_uncached(text: &str, style: &TextStyle, runs: &[StyleRun], pa
     for (i, pl) in plines.into_iter().enumerate() {
         if i > 0 {
             // rich text: a line holding a larger run pushes its baseline down
-            baseline += if rich { line_h.max(prev_desc + pl.ascent + para.leading) } else { line_h };
-            if box_h.is_some_and(|h| baseline + pl.descent > h + 0.01) {
+            baseline += match (para.auto_leading, rich) {
+                (true, true) => AUTO_LEADING * pl.glyphs.iter().map(|g| g.size).fold(style.size, f32::max) + para.leading,
+                (false, true) => line_h.max(prev_desc + pl.ascent + para.leading),
+                (_, false) => line_h,
+            };
+            // Premiere keeps a line whose baseline is in the box, its descenders hanging out
+            // (Round 5 A3: two Arial 70 lines in a 158.7 px box, the second ending at 162 px)
+            let bottom = if para.auto_leading { baseline } else { baseline + pl.descent };
+            if box_h.is_some_and(|h| bottom > h + 0.01) {
                 lay.overflow = true;
                 break;
             }
@@ -934,6 +950,25 @@ mod tests {
         let gap = l.lines[1].baseline - l.lines[0].baseline;
         let l2 = layout("one\ntwo", &st(30.0), &ParagraphStyle { leading: 10.0, ..Default::default() });
         assert!((l2.lines[1].baseline - l2.lines[0].baseline - gap - 10.0).abs() < 1e-3);
+    }
+
+    /// Auto leading (Premiere's titles): lines 1.2 × the font size apart, Leading added; with a
+    /// larger run, 1.2 × its size; a boxed line is kept while its baseline is in the box.
+    #[test]
+    fn auto_leading_is_120_percent_of_the_size() {
+        let auto = ParagraphStyle { auto_leading: true, ..Default::default() };
+        let l = layout("one\ntwo", &st(70.0), &auto);
+        assert!((l.lines[1].baseline - l.lines[0].baseline - 84.0).abs() < 1e-3, "{}", l.lines[1].baseline - l.lines[0].baseline);
+        let led = layout("one\ntwo", &st(70.0), &ParagraphStyle { leading: 10.0, ..auto.clone() });
+        assert!((led.lines[1].baseline - led.lines[0].baseline - 94.0).abs() < 1e-3);
+        let runs = [StyleRun { range: 4..7, style: st(100.0) }];
+        let rich = layout_rich("one\ntwo", &st(70.0), &runs, &auto);
+        assert!((rich.lines[1].baseline - rich.lines[0].baseline - 120.0).abs() < 1e-3);
+        // two lines in a box whose bottom cuts the second line's descenders
+        let first = layout("one", &st(70.0), &ParagraphStyle { width: Some(600.0), ..auto.clone() }).lines[0].baseline;
+        let boxed = layout("one\ntwo", &st(70.0), &ParagraphStyle { width: Some(600.0), height: Some(first + 84.0 + 1.0), ..auto });
+        assert_eq!(boxed.lines.len(), 2);
+        assert!(!boxed.overflow);
     }
 
     #[test]
