@@ -811,10 +811,26 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                             && let Some(d) = prproj_fx::dynamics_curve(c)
                         {
                             // Dynamics Processing whose curve is a compressor's (else it is off)
-                            e.params.insert("threshold".into(), Param::new(ParamValue::Float(d.threshold)));
-                            e.params.insert("ratio".into(), Param::new(ParamValue::Float(d.ratio)));
                             e.params.insert("detect".into(), Param::new(ParamValue::Choice(u32::from(d.rms))));
-                            e.params.insert("output".into(), Param::new(ParamValue::Float(d.output)));
+                            let values = [
+                                ("threshold", d.threshold),
+                                ("ratio", d.ratio),
+                                ("output", d.output),
+                                ("input", d.input),
+                                ("knee", d.knee),
+                                ("attack", d.attack),
+                                ("release", d.release),
+                            ];
+                            for (id, v) in values {
+                                e.params.insert(id.into(), Param::new(ParamValue::Float(v)));
+                            }
+                        } else if def.id == "deesser"
+                            && let Some(d) = prproj_fx::deesser_settings(c)
+                        {
+                            e.params.insert("mode".into(), Param::new(ParamValue::Choice(u32::from(d.multiband))));
+                            for (id, v) in [("frequency", d.frequency), ("bandwidth", d.bandwidth), ("threshold", d.threshold), ("reduction", d.reduction)] {
+                                e.params.insert(id.into(), Param::new(ParamValue::Float(v)));
+                            }
                         } else if !prproj_fx::audio_effect_read(def.id) {
                             e.enabled = false;
                             *self.audio_off.entry(def.name.to_string()).or_insert(0) += 1;

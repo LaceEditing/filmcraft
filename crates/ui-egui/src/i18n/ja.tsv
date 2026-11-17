@@ -3649,6 +3649,13 @@
 	Peak	ピーク
 	True Peak	トゥルーピーク
 	RMS	RMS
+	Broadband	ブロードバンド
+	Multiband	マルチバンド
+	Bandwidth	帯域幅
+	Auto Gain	自動ゲイン
+	Make-Up Gain	メイクアップゲイン
+	Input Gain	入力ゲイン
+	Knee	ニー
 	Voice Leveler	音声レベラー
 	Gate and Compress	ゲートとコンプレッション
 	Voice Over	ナレーション

@@ -27,12 +27,18 @@ fn pow_db(p: f64) -> f64 {
 
 // ---------------------------------------------------------------------------------------------
 
-/// De-esser: a 2nd-order high-pass sidechain at `frequency` detects sibilance (the band level
-/// exceeds the broadband level by more than `threshold`); the band above `frequency` is then cut
-/// by a dynamic RBJ high shelf whose gain follows the gain reduction (attack ~1 ms, release
-/// ~60 ms, stereo-linked). At 0 dB reduction the shelf is an exact identity, so non-sibilant
-/// passages pass unchanged. (A subtractive split `x − HP(x)` is not used: the high-pass phase
-/// shift around the crossover makes `x − (1 − g)·HP(x)` boost there instead of cutting.)
+/// De-esser, in two modes:
+/// - Broadband: a 2nd-order high-pass sidechain at `frequency` detects sibilance (the band level
+///   exceeds the broadband level by more than `threshold`); the band above `frequency` is then cut
+///   by a dynamic RBJ high shelf.
+/// - Multiband (Premiere's default): a band-pass sidechain at `frequency`, `bandwidth` wide,
+///   detects sibilance (the band's own level above `threshold`, in dBFS), and a dynamic RBJ
+///   peaking filter of the same centre and width cuts that band only.
+///
+/// The filter's gain follows the gain reduction (attack ~1 ms, release ~60 ms, stereo-linked). At
+/// 0 dB reduction it is an exact identity, so non-sibilant passages pass unchanged. (A
+/// subtractive split `x − HP(x)` is not used: the high-pass phase shift around the crossover makes
+/// `x − (1 − g)·HP(x)` boost there instead of cutting.)
 pub struct DeEsser {
     pv: ParamValues,
     sr: f64,
@@ -51,15 +57,25 @@ pub struct DeEsser {
     rel: f64,
     threshold: f64,
     reduction: f64,
+    /// Multiband (a band cut) rather than broadband (a high shelf).
+    band: bool,
+    bandwidth: f64,
     gr_meter: f32,
 }
 
 impl DeEsser {
     pub const PARAMS: &'static [ParamSpec] = &[
-        ParamSpec::log("frequency", "Frequency", 2000.0, 12000.0, 6000.0, Unit::Hertz),
-        ParamSpec::new("threshold", "Threshold", -40.0, 0.0, -12.0, Unit::Decibels),
+        ParamSpec::log("frequency", "Frequency", 500.0, 12000.0, 6000.0, Unit::Hertz),
+        ParamSpec::new("threshold", "Threshold", -80.0, 0.0, -12.0, Unit::Decibels),
         ParamSpec::new("reduction", "Max Reduction", 0.0, 24.0, 8.0, Unit::Decibels),
+        ParamSpec::choice("mode", "Mode", &["Broadband", "Multiband"], 0),
+        ParamSpec::log("bandwidth", "Bandwidth", 100.0, 8000.0, 2000.0, Unit::Hertz),
     ];
+
+    /// The band filters' Q: centre over width.
+    fn q(&self) -> f64 {
+        (self.freq.value() as f64 / self.bandwidth.max(1.0)).clamp(0.1, 40.0)
+    }
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let sr = sample_rate as f64;
@@ -80,6 +96,8 @@ impl DeEsser {
             rel: coef(60.0, sr),
             threshold: -12.0,
             reduction: 8.0,
+            band: false,
+            bandwidth: 2000.0,
             gr_meter: 0.0,
         };
         s.apply_params(true);
@@ -87,15 +105,23 @@ impl DeEsser {
     }
 
     fn design(&mut self) {
-        self.coeffs = Coeffs::design(FilterType::HighPass, self.sr, self.freq.value() as f64, std::f64::consts::FRAC_1_SQRT_2, 0.0);
+        let f = self.freq.value() as f64;
+        self.coeffs = if self.band {
+            Coeffs::design(FilterType::BandPass, self.sr, f, self.q(), 0.0)
+        } else {
+            Coeffs::design(FilterType::HighPass, self.sr, f, std::f64::consts::FRAC_1_SQRT_2, 0.0)
+        };
         self.design_shelf();
     }
 
     fn design_shelf(&mut self) {
+        let f = self.freq.value() as f64;
         self.shelf_coeffs = if self.gr == 0.0 {
             Coeffs::IDENTITY
+        } else if self.band {
+            Coeffs::design(FilterType::Peaking, self.sr, f, self.q(), self.gr)
         } else {
-            Coeffs::design(FilterType::HighShelf, self.sr, self.freq.value() as f64, std::f64::consts::FRAC_1_SQRT_2, self.gr)
+            Coeffs::design(FilterType::HighShelf, self.sr, f, std::f64::consts::FRAC_1_SQRT_2, self.gr)
         };
         self.shelf_gr = self.gr;
     }
@@ -104,8 +130,14 @@ impl DeEsser {
         self.freq.set(self.pv.v("frequency"));
         self.threshold = self.pv.v("threshold") as f64;
         self.reduction = self.pv.v("reduction") as f64;
-        if snap {
-            self.freq.snap();
+        let (band, bandwidth) = (self.pv.idx("mode") == 1, self.pv.v("bandwidth") as f64);
+        let redesign = band != self.band || (bandwidth - self.bandwidth).abs() > 1e-9;
+        self.band = band;
+        self.bandwidth = bandwidth;
+        if snap || redesign {
+            if snap {
+                self.freq.snap();
+            }
             self.design();
         }
     }
@@ -147,7 +179,8 @@ impl AudioEffect for DeEsser {
             self.env_band = flush(self.det * self.env_band + (1.0 - self.det) * pb);
             self.env_full = flush(self.det * self.env_full + (1.0 - self.det) * pf);
             let bdb = pow_db(self.env_band);
-            let excess = bdb - pow_db(self.env_full) - self.threshold;
+            // broadband: the band's level relative to the whole signal's; multiband: its own (dBFS)
+            let excess = if self.band { bdb - self.threshold } else { bdb - pow_db(self.env_full) - self.threshold };
             let target = if bdb > -70.0 && excess > 0.0 { -(excess * 2.0).min(self.reduction) } else { 0.0 };
             let c = if target < self.gr { self.att } else { self.rel };
             self.gr = flush(c * self.gr + (1.0 - c) * target);
@@ -172,6 +205,10 @@ impl AudioEffect for DeEsser {
 const DEREVERB_TD: f64 = 0.05;
 /// Time constant (s) of the PSD smoothing.
 const DEREVERB_PSD_TAU: f64 = 0.02;
+/// How much quieter the output is with Auto Gain off (dB): Premiere's DeReverb drops speech by
+/// 9.75 dB against its Auto Gain level at Amount 40 % (Round 5 B2.5), and Make-Up Gain adds back
+/// dB for dB.
+const DEREVERB_NO_AUTO_GAIN_DB: f32 = 9.75;
 
 #[derive(Clone, Debug)]
 struct ReverbState {
@@ -198,7 +235,8 @@ impl ReverbState {
 
 /// Spectral de-reverberation: suppresses the late reverberant tail predicted by the exponential
 /// decay model for the assumed `rt60`. `amount` sets the over-subtraction and the gain floor
-/// (0 % = identity apart from the STFT delay, 100 % ≈ −18 dB floor).
+/// (0 % = identity apart from the STFT delay, 100 % ≈ −18 dB floor). With `auto_gain` off the
+/// output drops by [`DEREVERB_NO_AUTO_GAIN_DB`]; `makeup` adds gain.
 pub struct DeReverb {
     pv: ParamValues,
     sr: f32,
@@ -214,11 +252,17 @@ pub struct DeReverb {
     beta: f32,
     floor: f32,
     alpha: f32,
+    /// Output gain from Auto Gain and Make-Up Gain.
+    out_gain: f32,
 }
 
 impl DeReverb {
-    pub const PARAMS: &'static [ParamSpec] =
-        &[ParamSpec::new("amount", "Amount", 0.0, 100.0, 50.0, Unit::Percent), ParamSpec::log("rt60", "Decay (RT60)", 0.1, 5.0, 0.8, Unit::Seconds)];
+    pub const PARAMS: &'static [ParamSpec] = &[
+        ParamSpec::new("amount", "Amount", 0.0, 100.0, 50.0, Unit::Percent),
+        ParamSpec::log("rt60", "Decay (RT60)", 0.1, 5.0, 0.8, Unit::Seconds),
+        ParamSpec::toggle("auto_gain", "Auto Gain", true),
+        ParamSpec::new("makeup", "Make-Up Gain", 0.0, 20.0, 0.0, Unit::Decibels),
+    ];
 
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let n = fft_size(sample_rate);
@@ -240,6 +284,7 @@ impl DeReverb {
             beta: 1.0,
             floor: 1.0,
             alpha: (-(hop as f64) / (sample_rate as f64 * DEREVERB_PSD_TAU)).exp() as f32,
+            out_gain: 1.0,
         };
         s.apply_params(true);
         s
@@ -253,6 +298,8 @@ impl DeReverb {
         self.decay = (-2.0 * delta * td).exp() as f32;
         self.beta = 1.0 + amount;
         self.floor = db_to_gain(-18.0 * amount);
+        let drop = if self.pv.v("auto_gain") >= 0.5 { 0.0 } else { DEREVERB_NO_AUTO_GAIN_DB };
+        self.out_gain = db_to_gain(self.pv.v("makeup") - drop);
     }
 }
 
@@ -270,7 +317,7 @@ impl AudioEffect for DeReverb {
         let nch = channels.len().min(self.stft.len());
         let (n, hop, delay) = (self.n, self.hop, self.delay);
         let (decay, beta, floor, alpha) = (self.decay, self.beta, self.floor, self.alpha);
-        let scale = 1.0 / (n as f32 * 2.0);
+        let scale = self.out_gain / (n as f32 * 2.0);
         let bins = n / 2 + 1;
         for ch in 0..nch {
             let st = &mut self.state[ch];
@@ -590,6 +637,52 @@ mod tests {
             assert!(low_change.abs() < 1.0, "voice band changed {low_change} dB");
             assert!(quiet_change.abs() < 0.5, "non-sibilant passages changed {quiet_change} dB");
         }
+    }
+
+    /// Multiband cuts its band only, once the band itself passes the threshold (dBFS).
+    #[test]
+    fn deesser_multiband_cuts_its_band_above_an_absolute_threshold() {
+        let n = SR as usize * 3;
+        let voice = harmonic_voice(n, 150.0, 0.15);
+        let sib = bandpassed_noise(11, n, 5000.0, 10000.0, 0.6);
+        let x: Vec<f32> = voice.iter().zip(&sib).map(|(v, s)| v + s).collect();
+        let run = |threshold: f32| {
+            let mut d = DeEsser::new(SR, 1);
+            for (id, v) in [("mode", 1.0), ("frequency", 7000.0), ("bandwidth", 5000.0), ("threshold", threshold), ("reduction", 10.0)] {
+                d.set_param(id, v);
+            }
+            d.reset();
+            let mut y = x.clone();
+            d.process(&mut [&mut y]);
+            let (xs, ys) = (&x[SR as usize..], &y[SR as usize..]);
+            let change = |lo: f64, hi: f64| 10.0 * (band_energy(ys, lo, hi) / band_energy(xs, lo, hi)).log10();
+            (change(5000.0, 10000.0), change(150.0, 1500.0))
+        };
+        let (sib_drop, voice_change) = run(-40.0);
+        assert!(sib_drop < -5.0 && voice_change.abs() < 1.0, "sibilance {sib_drop} dB, voice {voice_change} dB");
+        // the band never reaches 0 dBFS: nothing is cut
+        let (sib_drop, voice_change) = run(0.0);
+        assert!(sib_drop.abs() < 0.5 && voice_change.abs() < 0.5, "sibilance {sib_drop} dB, voice {voice_change} dB");
+    }
+
+    /// Auto Gain off drops the output by 9.75 dB; Make-Up Gain adds dB for dB.
+    #[test]
+    fn dereverb_auto_gain_and_make_up() {
+        let x = harmonic_voice(SR as usize * 2, 180.0, 0.25);
+        let run = |auto_gain: f32, makeup: f32| {
+            let mut d = DeReverb::new(SR, 1);
+            d.set_param("auto_gain", auto_gain);
+            d.set_param("makeup", makeup);
+            d.reset();
+            let mut y = x.clone();
+            d.process(&mut [&mut y]);
+            energy(&y[SR as usize..])
+        };
+        let on = run(1.0, 0.0);
+        let level = |e: f64| 10.0 * (e / on).log10();
+        assert!((level(run(0.0, 0.0)) + 9.75).abs() < 0.01, "{}", level(run(0.0, 0.0)));
+        assert!((level(run(0.0, 10.0)) - 0.25).abs() < 0.01, "{}", level(run(0.0, 10.0)));
+        assert!((level(run(1.0, 6.0)) - 6.0).abs() < 0.01, "{}", level(run(1.0, 6.0)));
     }
 
     #[test]

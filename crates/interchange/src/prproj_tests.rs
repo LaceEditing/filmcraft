@@ -786,15 +786,38 @@ fn track_mix_master_and_clip_pan_are_read() {
     assert_eq!(seq.master_volume_db, 0.0);
 }
 
+/// The FilmCraft effect `id` that the test clip's Premiere audio filter `filter` comes in as, with
+/// these settings (normalised; `None` is saved with no value, as Premiere saves a 1).
+fn with_audio_filter(filter: &str, params: &[(&str, Option<f64>)], id: &str) -> filmcraft_project::EffectInstance {
+    let class = "a714635e-a628-4b27-9d59-77eba47dbc1a";
+    let refs: String = (0..params.len()).map(|i| format!("<Param Index=\"{i}\" ObjectRef=\"{}\"/>", 951 + i)).collect();
+    let objs: String = params
+        .iter()
+        .enumerate()
+        .map(|(i, (name, v))| {
+            let value = v.map(|v| format!("<StartKeyframe>-91445760000000000,{v},0,0,0,0,0,0</StartKeyframe>")).unwrap_or_default();
+            format!("  <AudioComponentParam ObjectID=\"{}\" ClassID=\"{class}\">{value}<Name>{name}</Name></AudioComponentParam>\n", 951 + i)
+        })
+        .collect();
+    let text = doc()
+        .replace("<Component Index=\"0\" ObjectRef=\"74\"/></Components>", "<Component Index=\"0\" ObjectRef=\"74\"/><Component Index=\"1\" ObjectRef=\"950\"/></Components>")
+        .replace(
+            "</PremiereData>",
+            &format!("  <AudioFilterComponent ObjectID=\"950\"><AudioComponent><Component><Params>{refs}</Params></Component></AudioComponent><FilterMatchName>{filter}</FilterMatchName></AudioFilterComponent>\n{objs}</PremiereData>"),
+        );
+    let (imp, _) = import(text.as_bytes(), None);
+    let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+    seq.audio_tracks[0].items[0].effect(id).cloned().expect("the effect")
+}
+
 /// Dynamics Processing's transfer curve (Round 5 B2.4: X/Y pairs in dB = 100·n − 100; a value of 1
-/// is saved with none) comes in as a threshold / ratio compressor when it is one; any other curve
-/// keeps the effect switched off.
+/// is saved with none) comes in as a threshold / ratio compressor when it is one, with its Input
+/// Gain and timing; any other curve keeps the effect switched off.
 #[test]
 fn dynamics_processing_curves_come_in_as_compressors() {
-    let class = "a714635e-a628-4b27-9d59-77eba47dbc1a";
-    let with_settings = |points: &[(f64, f64)], output: f64, peak_rms: f64| {
+    let with_settings = |points: &[(f64, f64)], input: f64, output: f64, peak_rms: f64| {
         let mut params = vec![
-            ("Input Gain", Some(0.5)),
+            ("Input Gain", Some(input)),
             ("Output Gain", Some(output)),
             ("Peak/RMS", (peak_rms < 1.0).then_some(peak_rms)),
             ("Number of X/Y Pairs", Some(points.len() as f64 / 7.0)),
@@ -805,40 +828,68 @@ fn dynamics_processing_curves_come_in_as_compressors() {
             params.push((names[i].0.as_str(), (*l < 1.0).then_some(*l)));
             params.push((names[i].1.as_str(), (*v < 1.0).then_some(*v)));
         }
-        let refs: String = (0..params.len()).map(|i| format!("<Param Index=\"{i}\" ObjectRef=\"{}\"/>", 951 + i)).collect();
-        let objs: String = params
-            .iter()
-            .enumerate()
-            .map(|(i, (name, v))| {
-                let value = v.map(|v| format!("<StartKeyframe>-91445760000000000,{v},0,0,0,0,0,0</StartKeyframe>")).unwrap_or_default();
-                format!("  <AudioComponentParam ObjectID=\"{}\" ClassID=\"{class}\">{value}<Name>{name}</Name></AudioComponentParam>\n", 951 + i)
-            })
-            .collect();
-        let text = doc()
-            .replace("<Component Index=\"0\" ObjectRef=\"74\"/></Components>", "<Component Index=\"0\" ObjectRef=\"74\"/><Component Index=\"1\" ObjectRef=\"950\"/></Components>")
-            .replace(
-                "</PremiereData>",
-                &format!("  <AudioFilterComponent ObjectID=\"950\"><AudioComponent><Component><Params>{refs}</Params></Component></AudioComponent><FilterMatchName>f76dad9c-77da-477a-9939-eefefc5c23bd</FilterMatchName></AudioFilterComponent>\n{objs}</PremiereData>"),
-            );
-        let (imp, _) = import(text.as_bytes(), None);
-        let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
-        seq.audio_tracks[0].items[0].effect("dynamics").cloned().expect("Dynamics Processing")
+        with_audio_filter("f76dad9c-77da-477a-9939-eefefc5c23bd", &params, "dynamics")
     };
     let with_curve = |points: &[(f64, f64)]| {
-        let e = with_settings(points, 0.5, 1.0);
+        let e = with_settings(points, 0.5, 0.5, 1.0);
         (e.enabled, e.f64_at("threshold", Tick::ZERO), e.f64_at("ratio", Tick::ZERO))
     };
     // "4:1 above −20 dB": (0,0) (0.8,0.8) (1,0.85)
     let (on, threshold, ratio) = with_curve(&[(0.0, 0.0), (0.8, 0.8), (1.0, 0.85)]);
     assert!(on && (threshold + 20.0).abs() < 1e-6 && (ratio - 4.0).abs() < 1e-6, "{on} {threshold} {ratio}");
     // the RMS detector (Peak/RMS 0) and Output Gain (n 0.6 = +9.6 dB) come with it
-    let e = with_settings(&[(0.0, 0.0), (0.8, 0.8), (1.0, 0.85)], 0.6, 0.0);
+    let e = with_settings(&[(0.0, 0.0), (0.8, 0.8), (1.0, 0.85)], 0.5, 0.6, 0.0);
     assert_eq!(e.param("detect").map(|p| p.value.clone()), Some(ParamValue::Choice(1)));
     assert!((e.f64_at("output", Tick::ZERO) - 9.6).abs() < 1e-6, "{}", e.f64_at("output", Tick::ZERO));
+    // Premiere's default timing (8.5 / 19.5 ms to 63 %) on FilmCraft's peak detector, hard corners
+    let e = with_settings(&[(0.0, 0.0), (0.8, 0.8), (1.0, 0.85)], 0.5, 0.5, 1.0);
+    let at = |id: &str| e.f64_at(id, Tick::ZERO);
+    assert!((at("attack") - 5.0).abs() < 0.01 && (at("release") - 19.5).abs() < 0.01 && at("knee") == 0.0 && at("input") == 0.0);
+    // Input Gain n 0.6 is +19.2 dB
+    let e = with_settings(&[(0.0, 0.0), (0.8, 0.8), (1.0, 1.0)], 0.6, 0.5, 1.0);
+    assert!(e.enabled && (e.f64_at("input", Tick::ZERO) - 19.2).abs() < 1e-6, "{}", e.f64_at("input", Tick::ZERO));
     // the default identity line compresses nothing
     let (on, _, ratio) = with_curve(&[(0.0, 0.0), (0.8, 0.8), (1.0, 1.0)]);
     assert!(on && ratio == 1.0);
     // an expander below −30 dB is not a compressor: off
     let (on, ..) = with_curve(&[(0.4, 0.1), (0.7, 0.7), (1.0, 1.0)]);
     assert!(!on);
+}
+
+/// The DeEsser comes in in Premiere's own units (Round 5 B2: Threshold −80·(1 − n) dBFS, Center
+/// Frequency 500 + 11 500·n Hz, Bandwidth 100 + 7 400·n Hz; Mode 1, saved with no value, is
+/// Multiband); with Output Sibilance Only on it stays switched off.
+#[test]
+fn deessers_come_in_in_premieres_units() {
+    let with = |mode: Option<f64>, sibilance_only: Option<f64>| {
+        let params = [
+            ("Threshold", Some(0.625)),
+            ("Center Frequency", Some(0.391304343939)),
+            ("Bandwidth", Some(0.391891896725)),
+            ("Output Sibilance Only", sibilance_only),
+            ("Mode", mode),
+        ];
+        with_audio_filter("ffbe710f-cd69-4139-ad26-65603616d9d4", &params, "deesser")
+    };
+    let e = with(None, Some(0.0));
+    let near = |id: &str, want: f64| (e.f64_at(id, Tick::ZERO) - want).abs() < 0.01;
+    assert!(e.enabled && near("threshold", -30.0) && near("frequency", 5000.0) && near("bandwidth", 3000.0) && near("reduction", 10.0));
+    assert_eq!(e.param("mode").map(|p| p.value.clone()), Some(ParamValue::Choice(1)));
+    let broadband = with(Some(0.0), Some(0.0));
+    assert!(broadband.enabled && broadband.param("mode").map(|p| p.value.clone()) == Some(ParamValue::Choice(0)));
+    assert!(!with(None, None).enabled);
+}
+
+/// DeReverb's Auto Gain (on, its default, is saved with no value) and Make-Up Gain (0…20 dB) come
+/// in with its Amount.
+#[test]
+fn dereverb_auto_gain_and_make_up_come_in() {
+    let with = |auto_gain: Option<f64>, makeup: f64| {
+        let params = [("Amount", Some(0.4)), ("Make-Up Gain", Some(makeup)), ("Auto Gain", auto_gain)];
+        with_audio_filter("aeb0b5ea-5024-4f02-8097-81f8fd7aba92", &params, "dereverb")
+    };
+    let e = with(Some(0.0), 0.5);
+    assert!(e.enabled && (e.f64_at("amount", Tick::ZERO) - 40.0).abs() < 1e-6 && (e.f64_at("makeup", Tick::ZERO) - 10.0).abs() < 1e-6);
+    assert_eq!(e.f64_at("auto_gain", Tick::ZERO), 0.0);
+    assert_eq!(with(None, 0.0).f64_at("auto_gain", Tick::ZERO), 1.0);
 }

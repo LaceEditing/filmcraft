@@ -233,9 +233,12 @@ pub(super) fn defs() -> Vec<EffectDef> {
             "DeEsser",
             A_AMP,
             vec![
-                hz("frequency", "Frequency", 6000.0, 2000.0, 12000.0),
-                db("threshold", "Threshold", -12.0, -40.0, 0.0),
+                hz("frequency", "Frequency", 6000.0, 500.0, 12000.0),
+                // broadband: above the whole signal's level; multiband: the band's own (dBFS)
+                db("threshold", "Threshold", -12.0, -80.0, 0.0),
                 db("reduction", "Maximum Reduction", 8.0, 0.0, 24.0),
+                ch("mode", "Mode", &["Broadband", "Multiband"], 0),
+                hz("bandwidth", "Bandwidth", 2000.0, 100.0, 8000.0),
             ],
         ),
         audio("dynamics_rack", "Dynamics", A_AMP, dynamics()),
@@ -244,8 +247,10 @@ pub(super) fn defs() -> Vec<EffectDef> {
             "Dynamics Processing",
             A_AMP,
             vec![
+                db("input", "Input Gain", 0.0, -40.0, 40.0),
                 db("threshold", "Threshold", -20.0, -60.0, 0.0),
                 num("ratio", "Ratio", 4.0, 1.0, 30.0, ":1", 1),
+                db("knee", "Knee", 6.0, 0.0, 24.0),
                 ms("attack", "Attack", 10.0, 0.1, 500.0),
                 fs("release", "Release", 100.0, (1.0, 5000.0), (1.0, 5000.0), "ms", 0),
                 ch("detect", "Detection", &["Peak", "RMS"], 0),
@@ -438,7 +443,12 @@ pub(super) fn defs() -> Vec<EffectDef> {
             "dereverb",
             "DeReverb",
             A_NOISE,
-            vec![f("amount", "Amount", 50.0, 0.0, 100.0, "%"), fs("rt60", "Decay Time (RT60)", 0.8, (0.1, 5.0), (0.1, 3.0), "s", 2)],
+            vec![
+                f("amount", "Amount", 50.0, 0.0, 100.0, "%"),
+                fs("rt60", "Decay Time (RT60)", 0.8, (0.1, 5.0), (0.1, 3.0), "s", 2),
+                b("auto_gain", "Auto Gain", true),
+                db("makeup", "Make-Up Gain", 0.0, 0.0, 20.0),
+            ],
         ),
         audio("speech_enhance", "Enhance Speech", A_NOISE, vec![f("mix", "Mix", 100.0, 0.0, 100.0, "%"), ch("tone", "Voice", &["Low Tone", "High Tone"], 0)]),
         // ---- Reverb ----

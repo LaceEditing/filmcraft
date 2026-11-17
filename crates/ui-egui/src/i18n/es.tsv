@@ -3650,6 +3650,13 @@
 	Peak	Pico
 	True Peak	Pico real
 	RMS	RMS
+	Broadband	Banda ancha
+	Multiband	Multibanda
+	Bandwidth	Ancho de banda
+	Auto Gain	Ganancia automática
+	Make-Up Gain	Ganancia de compensación
+	Input Gain	Ganancia de entrada
+	Knee	Codo
 	Voice Leveler	Nivelador de voz
 	Gate and Compress	Puerta y compresión
 	Voice Over	Voz en off

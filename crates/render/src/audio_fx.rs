@@ -42,6 +42,8 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
                 d.set_param("release", f(e, "release", t));
                 d.set_param("detector", f(e, "detect", t));
                 d.set_param("makeup", f(e, "output", t));
+                d.set_param("knee", f(e, "knee", t));
+                d.set_param("input_gain", f(e, "input", t));
             },
         },
         "hard_limiter" => Mapping {
@@ -95,6 +97,8 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
                 d.set_param("frequency", f(e, "frequency", t));
                 d.set_param("threshold", f(e, "threshold", t));
                 d.set_param("reduction", f(e, "reduction", t));
+                d.set_param("mode", f(e, "mode", t));
+                d.set_param("bandwidth", f(e, "bandwidth", t));
             },
         },
         "dereverb" => Mapping {
@@ -103,6 +107,8 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
             apply: |d, e, t| {
                 d.set_param("amount", f(e, "amount", t));
                 d.set_param("rt60", f(e, "rt60", t));
+                d.set_param("auto_gain", f(e, "auto_gain", t));
+                d.set_param("makeup", f(e, "makeup", t));
             },
         },
         "speech_enhance" => Mapping {

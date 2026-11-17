@@ -36,10 +36,13 @@ pub fn expander_curve(x: f32, threshold: f32, ratio: f32, range: f32) -> f32 {
 
 // ---------------------------------------------------------------------------------------------
 
-/// Feed-forward compressor (peak or RMS detector, soft knee, attack/release, make-up gain).
+/// Feed-forward compressor (input gain, peak or RMS detector, soft knee, attack/release, make-up
+/// gain).
 pub struct Compressor {
     pv: ParamValues,
     sr: f32,
+    /// Input gain (linear), ahead of the detector and the gain.
+    input: f32,
     threshold: f32,
     ratio: f32,
     knee: f32,
@@ -64,12 +67,14 @@ impl Compressor {
         ParamSpec::log("release", "Release", 1.0, 3000.0, 100.0, Unit::Milliseconds),
         ParamSpec::new("makeup", "Make-up Gain", -40.0, 40.0, 0.0, Unit::Decibels),
         ParamSpec::choice("detector", "Detector", &["Peak", "RMS"], 0),
+        ParamSpec::new("input_gain", "Input Gain", -40.0, 40.0, 0.0, Unit::Decibels),
     ];
 
     pub fn new(sample_rate: f32, _channels: usize) -> Self {
         let mut s = Compressor {
             pv: ParamValues::new(Self::PARAMS),
             sr: sample_rate,
+            input: 1.0,
             threshold: 0.0,
             ratio: 1.0,
             knee: 0.0,
@@ -87,6 +92,7 @@ impl Compressor {
     }
 
     fn apply_params(&mut self, snap: bool) {
+        self.input = db_to_gain(self.pv.v("input_gain"));
         self.threshold = self.pv.v("threshold");
         self.ratio = self.pv.v("ratio");
         self.knee = self.pv.v("knee");
@@ -113,7 +119,8 @@ impl Compressor {
 impl AudioEffect for Compressor {
     param_plumbing!("compressor");
     fn transfer_db(&self, band: usize, input_db: f32) -> Option<f32> {
-        (band == 0).then(|| self.curve(input_db) + self.pv.v("makeup"))
+        let x = input_db + self.pv.v("input_gain");
+        (band == 0).then(|| self.curve(x) + self.pv.v("makeup"))
     }
     fn reset(&mut self) {
         self.makeup.snap();
@@ -127,7 +134,7 @@ impl AudioEffect for Compressor {
             let mut peak = 0.0f32;
             let mut sq = 0.0f32;
             for ch in channels.iter() {
-                let x = ch[i];
+                let x = ch[i] * self.input;
                 peak = peak.max(x.abs());
                 sq = sq.max(x * x);
             }
@@ -146,7 +153,7 @@ impl AudioEffect for Compressor {
             if self.env.abs() < 1e-9 {
                 self.env = 0.0;
             }
-            let g = db_to_gain(self.env) * self.makeup.tick();
+            let g = self.input * db_to_gain(self.env) * self.makeup.tick();
             for ch in channels.iter_mut() {
                 ch[i] *= g;
             }
@@ -520,6 +527,23 @@ mod tests {
                 assert_eq!(l[47999], -r[47999]);
             }
         }
+    }
+
+    /// Input Gain comes ahead of the curve: +12 dB lifts −40 dB to −28, and −10 dB into the 4:1
+    /// part (+2 dB in: −14.5 out).
+    #[test]
+    fn compressor_input_gain_comes_ahead_of_the_curve() {
+        let mut c = Compressor::new(SR, 1);
+        for (id, v) in [("threshold", -20.0), ("ratio", 4.0), ("knee", 0.0), ("input_gain", 12.0)] {
+            c.set_param(id, v);
+        }
+        for (level_db, expect) in [(-40.0f32, -28.0f32), (-10.0, -14.5)] {
+            c.reset();
+            let mut x = vec![db_to_gain(level_db); 48000];
+            c.process(&mut [&mut x]);
+            assert!((lin_to_db(x[47999]) - expect).abs() < 0.05, "in {level_db}: {} vs {expect}", lin_to_db(x[47999]));
+        }
+        assert!((c.transfer_db(0, -40.0).unwrap_or(f32::NAN) + 28.0).abs() < 1e-3);
     }
 
     #[test]

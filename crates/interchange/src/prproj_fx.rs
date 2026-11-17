@@ -200,6 +200,9 @@ pub(crate) const AUDIO_PARAMS: &[(&str, &str, &str, Conv)] = &[
     // and 1–2 dB per third octave on the Round 5 B2 speech, closer than off at every Amount (its
     // display is normalised in Premiere; Auto Gain, Make-Up and the shelf are not read)
     ("dereverb", "Amount", "amount", Conv::Lin(0.0, 100.0)),
+    // Make-Up n 0.5 with Auto Gain off brings Premiere's level up by 10.0 dB (Round 5 B2.5)
+    ("dereverb", "Auto Gain", "auto_gain", Conv::Flag(1)),
+    ("dereverb", "Make-Up Gain", "makeup", Conv::Lin(0.0, 20.0)),
     ("dynamics_rack", "AutoGate Enabled", "gate_on", Conv::Flag(1)),
     ("dynamics_rack", "AutoGate Threshold", "gate_threshold", Conv::Lin(-60.0, 0.0)),
     ("dynamics_rack", "Compressor Enabled", "comp_on", Conv::Flag(1)),
@@ -296,28 +299,29 @@ pub(crate) struct Dynamics {
     pub rms: bool,
     /// Output Gain in dB: 96·n − 48 (Round 5 B2.4: n 0.6 is +9.6 dB).
     pub output: f64,
+    /// Input Gain in dB: 192·n − 96 (Round 5 B2.4: n 0.6 lifts −40 dB to −20.8 through the
+    /// identity curve).
+    pub input: f64,
+    /// 0 dB: the curve's corners are sharp, unless Spline Curves rounds them (FilmCraft's 6 dB).
+    pub knee: f64,
+    pub attack: f64,
+    pub release: f64,
 }
 
 /// Premiere's Dynamics Processing as FilmCraft's threshold / ratio compressor, when its transfer
 /// curve is one. The curve is `Number of X/Y Pairs` (n·7) points `Location…` → `Value…`, both in
 /// dB = 100·n − 100 (Round 5 B2.4: the default (0,0) (0.8,0.8) (1,1) is the identity line). It maps
-/// when it follows the identity line up to a knee and one straight segment above it, unanimated,
-/// with Input Gain at 0 dB (n 0.5). `None` for any other curve (an expander, several knees) or
-/// Input Gain, which FilmCraft cannot play.
+/// when it follows the identity line up to a knee and one straight segment above it, unanimated.
+/// `None` for any other curve (an expander, several knees). Premiere mutes what Input Gain lifts
+/// above 0 dBFS (B2.4: −10 dB through +19.2 dB comes out at −92 dB); FilmCraft does not.
 pub(crate) fn dynamics_curve(c: &Component) -> Option<Dynamics> {
-    let value = |name: &str| -> Option<f64> {
-        let p = c.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim().eq_ignore_ascii_case(name)))?;
-        match decode(p, Conv::Lin(0.0, 1.0))? {
-            Canon { value: Val::F(v), keys } if keys.is_empty() => Some(v),
-            _ => None,
-        }
-    };
-    if value("Input Gain").is_none_or(|v| (v - 0.5).abs() > 1e-3) {
-        return None;
-    }
+    let value = |name: &str| fixed(c, name);
     let output = (96.0 * value("Output Gain")? - 48.0).clamp(-40.0, 40.0);
+    let input = (192.0 * value("Input Gain")? - 96.0).clamp(-40.0, 40.0);
     let rms = value("Peak/RMS").is_some_and(|v| v < 0.5);
-    let dynamics = |threshold: f64, ratio: f64| Dynamics { threshold, ratio, rms, output };
+    let knee = if value("Spline Curves").is_some_and(|v| v >= 0.5) { 6.0 } else { 0.0 };
+    let (attack, release) = dynamics_timing(c, rms);
+    let dynamics = |threshold: f64, ratio: f64| Dynamics { threshold, ratio, rms, output, input, knee, attack, release };
     let n = (value("Number of X/Y Pairs")? * 7.0).round() as usize;
     if !(2..=7).contains(&n) {
         return None;
@@ -338,6 +342,60 @@ pub(crate) fn dynamics_curve(c: &Component) -> Option<Dynamics> {
     let s = slope(pts.last()?)?;
     let straight = pts[knee..].iter().all(|p| slope(p).is_some_and(|k| (k - s).abs() < 1e-3));
     (straight && (0.0..1.0).contains(&s) && (-60.0..=0.0).contains(&threshold)).then(|| dynamics(threshold, (1.0 / s.max(1.0 / 30.0)).min(30.0)))
+}
+
+/// FilmCraft attack and release (ms) that give Premiere's 63 % times on Round 5 B2.4's steps
+/// (−40 → −10 → −40 dB through 4:1 above −20 dB). Premiere takes 8.5 ms to attack and 19.5 ms to
+/// release at its defaults (Level Detector attack n 0.002, release 0.05; Gain Processor attack
+/// 0.048, release 0.05; Lookahead 0.006); 11.5 / 158.5 ms with the detector at 0.02 / 0.5;
+/// 43.5 / 79.5 ms with the gain processor at 0.2 / 0.5; an 11.5 ms attack with no lookahead;
+/// and 3 ms longer to attack, 2 ms shorter to release with the RMS detector. The times here are
+/// linear in each setting through those points. FilmCraft's peak detector takes 1.5·a + 1 ms to
+/// attack and r ms to release; its RMS detector a + 7 and r + 14.5 ms.
+fn dynamics_timing(c: &Component, rms: bool) -> (f64, f64) {
+    let value = |name: &str, default: f64| fixed(c, name).unwrap_or(default);
+    let attack = 8.5 + 166.7 * (value("Level Detector - Attack Time", 0.002) - 0.002) + 230.0 * (value("Gain Processor - Attack Time", 0.048) - 0.048)
+        - 500.0 * (value("Lookahead Time", 0.006) - 0.006);
+    let release = 19.5 + 308.9 * (value("Level Detector - Release Time", 0.05) - 0.05) + 133.3 * (value("Gain Processor - Release Time", 0.05) - 0.05);
+    let (a, r) = if rms { (attack + 3.0 - 7.0, release - 2.0 - 14.5) } else { ((attack - 1.0) / 1.5, release) };
+    (a.clamp(0.1, 500.0), r.clamp(1.0, 5000.0))
+}
+
+/// Premiere's DeEsser as FilmCraft's ([`deesser_settings`]).
+pub(crate) struct DeEsser {
+    pub multiband: bool,
+    pub frequency: f64,
+    pub bandwidth: f64,
+    pub threshold: f64,
+    pub reduction: f64,
+}
+
+/// Premiere's DeEsser settings in FilmCraft's DeEsser. Premiere keeps them normalised and, in the
+/// filter's `OpaqueData`, in its own units (Round 5 B2: Threshold −80·(1 − n) dBFS, Center
+/// Frequency 500 + 11 500·n Hz, Bandwidth 100 + 7 400·n Hz); its Max Reduction is not a setting,
+/// and 10 dB matches its renders best. FilmCraft then comes within 0.3–1.3 dB of Premiere per
+/// third octave on the kit's eight settings (3.1 dB on average with the effect off). `None` with
+/// Output Sibilance Only on, or animated.
+pub(crate) fn deesser_settings(c: &Component) -> Option<DeEsser> {
+    if fixed(c, "Output Sibilance Only").is_some_and(|v| v >= 0.5) {
+        return None;
+    }
+    Some(DeEsser {
+        multiband: fixed(c, "Mode").is_none_or(|v| v >= 0.5),
+        frequency: (500.0 + 11_500.0 * fixed(c, "Center Frequency")?).clamp(500.0, 12_000.0),
+        bandwidth: (100.0 + 7_400.0 * fixed(c, "Bandwidth")?).clamp(100.0, 8_000.0),
+        threshold: (-80.0 * (1.0 - fixed(c, "Threshold")?)).clamp(-80.0, 0.0),
+        reduction: 10.0,
+    })
+}
+
+/// A component setting's normalised value, when it is not animated.
+fn fixed(c: &Component, name: &str) -> Option<f64> {
+    let p = c.params.iter().copied().find(|p| child_text(*p, "Name").is_some_and(|n| n.trim().eq_ignore_ascii_case(name)))?;
+    match decode(p, Conv::Lin(0.0, 1.0))? {
+        Canon { value: Val::F(v), keys } if keys.is_empty() => Some(v),
+        _ => None,
+    }
 }
 
 /// Whether FilmCraft reads this audio effect's settings (else it comes in switched off).
