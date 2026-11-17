@@ -794,13 +794,6 @@ fn a_graphics_tab_edit_writes_keyframed_text_where_it_is_shown() {
     assert_eq!(at(&mut d, late), filmcraft_project::ParamValue::Text("End".into()), "the end keeps its own");
 }
 
-/// Click the entry labelled `label` of the open drop-down list with the pointer.
-fn pick(d: &mut Driver, label: &str) {
-    let r = d.harness.get_by_label(label).rect();
-    d.ok("ui.click", json!({"x": (r.min.x + r.max.x) / 2.0, "y": (r.min.y + r.max.y) / 2.0}));
-    d.frames(3);
-}
-
 // Upstream's #3539 test of its Font / Font Style drop-downs in Effect Controls is not carried: the
 // fork draws those rows with its searchable font picker (`effectControls.graphic_text.font`),
 // covered by the font picker test above.
