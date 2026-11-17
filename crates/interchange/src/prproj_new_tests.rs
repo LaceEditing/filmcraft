@@ -187,6 +187,30 @@ fn motion_opacity_volume_links_and_markers_are_written() {
     assert!(s.children().any(|c| c.has_tag_name("MarkerOwner")), "markers on the Sequence");
 }
 
+/// Track pan and mono tracks are written as Premiere saves them (Round 5 B3): a stereo track's
+/// Balance, a mono track's `ChannelType` 0 and its Pan into the stereo mix.
+#[test]
+fn track_pan_and_mono_tracks_are_written() {
+    let (mut p, main, _) = project();
+    {
+        let q = p.sequence_mut(main).unwrap();
+        q.audio_tracks[0].pan = -40.0;
+        q.audio_tracks[1].channels = AudioChannels::Mono;
+        q.audio_tracks[1].pan = 100.0;
+    }
+    let (bytes, report) = create(&p, &opts()).unwrap();
+    assert!(!report.mentions("pan") && !report.mentions("mono"), "{report}");
+    let (xml, _) = prproj_graph::decompress(&bytes).unwrap();
+    let text = String::from_utf8(xml).unwrap();
+    assert!(crate::prproj_write::problems(&text).is_empty(), "{:?}", crate::prproj_write::problems(&text));
+    assert!(text.contains("<MonoToStereoPanProcessor") && text.contains("<Name>Pan</Name>"));
+    let (back, _) = read(&bytes);
+    let seq = back.items.values().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
+    let tracks: Vec<_> = seq.audio_tracks.iter().map(|t| (t.channels, t.pan)).collect();
+    assert_eq!(&tracks[..2], &[(AudioChannels::Stereo, -40.0), (AudioChannels::Mono, 100.0)]);
+    assert_eq!(clips(&back, "Main Edit", TrackKind::Audio), clips(&p, "Main Edit", TrackKind::Audio));
+}
+
 #[test]
 fn what_a_new_premiere_project_cannot_hold_is_reported() {
     let (mut p, main, _) = project();

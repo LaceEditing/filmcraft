@@ -22,7 +22,8 @@
 //! of whose parameters FilmCraft maps are borrowed, so no setting of the borrowed clip leaks in.
 //!
 //! Not written (each listed in the report): effects and transitions with no model, graphics /
-//! titles, generated media other than colour mattes and black video, captions and track effects.
+//! titles, generated media other than colour mattes and black video, captions, track effects,
+//! mute and solo, and 5.1 or adaptive tracks (written as stereo ones).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
@@ -105,6 +106,7 @@ mod class {
     pub const METER: (&str, u32) = ("72ea4700-f615-11d5-abc4-c186585e63e0", 2);
     pub const STEREO_PANNER: (&str, u32) = ("7bf86a01-efbe-11d5-abc4-c1ce2b1e9090", 1);
     pub const DEFAULT_PANNER: (&str, u32) = ("33a94282-ee2c-11d5-abc4-c1cd7f9e3c10", 2);
+    pub const MONO_PANNER: (&str, u32) = ("33a94283-ee2c-11d5-abc4-c1cd7f9e3c10", 1);
     pub const VIDEO_TRACK_ITEM: (&str, u32) = ("368b0406-29e3-4923-9fcd-094fbf9a1089", 8);
     pub const AUDIO_TRACK_ITEM: (&str, u32) = ("064ec682-9ba6-11d5-af2d-9ca32c7d6164", 11);
     pub const SUB_CLIP: (&str, u32) = ("e0c58dc9-dbdd-4166-aef7-5db7e3f22e84", 6);
@@ -204,7 +206,7 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
             let before = t.transitions.len();
             t.transitions.retain(|tr| have.contains(&Need::transition(&tr.effect, audio)));
             transitions += before - t.transitions.len();
-            if !t.effects.is_empty() || t.pan.abs() > 1e-9 || t.muted || t.solo {
+            if !t.effects.is_empty() || t.muted || t.solo {
                 track_settings += 1;
             }
             t.items.retain_mut(|c| match target.get(&c.item).copied().unwrap_or(Err("missing items")) {
@@ -267,7 +269,7 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
         report.warn(format!("{transitions} transition(s) left out (none of your Premiere projects FilmCraft has opened has that transition to copy)"));
     }
     if track_settings > 0 {
-        report.warn(format!("track effects, pan, mute and solo of {track_settings} track(s) were not written (track volume was)"));
+        report.warn(format!("track effects, mute and solo of {track_settings} track(s) were not written (track volume and pan were)"));
     }
     if captions > 0 {
         report.warn(format!("{captions} caption track(s) were not written"));
@@ -790,8 +792,13 @@ impl<'p> Seed<'p> {
                 self.sequence(*id, uid);
             }
         }
-        if project.sequences().filter_map(|i| i.as_sequence()).flat_map(|s| s.audio_tracks.iter()).any(|t| t.channels != AudioChannels::Stereo) {
-            self.report.warn("mono, 5.1 and adaptive audio tracks were written as stereo tracks");
+        if project
+            .sequences()
+            .filter_map(|i| i.as_sequence())
+            .flat_map(|s| s.audio_tracks.iter())
+            .any(|t| !matches!(t.channels, AudioChannels::Stereo | AudioChannels::Mono))
+        {
+            self.report.warn("5.1 and adaptive audio tracks were written as stereo tracks");
         }
         self.templates();
         // the bin tree, in FilmCraft's order; items no bin lists go to the root
@@ -1194,39 +1201,27 @@ impl<'p> Seed<'p> {
         let audio_n = seq.audio_tracks.len().max(1);
         let mut audio_tracks = Vec::new();
         for i in 0..audio_n {
-            let volume = seq.audio_tracks.get(i).map(|t| t.volume_db).unwrap_or(0.0);
-            let fader = self.fader(sample, volume);
-            let meter = self.meter(sample);
+            let track = seq.audio_tracks.get(i);
+            let volume = track.map(|t| t.volume_db).unwrap_or(0.0);
+            // a mono track as Premiere saves one (Round 5 B3): mono fader, meter and panner, and
+            // `ChannelType` 0 on the track; its chain lists them with no layout of its own
+            let mono = track.is_some_and(|t| t.channels == AudioChannels::Mono);
+            let fader = self.fader(sample, volume, mono);
+            let meter = self.meter(sample, mono);
+            let chain_layout =
+                if mono { String::new() } else { format!("<FrameRate>{sample}</FrameRate>{}<ChannelType>1</ChannelType>", el("AudioChannelLayout", STEREO)) };
             let chain = self.obj(
                 "AudioComponentChain",
                 class::AUDIO_CHAIN,
-                &format!(
-                    "<ComponentChain Version=\"3\">{}</ComponentChain><FrameRate>{sample}</FrameRate>{}<ChannelType>1</ChannelType>",
-                    list("Components", "Component", &[fader, meter], false),
-                    el("AudioChannelLayout", STEREO)
-                ),
+                &format!("<ComponentChain Version=\"3\">{}</ComponentChain>{chain_layout}", list("Components", "Component", &[fader, meter], false)),
             );
-            let balance = self.obj(
-                "AudioComponentParam",
-                class::AUDIO_PARAM,
-                &format!(
-                    "<StartKeyframe>{NO_TIME},0.5,0,0,0,0,0,0</StartKeyframe><CurrentValue>0.5</CurrentValue><Name>Balance</Name><IsInverted>true</IsInverted>"
-                ),
-            );
-            let panner = self.obj(
-                "StereoToStereoPanProcessor",
-                class::STEREO_PANNER,
-                &format!(
-                    "<PanProcessor Version=\"3\"><AudioComponent Version=\"3\"><Component Version=\"7\">{}<ID>{PANNER_ID}</ID></Component><FrameRate>{sample}</FrameRate>{}<ChannelType>1</ChannelType><AudioComponentType>0</AudioComponentType></AudioComponent></PanProcessor>",
-                    list("Params", "Param", &[balance], false),
-                    el("AudioChannelLayout", STEREO)
-                ),
-            );
+            let panner = self.track_panner(sample, track.map_or(0.0, |t| t.pan), mono);
             let t = self.uuid();
             let track_id = self.uuid();
             let props = "<TL.SQTrackExpanded>0</TL.SQTrackExpanded><TL.SQTrackExpandedHeight>41</TL.SQTrackExpandedHeight><MZ.TrackTargeted>1</MZ.TrackTargeted><TL.SQTrackAudioKeyframeStyle>0</TL.SQTrackAudioKeyframeStyle><TL.SQTrackShy>0</TL.SQTrackShy><CM.KeyframeMode>true</CM.KeyframeMode>";
+            let channel_type = if mono { "<ChannelType>0</ChannelType>" } else { "" };
             let body = format!(
-                "{}<AudioTrack Version=\"12\"><ComponentOwner Version=\"1\"><Components ObjectRef=\"{chain}\"/></ComponentOwner><Panner ObjectRef=\"{panner}\"/><FrameRate>{sample}</FrameRate><ID>{track_id}</ID><NextPannerID>4294967279</NextPannerID></AudioTrack>",
+                "{}<AudioTrack Version=\"12\"><ComponentOwner Version=\"1\"><Components ObjectRef=\"{chain}\"/></ComponentOwner><Panner ObjectRef=\"{panner}\"/><FrameRate>{sample}</FrameRate><ID>{track_id}</ID>{channel_type}<NextPannerID>4294967279</NextPannerID></AudioTrack>",
                 // the master track is track 1 of the audio group
                 Self::clip_track(props, i + 2, AUDIO_MEDIA_TYPE, i)
             );
@@ -1234,8 +1229,8 @@ impl<'p> Seed<'p> {
             audio_tracks.push(t);
         }
         // the master track
-        let fader = self.fader(sample, seq.master_volume_db);
-        let meter = self.meter(sample);
+        let fader = self.fader(sample, seq.master_volume_db, false);
+        let meter = self.meter(sample, false);
         let master_chain = self.obj(
             "AudioComponentChain",
             class::AUDIO_CHAIN,
@@ -1331,8 +1326,36 @@ impl<'p> Seed<'p> {
         )
     }
 
-    /// A track fader at `db` (linear; 1.0 is 0 dB).
-    fn fader(&mut self, sample: i64, db: f64) -> u64 {
+    /// A track's panner at `pan` (−100 … 100): a stereo track's Balance, a mono track's Pan into
+    /// the stereo mix, both saved as (pan + 100) / 200 (as every audio setting at 1, +100 is saved
+    /// with no value).
+    fn track_panner(&mut self, sample: i64, pan: f64, mono: bool) -> u64 {
+        let n = if pan.is_finite() { ((pan + 100.0) / 200.0).clamp(0.0, 1.0) } else { 0.5 };
+        let value = if n < 1.0 {
+            format!("<StartKeyframe>{NO_TIME},{},0,0,0,0,0,0</StartKeyframe><CurrentValue>{}</CurrentValue>", num(n), num(n))
+        } else {
+            String::new()
+        };
+        let name = if mono { "Pan" } else { "Balance" };
+        let param = self.obj("AudioComponentParam", class::AUDIO_PARAM, &format!("{value}<Name>{name}</Name><IsInverted>true</IsInverted>"));
+        let (tag, class, layout, kind, output) = if mono {
+            ("MonoToStereoPanProcessor", class::MONO_PANNER, MONO, 0, el("OutputAudioChannelLayout", STEREO))
+        } else {
+            ("StereoToStereoPanProcessor", class::STEREO_PANNER, STEREO, 1, String::new())
+        };
+        self.obj(
+            tag,
+            class,
+            &format!(
+                "<PanProcessor Version=\"3\"><AudioComponent Version=\"3\"><Component Version=\"7\">{}<ID>{PANNER_ID}</ID></Component><FrameRate>{sample}</FrameRate>{}<ChannelType>{kind}</ChannelType><AudioComponentType>0</AudioComponentType></AudioComponent>{output}</PanProcessor>",
+                list("Params", "Param", &[param], false),
+                el("AudioChannelLayout", layout)
+            ),
+        )
+    }
+
+    /// A track fader at `db` (linear; 1.0 is 0 dB), of a mono track or a stereo one.
+    fn fader(&mut self, sample: i64, db: f64, mono: bool) -> u64 {
         let value = if db.is_finite() && db.abs() > 1e-9 {
             let g = 10f64.powf(db.clamp(-200.0, 15.0) / 20.0);
             format!("<StartKeyframe>{NO_TIME},{},0,0,0,0,0,0</StartKeyframe><CurrentValue>{}</CurrentValue>", num(g), num(g))
@@ -1349,20 +1372,22 @@ impl<'p> Seed<'p> {
             "AudioFader",
             class::FADER,
             &format!(
-                "<AudioComponent Version=\"3\"><Component Version=\"7\">{}<ID>1</ID></Component><FrameRate>{sample}</FrameRate>{}<ChannelType>1</ChannelType><AudioComponentType>1</AudioComponentType></AudioComponent>",
+                "<AudioComponent Version=\"3\"><Component Version=\"7\">{}<ID>1</ID></Component><FrameRate>{sample}</FrameRate>{}<ChannelType>{}</ChannelType><AudioComponentType>1</AudioComponentType></AudioComponent>",
                 list("Params", "Param", &[volume, mute], false),
-                el("AudioChannelLayout", STEREO)
+                el("AudioChannelLayout", if mono { MONO } else { STEREO }),
+                u8::from(!mono)
             ),
         )
     }
 
-    fn meter(&mut self, sample: i64) -> u64 {
+    fn meter(&mut self, sample: i64, mono: bool) -> u64 {
         self.obj(
             "AudioMeter",
             class::METER,
             &format!(
-                "<AudioComponent Version=\"3\"><Component Version=\"7\"><ID>2</ID></Component><FrameRate>{sample}</FrameRate>{}<ChannelType>1</ChannelType><AudioComponentType>2</AudioComponentType></AudioComponent>",
-                el("AudioChannelLayout", STEREO)
+                "<AudioComponent Version=\"3\"><Component Version=\"7\"><ID>2</ID></Component><FrameRate>{sample}</FrameRate>{}<ChannelType>{}</ChannelType><AudioComponentType>2</AudioComponentType></AudioComponent>",
+                el("AudioChannelLayout", if mono { MONO } else { STEREO }),
+                u8::from(!mono)
             ),
         )
     }
