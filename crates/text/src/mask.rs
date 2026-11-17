@@ -1,7 +1,8 @@
 //! Coverage-mask operations used for text and shape appearance: strokes (outer / centre / inner)
-//! from an exact Euclidean distance transform, Gaussian-like blur for shadows, offsets.
+//! from the outline with mitred, round or bevelled corners, or from an exact Euclidean distance
+//! transform (round corners) where there is only a mask, Gaussian-like blur for shadows, offsets.
 
-use crate::raster::Mask;
+use crate::raster::{Join, Mask, Path, fill_into, stroke_band};
 
 /// Where a stroke sits relative to the shape's edge (Premiere's stroke types).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -112,6 +113,21 @@ pub fn signed_distance(m: &Mask) -> Vec<f32> {
         .collect()
 }
 
+/// [`stroke`] drawn from the outline itself, so its corners turn as `join` says (a distance
+/// transform can only round them). `path` is the shape in the mask's pixels once offset by
+/// `(dx, dy)` (as [`crate::raster::fill_into`] takes it) and `cover` its filled coverage.
+pub fn stroke_outline(path: &Path, cover: &Mask, (dx, dy): (f32, f32), width: f32, kind: StrokeKind, join: Join) -> Mask {
+    let r = if kind == StrokeKind::Center { width / 2.0 } else { width };
+    let mut m = Mask::new(cover.w, cover.h);
+    fill_into(&stroke_band(path, r, join), &mut m, dx, dy);
+    match kind {
+        StrokeKind::Outer => m.max_with(cover),
+        StrokeKind::Inner => m.a.iter_mut().zip(&cover.a).for_each(|(v, c)| *v = v.min(*c)),
+        StrokeKind::Center => {}
+    }
+    m
+}
+
 /// Stroke coverage of width `width` pixels around the shape in `m`.
 pub fn stroke(m: &Mask, width: f32, kind: StrokeKind) -> Mask {
     let sd = signed_distance(m);
@@ -198,6 +214,45 @@ mod tests {
         assert!(inner.get(12, 20) > 0.99 && inner.get(7, 20) < 0.01 && inner.get(20, 20) < 0.01);
         let centre = stroke(&m, 4.0, StrokeKind::Center);
         assert!(centre.get(9, 20) > 0.99 && centre.get(11, 20) > 0.99 && centre.get(20, 20) < 0.01 && centre.get(5, 20) < 0.01);
+    }
+
+    /// Drawn from the outline, an outer stroke has square corners with a mitre join and round ones
+    /// with a round join (the distance transform's); a concave corner has no hole, and a corner
+    /// too sharp for the miter limit is bevelled.
+    #[test]
+    fn outline_strokes_turn_corners_by_their_join() {
+        let sq = Path::rect(20.0, 20.0, 60.0, 60.0);
+        let cover = fill(&sq, 80, 80, 0.0, 0.0);
+        let miter = stroke_outline(&sq, &cover, (0.0, 0.0), 8.0, StrokeKind::Outer, Join::Miter(2.5));
+        let round = stroke_outline(&sq, &cover, (0.0, 0.0), 8.0, StrokeKind::Outer, Join::Round);
+        // 6.5 px out on both axes: inside a square corner, 9.2 px from a round one's centre
+        assert!(miter.get(13, 13) > 0.99 && round.get(13, 13) < 0.01, "{} {}", miter.get(13, 13), round.get(13, 13));
+        assert!(miter.get(40, 14) > 0.99 && miter.get(40, 10) < 0.01 && miter.get(40, 40) > 0.99);
+        let dt = stroke(&cover, 8.0, StrokeKind::Outer);
+        let worst = dt.a.iter().zip(&round.a).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.6, "round join vs distance transform: {worst}");
+        // an L (concave corner at 40, 40): the stroke inside the bend is whole
+        let mut l = Path::new();
+        for (i, p) in [(20.0, 20.0), (40.0, 20.0), (40.0, 40.0), (60.0, 40.0), (60.0, 60.0), (20.0, 60.0)].iter().enumerate() {
+            if i == 0 { l.move_to(p.0, p.1) } else { l.line_to(p.0, p.1) }
+        }
+        l.close();
+        let lc = fill(&l, 80, 80, 0.0, 0.0);
+        let ls = stroke_outline(&l, &lc, (0.0, 0.0), 8.0, StrokeKind::Outer, Join::Miter(2.5));
+        assert!(ls.get(44, 36) > 0.99 && ls.get(50, 30) < 0.01, "{} {}", ls.get(44, 36), ls.get(50, 30));
+        // a 20° spike: a mitre would reach 5.8 widths out, past the limit, so it is cut off
+        let mut spike = Path::new();
+        spike.move_to(10.0, 40.0);
+        spike.line_to(70.0, 40.0 - 60.0 * (10f32.to_radians()).tan());
+        spike.line_to(70.0, 40.0 + 60.0 * (10f32.to_radians()).tan());
+        spike.close();
+        let sc = fill(&spike, 80, 80, 0.0, 0.0);
+        let at_tip = |join| stroke_outline(&spike, &sc, (0.0, 0.0), 4.0, StrokeKind::Outer, join);
+        // 3 px before the tip: past a bevel, inside a round join; a mitre with a high limit
+        // reaches 5 px out too
+        assert!(at_tip(Join::Miter(2.5)).get(6, 39) < 0.01, "bevelled, not pointed");
+        assert!(at_tip(Join::Round).get(6, 39) > 0.5);
+        assert!(at_tip(Join::Miter(10.0)).get(4, 39) > 0.5);
     }
 
     #[test]

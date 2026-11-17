@@ -229,6 +229,104 @@ impl Path {
     }
 }
 
+/// How a stroke turns a corner of an outline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Join {
+    /// A pointed corner; where the point would be longer than this many times the stroke's
+    /// width (`1 / sin(φ/2)` for a corner of angle φ: 1.41 at a right angle) it is cut off
+    /// (bevelled), as PostScript and Premiere do.
+    Miter(f32),
+    Round,
+    Bevel,
+}
+
+/// Polygons whose non-zero union is the band within `r` pixels of every contour of `path`, on
+/// both sides, with its corners turned by `join`: a quad along every edge and, on the outer side
+/// of every turn, the corner piece. Every polygon winds the same way (positive area), whatever
+/// way the contours wind, so overlapping pieces never cancel.
+pub fn stroke_band(path: &Path, r: f32, join: Join) -> Path {
+    let mut out = Path::new();
+    if r.is_nan() || r <= 0.0 {
+        return out;
+    }
+    let mut poly = |pts: &[(f32, f32)]| {
+        if pts.len() < 3 {
+            return;
+        }
+        let mut it: Box<dyn Iterator<Item = &(f32, f32)>> = if contour_area(pts) < 0.0 { Box::new(pts.iter().rev()) } else { Box::new(pts.iter()) };
+        if let Some(&(x, y)) = it.next() {
+            out.move_to(x, y);
+            for &(x, y) in it {
+                out.line_to(x, y);
+            }
+            out.close();
+        }
+    };
+    for c in &path.contours {
+        // the contour's edges with their unit directions (zero-length ones dropped)
+        let n = c.len();
+        let mut edges: Vec<((f32, f32), (f32, f32), (f32, f32))> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (p0, p1) = (c[i], c[(i + 1) % n]);
+            let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+            let l = (dx * dx + dy * dy).sqrt();
+            if l > 1e-6 {
+                edges.push((p0, p1, (dx / l, dy / l)));
+            }
+        }
+        for &(p0, p1, (dx, dy)) in &edges {
+            let (nx, ny) = (-dy * r, dx * r);
+            poly(&[(p0.0 + nx, p0.1 + ny), (p1.0 + nx, p1.1 + ny), (p1.0 - nx, p1.1 - ny), (p0.0 - nx, p0.1 - ny)]);
+        }
+        if edges.len() < 2 {
+            continue;
+        }
+        for k in 0..edges.len() {
+            let (_, p, d1) = edges[k];
+            let (_, _, d2) = edges[(k + 1) % edges.len()];
+            let cross = d1.0 * d2.1 - d1.1 * d2.0;
+            let dot = d1.0 * d2.0 + d1.1 * d2.1;
+            if cross.abs() < 1e-7 && dot > 0.0 {
+                continue;
+            }
+            // the gap between the two edges' quads is on the side away from the turn
+            let s = if cross > 0.0 { -1.0 } else { 1.0 };
+            let (n1, n2) = ((-d1.1 * s, d1.0 * s), (-d2.1 * s, d2.0 * s));
+            let a = (p.0 + n1.0 * r, p.1 + n1.1 * r);
+            let b = (p.0 + n2.0 * r, p.1 + n2.1 * r);
+            // cosine of half the turn (= sine of half the corner's angle)
+            let cos_half = ((1.0 + dot) / 2.0).max(0.0).sqrt();
+            match join {
+                Join::Miter(limit) if cos_half > 1e-4 && 1.0 / cos_half <= limit => {
+                    let (bx, by) = (n1.0 + n2.0, n1.1 + n2.1);
+                    let bl = (bx * bx + by * by).sqrt().max(1e-9);
+                    let len = r / cos_half;
+                    poly(&[p, a, (p.0 + bx / bl * len, p.1 + by / bl * len), b]);
+                }
+                Join::Round => {
+                    let (a0, a1) = (n1.1.atan2(n1.0), n2.1.atan2(n2.0));
+                    let mut sweep = a1 - a0;
+                    while sweep > std::f32::consts::PI {
+                        sweep -= std::f32::consts::TAU;
+                    }
+                    while sweep < -std::f32::consts::PI {
+                        sweep += std::f32::consts::TAU;
+                    }
+                    let steps = ((sweep.abs() * r.sqrt()).ceil() as usize).clamp(1, 64);
+                    let mut pts = vec![p];
+                    for i in 0..=steps {
+                        let t = a0 + sweep * i as f32 / steps as f32;
+                        pts.push((p.0 + t.cos() * r, p.1 + t.sin() * r));
+                    }
+                    poly(&pts);
+                }
+                _ => poly(&[p, a, b]),
+            }
+        }
+    }
+    out
+}
+
 fn contour_area(c: &[(f32, f32)]) -> f32 {
     let n = c.len();
     let mut a = 0.0;

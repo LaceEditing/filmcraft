@@ -217,6 +217,10 @@ pub struct LayerRaster {
     pub img: Image,
 }
 
+/// How text and shape strokes turn corners: Premiere's default (Preferences ▸ Graphics: Miter,
+/// miter limit 2.5; Round 5: square stroke corners on both NintendoVHS and RahulRai2 titles).
+const STROKE_JOIN: filmcraft_text::Join = filmcraft_text::Join::Miter(2.5);
+
 fn stroke_kind(k: u32) -> StrokeKind {
     match k {
         1 => StrokeKind::Center,
@@ -388,12 +392,14 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
         .strokes
         .iter()
         .map(|(_, w, k)| {
+            // (a mitred corner reaches up to the miter limit times the width out)
+            let point = if let filmcraft_text::Join::Miter(limit) = STROKE_JOIN { limit.max(1.0) } else { 1.0 };
             if *k == 2 {
                 0.0
             } else if *k == 1 {
-                w / 2.0
+                w / 2.0 * point
             } else {
-                *w
+                *w * point
             }
         })
         .fold(0.0f32, f32::max);
@@ -429,7 +435,23 @@ pub fn raster_layer(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option
     if let Some(p) = &shape {
         fill_into(p, &mut cover, -x0 as f32, -y0 as f32);
     }
-    let mut strokes: Vec<(Mask, [f32; 4])> = ap.strokes.iter().map(|(c, sw, k)| (mask::stroke(&cover, sw * s, stroke_kind(*k)), *c)).collect();
+    // strokes from the outline, with Premiere's mitred corners
+    let outline = match (&text, &shape) {
+        (Some(l), _) if !ap.strokes.is_empty() => Some(render::layout_path(l, m)),
+        (None, Some(p)) => Some(p.clone()),
+        _ => None,
+    };
+    let mut strokes: Vec<(Mask, [f32; 4])> = ap
+        .strokes
+        .iter()
+        .map(|(c, sw, k)| {
+            let sm = match &outline {
+                Some(p) => mask::stroke_outline(p, &cover, (-x0 as f32, -y0 as f32), sw * s, stroke_kind(*k), STROKE_JOIN),
+                None => mask::stroke(&cover, sw * s, stroke_kind(*k)),
+            };
+            (sm, *c)
+        })
+        .collect();
     let outer = |k: u32| k != 1 && k != 2;
     // an outer stroke mask includes the shape so the fill sits on it without a seam; with the
     // fill off only the ring outside the edge shows (as in Premiere)

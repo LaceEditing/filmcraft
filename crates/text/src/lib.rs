@@ -25,7 +25,7 @@ pub mod sfnt;
 pub use fonts::{FaceId, Resolved, families, resolve};
 pub use layout::{Align, Caps, Glyph, Layout, Line, ParagraphStyle, StyleRun, TextStyle, layout, layout_rich, measure};
 pub use mask::StrokeKind;
-pub use raster::{Mask, Path, Xform};
+pub use raster::{Join, Mask, Path, Xform};
 
 #[cfg(test)]
 mod perf {
