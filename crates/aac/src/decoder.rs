@@ -110,6 +110,15 @@ impl Decoder {
         &self.layout
     }
 
+    /// Seed perceptual noise substitution from the position of the frame about to be decoded (its
+    /// first sample), so that the frame decodes to the same samples however the decoder got
+    /// there: in order or after a seek. Without it the noise is one running sequence, and a decode
+    /// started elsewhere fills the same noise bands with other noise.
+    pub fn seed_noise(&mut self, position: u64) {
+        let x = position.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.noise_state = ((x >> 32) as u32 ^ x as u32) | 1;
+    }
+
     /// Clear the overlap state (e.g. after a seek).
     pub fn reset(&mut self) {
         for c in &mut self.channels {
@@ -580,5 +589,64 @@ mod tests {
         let dec = Decoder::new(&[0x2B, 0x92, 0x08, 0x00]).unwrap();
         assert!(dec.sbr());
         assert_eq!(dec.sample_rate(), 22_050);
+    }
+
+    /// A mono AAC-LC frame whose one band (the first) is a noise band (PNS), no spectral data.
+    fn noise_frame() -> Vec<u8> {
+        let mut bw = filmcraft_bitstream::BitWriter::new();
+        bw.write_bits(0, 3); // ID_SCE
+        bw.write_bits(0, 4); // element_instance_tag
+        bw.write_bits(120, 8); // global_gain
+        // ics_info: one long window, max_sfb 1, no prediction
+        for (v, n) in [(0, 1), (0, 2), (0, 1), (1, 6), (0, 1)] {
+            bw.write_bits(v, n);
+        }
+        // section_data: one noise section, one band long
+        bw.write_bits(u32::from(NOISE_HCB), 4);
+        bw.write_bits(1, 5);
+        // scale_factor_data: the band's noise energy (first one: 9 bits, offset 256)
+        bw.write_bits(256 + 40, 9);
+        // no pulse, TNS or gain control data
+        bw.write_bits(0, 3);
+        bw.write_bits(7, 3); // ID_END
+        bw.finish()
+    }
+
+    /// Seeded with the frame's position, a noise-substituted frame decodes the same in order and
+    /// after a seek (reset, primed with the frame before); unseeded, its noise depends on how many
+    /// frames came before it.
+    #[test]
+    fn noise_substitution_seeded_by_position_ignores_history() {
+        let asc = [0x12, 0x08]; // AAC-LC, 44.1 kHz, mono
+        let frame = noise_frame();
+        let in_order = |seed: bool| {
+            let mut d = Decoder::new(&asc).unwrap();
+            (0..4u64)
+                .map(|k| {
+                    if seed {
+                        d.seed_noise(k * 1024);
+                    }
+                    d.decode(&frame).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let after_seek = |seed: bool| {
+            let mut d = Decoder::new(&asc).unwrap();
+            // something else was decoded first, then a seek to frame 3: reset, prime with frame 2
+            let _ = d.decode(&frame);
+            d.reset();
+            if seed {
+                d.seed_noise(2 * 1024);
+            }
+            let _ = d.decode(&frame);
+            if seed {
+                d.seed_noise(3 * 1024);
+            }
+            d.decode(&frame).unwrap()
+        };
+        let seq = in_order(true);
+        assert!(seq[3][0].iter().any(|s| s.abs() > 1e-6), "the frame is not silent");
+        assert_eq!(after_seek(true), seq[3]);
+        assert_ne!(after_seek(false), in_order(false)[3], "unseeded noise should depend on the history");
     }
 }

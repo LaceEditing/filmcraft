@@ -40,6 +40,15 @@ pub(crate) struct AudioOut {
     /// End of the range (samples); input past it is silence.
     end: i64,
     pub loudness: Option<LoudnessReport>,
+    /// The export's own mix scope: it continues no effect state playback or another export left
+    /// behind, so the same range always renders the same.
+    scope: u64,
+}
+
+impl Drop for AudioOut {
+    fn drop(&mut self) {
+        filmcraft_render::audio::end_scope(self.scope);
+    }
 }
 
 impl AudioOut {
@@ -61,7 +70,20 @@ impl AudioOut {
             l
         });
         let latency = limiter.as_ref().map(|l| l.latency() as i64).unwrap_or(0);
-        Ok(AudioOut { project, seq, sr, channels: r.channels as usize, gain: 1.0, limiter, latency, next_in: start, out: start, end, loudness: None })
+        Ok(AudioOut {
+            project,
+            seq,
+            sr,
+            channels: r.channels as usize,
+            gain: 1.0,
+            limiter,
+            latency,
+            next_in: start,
+            out: start,
+            end,
+            loudness: None,
+            scope: filmcraft_render::audio::new_scope(),
+        })
     }
 
     /// The loudness pass: measure the integrated loudness of the whole range and set the gain
@@ -149,15 +171,17 @@ impl AudioOut {
         let out_ch = if self.channels == 6 { 6 } else { 2 };
         let mut st = if real > 0 {
             let layout = filmcraft_audio_dsp::channels::Layout::from_channels(out_ch);
-            filmcraft_render::audio::mix_sequence_layout(
-                &self.project,
-                &self.seq,
-                pos,
-                real,
-                sources,
-                layout,
-                filmcraft_audio_dsp::channels::Mixdown::FrontRear,
-            )
+            filmcraft_render::audio::with_scope(self.scope, || {
+                filmcraft_render::audio::mix_sequence_layout(
+                    &self.project,
+                    &self.seq,
+                    pos,
+                    real,
+                    sources,
+                    layout,
+                    filmcraft_audio_dsp::channels::Mixdown::FrontRear,
+                )
+            })
             .channels
         } else {
             vec![Vec::new(); out_ch]

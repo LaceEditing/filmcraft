@@ -26,6 +26,42 @@ use crate::{SourceProvider, transitions};
 pub const CLIP_LANE_VOLUME: &str = "clip.volume";
 pub const CLIP_LANE_PAN: &str = "clip.pan";
 
+// ---- mix scopes
+//
+// Clip effect chains and the mixer graph's state are kept between requests so that sequential
+// consumers continue them (`audio_fx`, `mixer`). Each kept state carries the history of whoever
+// ran it, so a consumer that must render the same whatever played before (an export) mixes in a
+// scope of its own: only requests made in that scope continue its states.
+
+thread_local! {
+    static SCOPE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A scope no state belongs to yet (0 is everyone else's: playback, meters, previews).
+pub fn new_scope() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run `f` (mixes made on this thread) in `scope`.
+pub fn with_scope<R>(scope: u64, f: impl FnOnce() -> R) -> R {
+    let before = SCOPE.with(|s| s.replace(scope));
+    let r = f();
+    SCOPE.with(|s| s.set(before));
+    r
+}
+
+/// Drop the states kept for `scope` (an export that has finished).
+pub fn end_scope(scope: u64) {
+    crate::audio_fx::forget(scope);
+    crate::mixer::forget(scope);
+}
+
+/// The scope mixes on this thread are made in.
+pub(crate) fn current_scope() -> u64 {
+    SCOPE.with(std::cell::Cell::get)
+}
+
 pub fn db_to_gain(db: f64) -> f32 {
     if db <= -96.0 { 0.0 } else { 10f64.powf(db / 20.0) as f32 }
 }
@@ -83,10 +119,11 @@ pub fn track_input_live(
     sources: &dyn SourceProvider,
     ovs: &HashMap<(TrackId, String), Override>,
 ) -> AudioBuffer {
-    track_input_at(project, track, start, frames, sr, sources, ovs, 0)
+    track_input_at(project, track, start, frames, sr, sources, ovs, 0, current_scope())
 }
 
-/// [`track_input_live`] for a track `depth` nested sequences down from the one being mixed.
+/// [`track_input_live`] for a track `depth` nested sequences down from the one being mixed, in
+/// mix scope `scope`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn track_input_at(
     project: &Project,
@@ -97,6 +134,7 @@ pub(crate) fn track_input_at(
     sources: &dyn SourceProvider,
     ovs: &HashMap<(TrackId, String), Override>,
     depth: u32,
+    scope: u64,
 ) -> AudioBuffer {
     let w = crate::mixer::width_of(track.channels);
     let live = ClipLive {
@@ -104,6 +142,7 @@ pub(crate) fn track_input_at(
         pan: ovs.get(&(track.id, CLIP_LANE_PAN.to_string())).copied(),
         mono_law: track.channels == AudioChannels::Stereo,
         depth,
+        scope,
     };
     let range = TimeRange::from_bounds(Tick::from_units(start, sr as i64), Tick::from_units(start + frames as i64, sr as i64));
     let mut tbuf = AudioBuffer::silence(sr, w, frames);
@@ -180,6 +219,8 @@ struct ClipLive {
     mono_law: bool,
     /// How many nested sequences deep this track is ([`crate::MAX_NEST_DEPTH`] ends the descent).
     depth: u32,
+    /// The mix scope ([`with_scope`]).
+    scope: u64,
 }
 
 /// Balance for stereo signals (clip Panner, stereo track pan): centre = unity on both sides, turning
@@ -235,8 +276,8 @@ fn mix_item(
         };
         // The nested sequence is the clip's source: speed, reverse and clip effects apply to its
         // mix exactly as they do to a media clip's sound.
-        let read = |m0: i64, len: usize| Some(nested_mix(project, &q, m0, len, sr, sources, w, live.depth));
-        effected(item, &read, a0, n, sr, w)
+        let read = |m0: i64, len: usize| Some(nested_mix(project, &q, m0, len, sr, sources, w, live.depth, live.scope));
+        effected(item, &read, a0, n, sr, w, live.scope)
     } else {
         let Some(src) = sources.source(item.item) else { return };
         if !src.info().has_audio() {
@@ -248,7 +289,7 @@ fn mix_item(
                 let (left, right) = source_pair(item, s.channels as usize);
                 left == right
             });
-        effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, w)
+        effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, w, live.scope)
     };
     let law = if mono { crate::mixer::pan_law_mono } else { pan_gains };
     // gains: clip gain × Volume (keyframed, per 64-sample block) × channel volume × panner
@@ -307,7 +348,17 @@ fn mix_item(
 /// its own sample rate and converted when the two differ; time before its start is silent.
 /// `depth` is the nesting depth of the sequence the nest is in.
 #[allow(clippy::too_many_arguments)]
-fn nested_mix(project: &Project, nested: &Sequence, m0: i64, len: usize, sr: u32, sources: &dyn SourceProvider, w: usize, depth: u32) -> AudioBuffer {
+fn nested_mix(
+    project: &Project,
+    nested: &Sequence,
+    m0: i64,
+    len: usize,
+    sr: u32,
+    sources: &dyn SourceProvider,
+    w: usize,
+    depth: u32,
+    scope: u64,
+) -> AudioBuffer {
     // a damaged project can claim any rate: keep the buffer below sized by a real one
     let own = nested.settings.sample_rate.clamp(1_000, 768_000);
     let sr = sr.max(1);
@@ -319,7 +370,7 @@ fn nested_mix(project: &Project, nested: &Sequence, m0: i64, len: usize, sr: u32
     let lead = first.min(0).unsigned_abs().min(count as u64) as usize;
     let mut mix = AudioBuffer::silence(own, w, count);
     if count > lead {
-        let b = crate::mixer::mix_graph_at(project, nested, first + lead as i64, count - lead, sources, None, depth + 1);
+        let b = crate::mixer::mix_graph_at(project, nested, first + lead as i64, count - lead, sources, None, depth + 1, scope);
         let b = to_layout(b, Layout::from_channels(w), Mixdown::FrontRear);
         for (dst, src) in mix.channels.iter_mut().zip(&b.channels) {
             let m = src.len().min(count - lead);
@@ -350,9 +401,9 @@ type SourceAudio<'a> = &'a dyn Fn(i64, usize) -> Option<AudioBuffer>;
 
 /// The clip's audio after speed/reverse and clip effects (before clip gain, Volume and Panner) for
 /// timeline samples `[a0, a0 + n)`, `w` channels.
-fn effected(item: &TrackItem, src: SourceAudio, a0: i64, n: usize, sr: u32, w: usize) -> Vec<Vec<f32>> {
+fn effected(item: &TrackItem, src: SourceAudio, a0: i64, n: usize, sr: u32, w: usize, scope: u64) -> Vec<Vec<f32>> {
     let read = |x0: i64, len: usize| raw_channels(item, src, x0, len, sr, w);
-    if crate::audio_fx::has_effects(item) { crate::audio_fx::process(item, a0, n, sr, &read) } else { read(a0, n) }
+    if crate::audio_fx::has_effects(item) { crate::audio_fx::process(item, a0, n, sr, &read, scope) } else { read(a0, n) }
 }
 
 /// One clip's own signal for timeline samples `[start, start + frames)` (sequence rate): clip gain
@@ -371,7 +422,7 @@ pub fn clip_signal(item: &TrackItem, start: i64, frames: usize, sr: u32, sources
         let n = (a1 - a0) as usize;
         let off = (a0 - start) as usize;
         let g = db_to_gain(item.gain_db);
-        let buf = effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, 2);
+        let buf = effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, 2, current_scope());
         for (dst, b) in out.iter_mut().zip(&buf) {
             for (d, x) in dst[off..off + n].iter_mut().zip(b) {
                 *d = x * g;

@@ -315,11 +315,17 @@ struct Chain {
     next_out: i64,
 }
 
-type Key = (u64, u64, u32, usize);
+/// (mix scope, clip id, effect structure, sample rate, channels).
+type Key = (u64, u64, u64, u32, usize);
 
 fn cache() -> &'static Mutex<HashMap<Key, Vec<Chain>>> {
     static C: OnceLock<Mutex<HashMap<Key, Vec<Chain>>>> = OnceLock::new();
     C.get_or_init(Default::default)
+}
+
+/// Forget the chains of mix scope `scope` ([`crate::audio::end_scope`]).
+pub(crate) fn forget(scope: u64) {
+    cache().lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| k.0 != scope);
 }
 
 fn structure_hash(item: &TrackItem) -> u64 {
@@ -356,12 +362,12 @@ fn run(chain: &mut Chain, item: &TrackItem, in0: i64, input: &mut [Vec<f32>], sr
     }
 }
 
-/// Process the item's audio for timeline samples `[a0, a0 + n)`. `read(x0, len)` returns the clip's
-/// raw planar audio (2 channels, or 6 on a 5.1 track) for timeline samples `[x0, x0 + len)`
-/// (silence outside the clip).
-pub fn process(item: &TrackItem, a0: i64, n: usize, sr: u32, read: &dyn Fn(i64, usize) -> Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+/// Process the item's audio for timeline samples `[a0, a0 + n)`, continuing a chain of mix scope
+/// `scope` ([`crate::audio::with_scope`]). `read(x0, len)` returns the clip's raw planar audio (2
+/// channels, or 6 on a 5.1 track) for timeline samples `[x0, x0 + len)` (silence outside the clip).
+pub fn process(item: &TrackItem, a0: i64, n: usize, sr: u32, read: &dyn Fn(i64, usize) -> Vec<Vec<f32>>, scope: u64) -> Vec<Vec<f32>> {
     let width = read(a0, 0).len().max(1);
-    let key = (item.id.0, structure_hash(item), sr, width);
+    let key = (scope, item.id.0, structure_hash(item), sr, width);
     let taken = {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
         c.get_mut(&key).and_then(|v| v.iter().position(|ch| ch.next_out == a0).map(|i| v.swap_remove(i)))
@@ -399,7 +405,8 @@ pub fn process(item: &TrackItem, a0: i64, n: usize, sr: u32, read: &dyn Fn(i64, 
         v.remove(0);
     }
     if c.len() > 256 {
-        c.clear();
+        // (other scopes first: an export keeps its chains)
+        c.retain(|k, _| k.0 == key.0);
     }
     out
 }

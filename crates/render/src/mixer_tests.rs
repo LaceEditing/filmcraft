@@ -137,6 +137,31 @@ fn pan_laws() {
     assert!(close(l[5], 0.5 * bl, 1e-6) && close(r[5], 0.5 * br, 1e-6) && br == 1.0 && bl < 0.6);
 }
 
+/// A mix in a scope of its own (an export's) continues only its own effect state. Here another
+/// project, whose clip has the same id and effects but another sound, plays up to the sample where
+/// the export's second request starts: the export renders as before, while a mix in the shared
+/// scope picks that reverb tail up.
+#[test]
+fn a_scoped_mix_renders_the_same_whatever_played_before() {
+    let with_reverb = |f: fn(i64, usize) -> f32| {
+        let mut r = Rig::new(&[f]);
+        r.track(0).items[0].effects.push(filmcraft_project::find_effect("studio_reverb").unwrap().instance());
+        r
+    };
+    let rig = with_reverb(noise);
+    let export = |r: &Rig| {
+        let scope = crate::audio::new_scope();
+        let out = crate::audio::with_scope(scope, || r.mix_cut(0, 9600, &[4800], None));
+        crate::audio::end_scope(scope);
+        out
+    };
+    let first = export(&rig);
+    let other = with_reverb(dc);
+    let _ = other.mix(0, 4800);
+    assert_eq!(export(&rig), first, "the export continued state it did not make");
+    assert_ne!(rig.mix_cut(0, 9600, &[4800], None), first, "the shared scope no longer shows the leak this guards against");
+}
+
 /// A mono clip on a stereo track pans as Premiere's mono clip Panner does: 3 dB down on each side
 /// when centred, 0 dB on one side when hard left or right (Round 5 B3: a centred −20 dBFS mono
 /// tone plays at −23.01 dB per side). On a mono track only the track pans, once.

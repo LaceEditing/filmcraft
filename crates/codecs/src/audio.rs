@@ -184,6 +184,16 @@ impl PacketDecoder {
             other => Err(CodecError::Unsupported(format!("{} audio", other.name()))),
         }
     }
+    /// Tell the decoder where the next packet starts (its first sample), for decoders whose output
+    /// otherwise depends on the packets decoded before (AAC's noise substitution): a container that
+    /// knows every packet's position calls it before each [`Self::decode`], priming included, so a
+    /// packet decodes the same in order and after a seek.
+    pub fn seed_position(&mut self, ts: u64) {
+        if let Inner::Aac { dec, .. } = &mut self.inner {
+            dec.seed_noise(ts);
+        }
+    }
+
     /// Decode one packet into planar channels.
     pub fn decode(&mut self, data: &[u8], ts: u64) -> Result<Vec<Vec<f32>>> {
         if let Inner::MpegPending(rate) = self.inner {

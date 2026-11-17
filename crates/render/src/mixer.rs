@@ -589,9 +589,15 @@ fn build_state(plan: &Plan, sr: u32) -> GraphState {
     GraphState { next_out: 0, strips, latency }
 }
 
-fn cache() -> &'static Mutex<HashMap<u64, Vec<GraphState>>> {
-    static C: OnceLock<Mutex<HashMap<u64, Vec<GraphState>>>> = OnceLock::new();
+/// Kept graph states by (mix scope, graph structure); see [`crate::audio::with_scope`].
+fn cache() -> &'static Mutex<HashMap<(u64, u64), Vec<GraphState>>> {
+    static C: OnceLock<Mutex<HashMap<(u64, u64), Vec<GraphState>>>> = OnceLock::new();
     C.get_or_init(Default::default)
+}
+
+/// Forget the graph states of mix scope `scope` ([`crate::audio::end_scope`]).
+pub(crate) fn forget(scope: u64) {
+    lock(cache()).retain(|k, _| k.0 != scope);
 }
 
 /// Total latency (samples) of the sequence's mixer graph: how far ahead of the timeline the graph
@@ -864,11 +870,13 @@ fn run_strip(plan: &Plan, si: usize, st: &mut StripState, mut buf: Bus, x0: i64,
 /// Mix's width (2 channels, or 6 in L, R, C, LFE, Ls, Rs order for a 5.1 Mix). `live` adds the UI's
 /// held controls and receives the meters.
 pub fn mix_graph(project: &Project, seq: &Sequence, start: i64, frames: usize, sources: &dyn SourceProvider, live: Option<&LiveMix>) -> AudioBuffer {
-    mix_graph_at(project, seq, start, frames, sources, live, 0)
+    mix_graph_at(project, seq, start, frames, sources, live, 0, crate::audio::current_scope())
 }
 
 /// [`mix_graph`] for a sequence `depth` nests down from the one being mixed (see
-/// [`crate::MAX_NEST_DEPTH`]).
+/// [`crate::MAX_NEST_DEPTH`]), in mix scope `scope` (passed down, as the tracks mix on other
+/// threads).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mix_graph_at(
     project: &Project,
     seq: &Sequence,
@@ -877,11 +885,12 @@ pub(crate) fn mix_graph_at(
     sources: &dyn SourceProvider,
     live: Option<&LiveMix>,
     depth: u32,
+    scope: u64,
 ) -> AudioBuffer {
     let sr = seq.settings.sample_rate.max(1);
     let ovs = live.filter(|l| l.is_active()).map(LiveMix::overrides).unwrap_or_default();
     let plan = Plan::build(seq, &ovs);
-    let key = plan.structure_hash(sr);
+    let key = (scope, plan.structure_hash(sr));
     let taken = {
         let mut c = lock(cache());
         c.get_mut(&key).and_then(|v| v.iter().position(|g| g.next_out == start).map(|i| v.swap_remove(i)))
@@ -918,7 +927,7 @@ pub(crate) fn mix_graph_at(
                 return None;
             }
             let input = if has_clips {
-                let mut v = track_input_at(project, &s.track, x0, total, sr, sources, &ovs, depth).channels;
+                let mut v = track_input_at(project, &s.track, x0, total, sr, sources, &ovs, depth, scope).channels;
                 v.resize(s.width, vec![0.0; total]);
                 v
             } else {
@@ -973,7 +982,8 @@ pub(crate) fn mix_graph_at(
             v.remove(0);
         }
         if c.len() > 64 {
-            c.clear();
+            // (other scopes first: an export keeps its states)
+            c.retain(|k, _| k.0 == scope);
         }
     }
     if let Some(l) = live {

@@ -536,11 +536,14 @@ impl MkvSource {
                     };
                     for j in from..i {
                         if let Ok(prev) = self.read(ti, j) {
+                            d.seed_position(a.starts.get(j).copied().unwrap_or(0).max(0) as u64);
                             let _ = d.decode(&prev, 0);
                         }
                     }
                 }
-                let r = st.decoder.as_mut().ok_or_else(|| CodecError::Decode("no audio decoder".into()))?.decode(&data, pk_start.max(0) as u64);
+                let d = st.decoder.as_mut().ok_or_else(|| CodecError::Decode("no audio decoder".into()))?;
+                d.seed_position(pk_start.max(0) as u64);
+                let r = d.decode(&data, pk_start.max(0) as u64);
                 st.last_decoded = Some(i);
                 r.unwrap_or_default()
             }
