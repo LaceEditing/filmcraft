@@ -1791,7 +1791,8 @@ fn short_clips(s: &Session, clips: &[u64]) -> Vec<Value> {
 /// A clip's fade in or out (Premiere's fade handles): a transition on that one clip's edge — a
 /// Custom Fade on audio, a Cross Dissolve to nothing on video — made, resized, or (duration 0)
 /// removed. The two fades of a clip together fit in it; an edge already joined to the next clip by
-/// a transition has no fade of its own.
+/// a transition has no fade of its own. An audio fade's `shape` (Fade Value) bends its curve; as
+/// in Premiere, bending another fade (Constant Power…) makes it a Custom Fade of its curve.
 pub(crate) fn set_fade(s: &mut Session, p: &Value) -> Result<Value> {
     let clip = crate::commands::clip_p(p, "clip").ok_or_else(|| bad("clip.setFade", "need `clip`"))?;
     let fade_in = match str_p(p, "edge") {
@@ -1838,7 +1839,15 @@ pub(crate) fn set_fade(s: &mut Session, p: &Value) -> Result<Value> {
             Some(i) => {
                 let x = &mut t.transitions[i];
                 (x.start, x.duration) = (at, dur);
-                if let Some(v) = shape {
+                if let (Some(v), true) = (shape, audio) {
+                    if x.effect.effect != filmcraft_project::effect::CUSTOM_FADE {
+                        let linear = matches!(filmcraft_render::transitions::FadeCurve::of(&x.effect), filmcraft_render::transitions::FadeCurve::Linear(_));
+                        let curve = if linear { filmcraft_project::effect::FADE_LINEAR } else { filmcraft_project::effect::FADE_COSINE };
+                        let def = filmcraft_project::find_effect(filmcraft_project::effect::CUSTOM_FADE)
+                            .ok_or_else(|| EngineError::Other("no custom_fade effect".into()))?;
+                        x.effect = def.instance();
+                        x.effect.params.insert("curve".into(), filmcraft_project::Param::new(ParamValue::Choice(curve)));
+                    }
                     x.effect.params.insert("shape".into(), filmcraft_project::Param::new(ParamValue::Float(v)));
                 }
                 Ok(Some(x.id))

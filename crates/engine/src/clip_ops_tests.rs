@@ -1017,6 +1017,38 @@ fn clip_fades_are_made_resized_and_removed() {
     }
 }
 
+/// Bending a fade that isn't a Custom Fade makes it one of the same curve, as Premiere's first
+/// vertical drag on a fade handle does (Constant Gain is Linear 0); a video fade has no curve.
+#[test]
+fn bending_a_fade_makes_it_a_custom_fade_of_its_curve() {
+    let mut s = demo();
+    let (track, a, v) = {
+        let q = s.active_sequence().unwrap();
+        let free = |t: &filmcraft_project::Track| t.items.iter().find(|i| !t.transitions.iter().any(|x| x.from == Some(i.id) || x.to == Some(i.id))).cloned();
+        let (tr, a) = q.audio_tracks.iter().find_map(|t| free(t).map(|i| (t.id, i))).expect("a free audio clip");
+        (tr, a, q.video_tracks.iter().find_map(free).expect("a free video clip"))
+    };
+    let s1 = TICKS_PER_SECOND;
+    s.execute("clip.setFade", json!({"clip": a.id.0, "edge": "in", "duration": s1})).unwrap();
+    let mine = move |t: &filmcraft_project::Transition| t.to == Some(a.id) && t.from.is_none();
+    s.edit_sequence("Constant Gain", move |q, _, _| {
+        let x = q.track_mut(track).and_then(|t| t.transitions.iter_mut().find(|x| mine(x))).ok_or_else(|| crate::EngineError::Other("no fade".into()))?;
+        x.effect = filmcraft_project::find_effect("constant_gain").map(|d| d.instance()).ok_or_else(|| crate::EngineError::Other("no constant_gain".into()))?;
+        Ok(())
+    })
+    .unwrap();
+    s.execute("clip.setFade", json!({"clip": a.id.0, "edge": "in", "duration": s1, "shape": 40})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let x = q.track(track).and_then(|t| t.transitions.iter().find(|x| mine(x))).expect("the fade");
+    assert_eq!(x.effect.effect, filmcraft_project::effect::CUSTOM_FADE);
+    assert_eq!(x.effect.params["curve"].value, filmcraft_project::ParamValue::Choice(filmcraft_project::effect::FADE_LINEAR));
+    assert_eq!(x.effect.params["shape"].value, filmcraft_project::ParamValue::Float(40.0));
+    s.execute("clip.setFade", json!({"clip": v.id.0, "edge": "in", "frames": 12, "shape": 40})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let x = q.video_tracks.iter().flat_map(|t| t.transitions.iter()).find(|x| x.to == Some(v.id) && x.from.is_none()).expect("the video fade");
+    assert!(x.effect.effect == "cross_dissolve" && !x.effect.params.contains_key("shape"));
+}
+
 /// #164: Add Edit with a clip selected cut every targeted track. Like Premiere it now cuts only
 /// the selected clips under the playhead; with nothing selected there, the targeted tracks.
 #[test]

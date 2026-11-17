@@ -3657,6 +3657,8 @@
 	Make-Up Gain	Ganancia de compensación
 	Input Gain	Ganancia de entrada
 	Knee	Codo
+	Fade Cosine Value	Valor de fundido coseno
+	Fade Linear Value	Valor de fundido lineal
 	Voice Leveler	Nivelador de voz
 	Gate and Compress	Puerta y compresión
 	Voice Over	Voz en off

@@ -99,6 +99,22 @@ impl FadeCurve {
         }
     }
 
+    /// How far the curve is bent: a Custom Fade's Fade Value.
+    pub fn value(self) -> f32 {
+        match self {
+            Self::Cosine(v) | Self::Linear(v) => v,
+        }
+    }
+
+    /// The same curve bent to `v` (−100 … 100).
+    pub fn with_value(self, v: f32) -> Self {
+        let v = if v.is_finite() { v.clamp(-100.0, 100.0) } else { self.value() };
+        match self {
+            Self::Cosine(_) => Self::Cosine(v),
+            Self::Linear(_) => Self::Linear(v),
+        }
+    }
+
     /// The fading-out side's gain at `t` (0 → 1 through the fade).
     pub fn fade_out(self, t: f32) -> f32 {
         let t = if t.is_finite() { f64::from(t.clamp(0.0, 1.0)) } else { 0.0 };

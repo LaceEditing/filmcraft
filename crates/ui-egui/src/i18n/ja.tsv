@@ -3656,6 +3656,8 @@
 	Make-Up Gain	メイクアップゲイン
 	Input Gain	入力ゲイン
 	Knee	ニー
+	Fade Cosine Value	フェードのコサイン値
+	Fade Linear Value	フェードのリニア値
 	Voice Leveler	音声レベラー
 	Gate and Compress	ゲートとコンプレッション
 	Voice Over	ナレーション

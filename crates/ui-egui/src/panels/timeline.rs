@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use egui::{Align2, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use filmcraft_project::{ClipId, ItemId, MarkerId, Sequence, TrackId, TrackItem, TrackKind};
+use filmcraft_render::transitions::FadeCurve;
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeDisplay, format_time};
 use serde_json::{Value, json};
 
@@ -135,12 +136,14 @@ pub enum Drag {
         clip: ClipId,
         delta: Tick,
     },
-    /// A clip's fade handle: its fade at that edge is `dur` long (`from` when grabbed).
+    /// A clip's fade handle: its fade at that edge is `dur` long (`from` when grabbed). An audio
+    /// fade's `curve` as grabbed and as dragged up or down (Premiere bends it; None on video).
     Fade {
         clip: ClipId,
         edge: filmcraft_edit::Edge,
         from: Tick,
         dur: Tick,
+        curve: Option<(FadeCurve, FadeCurve)>,
     },
     /// An audio clip's Volume line (see [`super::timeline_volume`]).
     Volume(super::timeline_volume::LineDrag),
@@ -546,9 +549,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             // its fades (a Custom Fade as its gain line, one being dragged too) and, under the
             // pointer, the fade handles at its top corners
             if !previews.contains_key(&it.id) {
-                let dragged = match app.tl.drag {
-                    Some(Drag::Fade { clip, edge, dur, .. }) if clip == it.id => Some((clip, edge, dur)),
-                    _ => None,
+                let (dragged, bent) = match app.tl.drag {
+                    Some(Drag::Fade { clip, edge, dur, curve, .. }) if clip == it.id => (Some((clip, edge, dur)), curve.map(|c| c.1)),
+                    _ => (None, None),
                 };
                 for edge in [filmcraft_edit::Edge::In, filmcraft_edit::Edge::Out] {
                     let len = match dragged {
@@ -560,11 +563,26 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             filmcraft_edit::Edge::In => (layout.x_of(it.start + len), x0),
                             filmcraft_edit::Edge::Out => (layout.x_of(it.end() - len), x1),
                         };
-                        // the fade's own curve (a fresh one while its handle is dragged out)
-                        let curve = clip_fade(tr, it.id, edge)
-                            .map(|f| filmcraft_render::transitions::FadeCurve::of(&f.effect))
-                            .unwrap_or(filmcraft_render::transitions::FadeCurve::Cosine(0.0));
+                        // the fade's own curve (as bent, or a fresh one, while its handle is dragged)
+                        let curve = match (dragged, bent) {
+                            (Some((_, e, _)), Some(c)) if e == edge => c,
+                            _ => clip_fade(tr, it.id, edge).map(|f| FadeCurve::of(&f.effect)).unwrap_or(FadeCurve::Cosine(0.0)),
+                        };
                         draw_fade(&p, body, full, edge_x, curve);
+                        // Premiere's tooltip while the curve is bent
+                        if let (Some((_, e, _)), Some(c)) = (dragged, bent)
+                            && e == edge
+                        {
+                            let label = if matches!(c, FadeCurve::Linear(_)) { "Fade Linear Value" } else { "Fade Cosine Value" };
+                            let at = pos2(full.clamp(body.min.x, body.max.x), body.min.y - 2.0);
+                            p.text(
+                                at,
+                                Align2::CENTER_BOTTOM,
+                                format!("{}: {:.0}", crate::i18n::t(label), c.value()),
+                                egui::FontId::proportional(11.0),
+                                Color32::WHITE,
+                            );
+                        }
                     }
                 }
                 let hot = app.tl.drag.is_none() && !tr.locked && hover.is_some_and(|h| body.contains(h)) && app.ui.tool == Tool::Selection;
@@ -1992,6 +2010,10 @@ fn snap_to(app: &mut FilmcraftApp, seq: &Sequence, layout: &Layout, t: Tick, exc
     }
 }
 
+/// How far an audio fade's curve bends per pixel the fade handle is dragged up (Premiere: about
+/// 1.7, up is positive; Round 5 A7).
+const FADE_BEND_PER_PX: f32 = 1.7;
+
 /// Size of a fade handle (px): a small square in the clip's top corner, as in Premiere. Only
 /// the square itself takes a press, so the rest of the edge below it still trims (the edge is
 /// grabbed from 8 px below the clip's top, above where a transition on a cut takes the press).
@@ -2686,8 +2708,12 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             }
             // a fade handle dragged: the clip's fade at that edge (a click there selects the clip)
             (Tool::Selection, _) if resp.drag_started() && pressed.fade.is_some() => pressed.fade.map(|(track, clip, edge)| {
-                let from = seq.track(track).and_then(|tr| clip_fade(tr, clip, edge)).map_or(Tick::ZERO, |f| f.duration);
-                Drag::Fade { clip, edge, from, dur: from }
+                let tr = seq.track(track);
+                let fade = tr.and_then(|tr| clip_fade(tr, clip, edge));
+                let from = fade.map_or(Tick::ZERO, |f| f.duration);
+                // an audio fade's curve: its own, or a fresh Custom Fade's
+                let curve = tr.filter(|tr| tr.kind == TrackKind::Audio).map(|_| fade.map_or(FadeCurve::Cosine(0.0), |f| FadeCurve::of(&f.effect)));
+                Drag::Fade { clip, edge, from, dur: from, curve: curve.map(|c| (c, c)) }
             }),
             (_, Grab::Other(Hit::Ruler)) => Some(Drag::Scrub { initial: app.session.playhead() }),
             (Tool::Hand, _) => Some(Drag::Pan { last: p, start_scroll: app.ui.timeline.target_scroll, start_v: app.ui.timeline.v_scroll }),
@@ -2948,12 +2974,19 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 let target = rate.snap_nearest(it.end() + (t_here - from)).max(it.start + rate.frame_duration());
                 Drag::Remix { clip, delta: target - it.end(), from }
             }),
-            Drag::Fade { clip, edge, from, .. } => seq.find_item(clip).map(|(_, it)| {
-                // the handle moves by as much as the pointer has since the press
-                let origin = ctx.input(|i| i.pointer.press_origin()).map(|o| layout.tick_at(o.x)).unwrap_or(t_here);
-                let moved = t_here - origin;
+            Drag::Fade { clip, edge, from, curve, .. } => seq.find_item(clip).map(|(_, it)| {
+                // the handle moves by as much as the pointer has since the press: sideways the
+                // fade's length, up or down an audio fade's curve; Ctrl keeps the one the pointer
+                // has moved less along (Premiere: "Hold <Ctrl> key to fix either fade duration or
+                // shape")
+                let origin = ctx.input(|i| i.pointer.press_origin());
+                let here = resp.interact_pointer_pos().or(origin);
+                let (dx, dy) = origin.zip(here).map_or((0.0, 0.0), |(o, h)| (h.x - o.x, o.y - h.y));
+                let (length, bend) = if mods.command { (dx.abs() >= dy.abs(), dy.abs() > dx.abs()) } else { (true, true) };
+                let moved = if length { t_here - origin.map_or(t_here, |o| layout.tick_at(o.x)) } else { Tick::ZERO };
                 let d = if edge == filmcraft_edit::Edge::In { from + moved } else { from - moved };
-                Drag::Fade { clip, edge, from, dur: rate.snap_nearest(d).clamp(Tick::ZERO, it.duration) }
+                let curve = curve.map(|(c0, _)| (c0, if bend { c0.with_value((c0.value() + dy * FADE_BEND_PER_PX).round()) } else { c0 }));
+                Drag::Fade { clip, edge, from, dur: rate.snap_nearest(d).clamp(Tick::ZERO, it.duration), curve }
             }),
             Drag::Stretch { clip, edge, from, .. } => seq.find_item(clip).map(|(_, it)| {
                 let base = if edge == filmcraft_edit::Edge::In { it.start } else { it.end() };
@@ -3041,10 +3074,15 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     "timeline.trim",
                     json!({"clip": clip.0, "edge": if edge == filmcraft_edit::Edge::In {"in"} else {"out"}, "mode": if mode == filmcraft_edit::TrimMode::Ripple {"ripple"} else {"regular"}, "delta": delta.0}),
                 )),
-                Drag::Fade { clip, edge, from, dur } if dur != from => Some(app.session.execute(
-                    "clip.setFade",
-                    json!({"clip": clip.0, "edge": if edge == filmcraft_edit::Edge::In {"in"} else {"out"}, "duration": dur.0}),
-                )),
+                Drag::Fade { clip, edge, from, dur, curve } if dur != from || curve.is_some_and(|(a, b)| a != b) => {
+                    let mut p = json!({"clip": clip.0, "edge": if edge == filmcraft_edit::Edge::In {"in"} else {"out"}, "duration": dur.0});
+                    if let Some((a, b)) = curve
+                        && a != b
+                    {
+                        p["shape"] = json!(b.value());
+                    }
+                    Some(app.session.execute("clip.setFade", p))
+                }
                 Drag::Stretch { clip, edge, delta, .. } if delta != Tick::ZERO => Some(app.session.execute("timeline.rateStretch", json!({"clip": clip.0, "edge": if edge == filmcraft_edit::Edge::In {"in"} else {"out"}, "delta": delta.0}))),
                 Drag::Remix { clip, delta, .. } if delta != Tick::ZERO => {
                     let d = seq.find_item(clip).map(|(_, it)| it.duration + delta).unwrap_or(Tick::ZERO);
