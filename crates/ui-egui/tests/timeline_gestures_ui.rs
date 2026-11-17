@@ -397,6 +397,7 @@ fn rubber_bands_draw_fades_on_clips() {
 
 /// The editing keys act on the selection and the playhead as their names say.
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn editing_keys_do_what_they_say() {
     let mut d = Driver::new();
     let [a, b, c] = three_clips(&mut d);
@@ -560,7 +561,9 @@ fn track_header_menu_adds_renames_and_deletes_tracks() {
         // on the lock button: the header's menu opens wherever it is right-clicked
         d.ok("ui.click", json!({"x": x - 53.0, "y": y, "button": "right"}));
         d.frames(4);
-        d.ok("ui.click", json!({"id": format!("timeline.trackMenu.{item}")}));
+        // (the menu's items are `timeline.track.<V1|A1…>.menu.<item>`, as upstream names them)
+        let track = header.trim_end_matches(".header");
+        d.ok("ui.click", json!({"id": format!("{track}.menu.{item}")}));
         d.frames(4);
     };
     // Add Track on A1: A2 after it

@@ -1,21 +1,23 @@
 //! Interchange documents (CMX 3600 EDL, FCP7 XML, FCPXML, OTIO, AAF, OMF) ↔ the session's project.
 
-use std::path::Path;
-
 use serde_json::{Value, json};
 
 use filmcraft_interchange::{ExportOptions, Format, ImportOptions};
-use filmcraft_project::{ItemId, ItemKind, MediaRef};
+use filmcraft_project::{BinId, ItemId, ItemKind, MediaRef};
 
 use crate::{EngineError, Result, Session};
 
 /// Item metadata keys recorded when a Premiere Pro project is opened.
 pub use filmcraft_interchange::{META_SEQUENCE as PREMIERE_SEQUENCE, META_SOURCE as PREMIERE_SOURCE};
 
+/// File extensions of the interchange documents `file.import` reads (lower case), Premiere Pro
+/// projects included. The Media Browser lists the same set.
+pub const EXTENSIONS: [&str; 8] = ["edl", "xml", "fcpxml", "otio", "aaf", "omf", "omfi", "prproj"];
+
 /// The interchange format of a file, if it is one (by content, with the extension as a hint).
 pub fn detect(path: &str, bytes: &[u8]) -> Option<Format> {
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-    if !matches!(ext.as_deref(), Some("edl" | "xml" | "fcpxml" | "otio" | "aaf" | "omf" | "omfi" | "prproj")) {
+    if !ext.as_deref().is_some_and(|e| EXTENSIONS.contains(&e)) {
         return None;
     }
     filmcraft_interchange::detect(bytes, ext.as_deref())
@@ -51,30 +53,18 @@ fn is_file_media(item: &filmcraft_project::ProjectItem) -> bool {
 }
 
 /// Write embedded audio without replacing an occupied path; return the path used. A numbered
-/// alternative (`name (2).wav`, ...) replaces only the file name and keeps the directory exactly
-/// as `path` spells it: `Path::with_file_name` joins with `\` on Windows, which names another
-/// file for services that address files by their path text (and mixes separators in the project).
+/// name changes only the file name: the folder keeps its separators as written (`/` or `\`).
 fn write_embedded_audio(s: &Session, path: &str, wav: &[u8]) -> Result<String> {
-    let original = Path::new(path);
-    let missing = || EngineError::Other(format!("{path}: missing audio file name"));
-    let stem = original.file_stem().ok_or_else(missing)?.to_string_lossy();
-    let file_name = original.file_name().ok_or_else(missing)?.to_string_lossy();
-    let extension = original.extension().map(|e| e.to_string_lossy());
-    // the directory as written, separator included (None for a path that does not end in its name)
-    let dir = path.strip_suffix(file_name.as_ref());
+    let (folder, name) = path.split_at(path.rfind(['/', '\\']).map_or(0, |i| i + 1));
+    if matches!(name, "" | "." | "..") {
+        return Err(EngineError::Other(format!("{path}: missing audio file name")));
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
     for number in 1..=1_000 {
-        let candidate = if number == 1 {
-            path.to_owned()
-        } else {
-            let name = match &extension {
-                Some(extension) => format!("{stem} ({number}).{extension}"),
-                None => format!("{stem} ({number})"),
-            };
-            match dir {
-                Some(dir) => format!("{dir}{name}"),
-                None => original.with_file_name(name).to_string_lossy().into_owned(),
-            }
-        };
+        let candidate = if number == 1 { path.to_owned() } else { format!("{folder}{stem} ({number}){extension}") };
         match s.services.write_file_new(&candidate, wav) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -85,11 +75,17 @@ fn write_embedded_audio(s: &Session, path: &str, wav: &[u8]) -> Result<String> {
 }
 
 /// Import a document: merge its bins, media and sequences into the project (one undo step), then
-/// link each media file that exists on disk. Returns the new sequences.
-pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Result<Value> {
+/// link each media file that exists on disk. Returns the new sequences. The document's items go
+/// into `bin` (the Project panel's current bin, as for media files); the root when it is `None`
+/// or no longer exists.
+pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format, bin: Option<BinId>) -> Result<Value> {
     let p = std::path::Path::new(path);
+    // A relative document is taken from the working directory, as `doc_path::resolve` takes it.
+    // Its media paths then come out absolute, and following them as paths stored in the document
+    // doesn't join its folder a second time (#4001).
+    let document = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
     let opts = ImportOptions {
-        base_dir: p.parent().map(|d| d.to_string_lossy().to_string()),
+        base_dir: document.parent().map(|d| d.to_string_lossy().to_string()),
         name: p.file_stem().map(|n| n.to_string_lossy().to_string()),
         source_path: Some(path.to_string()),
         ..Default::default()
@@ -114,13 +110,18 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
         }
         _ => filmcraft_interchange::import_with(bytes, format, &opts).map_err(|e| EngineError::Other(format!("{path}: {e}")))?,
     };
+    for item in fragment.project.items.values() {
+        if let ItemKind::Sequence(sequence) = &item.kind {
+            sequence.settings.validate().map_err(|e| EngineError::Other(format!("{path}: invalid imported sequence settings: {e}")))?;
+        }
+    }
     if format == Format::Prproj {
         stash_premiere_original(s, path, bytes);
     }
     let before: std::collections::HashSet<ItemId> = s.project.items.keys().copied().collect();
     let name = opts.name.clone().unwrap_or_else(|| format.name().to_string());
     let seqs = s.edit(&format!("Import {name}"), |proj, _| {
-        let seqs = filmcraft_interchange::merge_into(proj, fragment, None);
+        let seqs = filmcraft_interchange::merge_into(proj, fragment, bin);
         // A document that sets only some Motion parameters leaves the others at their "auto"
         // (NaN) defaults. Resolve them as placing a clip does, for every format. A media file's
         // picture size is only what the document says so far (an EDL says nothing: the importer
@@ -817,5 +818,17 @@ mod embedded_audio_tests {
         assert_eq!(write_embedded_audio(&session, r"C:\media\cut Audio.wav", b"new").unwrap(), r"C:\media\cut Audio (2).wav");
         assert_eq!(write_embedded_audio(&session, "/files/A1", b"new").unwrap(), "/files/A1 (2)");
         assert_eq!(files.0.lock().unwrap()[r"C:\media\cut Audio (2).wav"], b"new");
+    }
+
+    #[test]
+    fn numbered_names_keep_the_path_separators() {
+        for path in ["C:/files/cut Audio.wav", "C:\\files\\cut Audio.wav"] {
+            let files = Arc::new(VirtualFiles::default());
+            files.0.lock().unwrap().insert(path.into(), b"first".to_vec());
+            let session = Session::new(files.clone());
+            let numbered = write_embedded_audio(&session, path, b"new audio").unwrap();
+            assert_eq!(numbered, path.replace("cut Audio.wav", "cut Audio (2).wav"));
+            assert_eq!(files.0.lock().unwrap()[path], b"first");
+        }
     }
 }

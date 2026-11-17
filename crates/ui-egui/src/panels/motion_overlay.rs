@@ -93,7 +93,7 @@ pub fn claimed(ui: &egui::Ui) -> bool {
 }
 
 fn drag_id() -> egui::Id {
-    egui::Id::new("program-motion-drag")
+    egui::Id::unique("program-motion-drag")
 }
 
 /// The Motion values of a clip at media time `mt`: position, anchor (unset: the centre of the

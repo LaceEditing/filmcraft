@@ -768,6 +768,7 @@ impl<'p> Seed<'p> {
                         has_alpha: false,
                         bitrate: None,
                         hdr: None,
+                        color_assumed: None,
                     });
                 }
                 if audio && info.audio().is_none_or(|a| a.channels == 0) && info.kind != MediaKind::Still {

@@ -168,7 +168,7 @@ pub(crate) fn zoom_bar(app: &mut FilmcraftApp, ui: &mut egui::Ui, bar: Rect, lan
     let a = fx(lane.t0).min(bar.max.x - 28.0);
     let b = fx(lane.t1).max(a + 28.0);
     let thumb = Rect::from_min_max(pos2(a, bar.center().y - 4.0), pos2(b, bar.center().y + 4.0));
-    let id = egui::Id::new(("ec-zoombar", clip.0));
+    let id = egui::Id::unique(("ec-zoombar", clip.0));
     let body = ui.interact(thumb, id.with("body"), Sense::click_and_drag());
     let ends = [(a, "start", id.with("start")), (b, "end", id.with("end"))];
     let hover = body.hovered() || body.dragged();
@@ -229,7 +229,7 @@ struct LaneDrag {
 const SNAP_PX: f64 = 8.0;
 
 fn lane_drag_id(clip: ClipId) -> egui::Id {
-    egui::Id::new(("ec-lane-drag", clip.0))
+    egui::Id::unique(("ec-lane-drag", clip.0))
 }
 
 /// A keyframe in the lane started a drag (the selection is already updated).
@@ -415,6 +415,7 @@ const COMP_COLORS: [Color32; 2] = [Color32::from_rgb(0xe0, 0x70, 0x70), Color32:
 
 /// Value and velocity graphs of an animated number or point, across the keyframe lane.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::cognitive_complexity)]
 pub(crate) fn graph_rows(
     app: &mut FilmcraftApp,
     ui: &mut egui::Ui,
@@ -451,8 +452,8 @@ pub(crate) fn graph_rows(
     let at = |i: usize| lane.mt_of(lane.t0 + Tick(((lane.t1 - lane.t0).0 as f64 * i as f64 / n as f64) as i64));
     let samples: Vec<Vec<f64>> = (0..=n).map(|i| comps(&param.value_at(at(i)))).collect();
     // the value range: what is shown and the keyframes, padded; frozen while a drag runs
-    let drag_id = egui::Id::new(("ec-graph-drag", &gkey));
-    let range_id = egui::Id::new(("ec-graph-range", &gkey));
+    let drag_id = egui::Id::unique(("ec-graph-drag", &gkey));
+    let range_id = egui::Id::unique(("ec-graph-range", &gkey));
     let dragging: Option<GraphDrag> = ui.data(|d| d.get_temp(drag_id));
     let (lo, hi) = match ui.data(|d| d.get_temp::<(f64, f64)>(range_id)).filter(|_| dragging.is_some()) {
         Some(r) => r,
@@ -526,7 +527,7 @@ pub(crate) fn graph_rows(
     p.text(pos2(velr.max.x - 30.0, varea.min.y + 6.0), Align2::RIGHT_CENTER, format!("{vmax:.1}/s"), Tokens::ui(10.0), t.text_dim);
     // the graph's height: its bottom edge drags
     let edge = Rect::from_min_max(pos2(area.min.x, vr.max.y - 5.0), pos2(area.max.x, vr.max.y + 1.0));
-    let er = ui.interact(edge, egui::Id::new(("ec-graph-h", &gkey)), Sense::drag());
+    let er = ui.interact(edge, egui::Id::unique(("ec-graph-h", &gkey)), Sense::drag());
     if er.hovered() || er.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
         p.line_segment([pos2(edge.min.x, edge.center().y), pos2(edge.max.x, edge.center().y)], Stroke::new(2.0, t.accent));
@@ -561,7 +562,7 @@ pub(crate) fn graph_rows(
                 let hp = pos2(x + side * infl * seg, c.y);
                 p.line_segment([c, hp], Stroke::new(1.0, Color32::from_rgb(0x90, 0x90, 0x90)));
                 let hr = Rect::from_center_size(hp, vec2(12.0, 12.0));
-                let resp = ui.interact(hr, egui::Id::new(("ec-graph-handle", &gkey, k.time.0, out)), Sense::drag());
+                let resp = ui.interact(hr, egui::Id::unique(("ec-graph-handle", &gkey, k.time.0, out)), Sense::drag());
                 p.circle_filled(hp, if resp.hovered() { 4.5 } else { 3.5 }, if resp.hovered() { Color32::WHITE } else { Color32::from_rgb(0xd0, 0xd0, 0xd0) });
                 app.auto.add(&format!("effectControls.{pkey}.graph.{}.{}", if out { "out" } else { "in" }, k.time.0), hr, "influence");
                 if resp.drag_started() {
@@ -590,7 +591,7 @@ pub(crate) fn graph_rows(
         for (c, v) in vals.iter().enumerate() {
             let kp = pos2(x, y_of(*v));
             let r = Rect::from_center_size(kp, vec2(12.0, 12.0));
-            let resp = ui.interact(r, egui::Id::new(("ec-graph-key", &gkey, k.time.0, c)), Sense::click_and_drag());
+            let resp = ui.interact(r, egui::Id::unique(("ec-graph-key", &gkey, k.time.0, c)), Sense::click_and_drag());
             let hot = resp.hovered() || dragging.as_ref().is_some_and(|g| g.cur == k.time.0 && g.comp == c && g.handle.is_none());
             let col = if point { COMP_COLORS[c] } else { Color32::from_rgb(0xe0, 0xe0, 0xe0) };
             p.circle_filled(kp, if hot { 5.5 } else { 4.5 }, if hot { Color32::WHITE } else { col });

@@ -322,6 +322,9 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 comment: d["mComment"].as_str().unwrap_or("").to_string(),
                 kind,
                 color: Label::Green,
+                url: String::new(),
+                author: String::new(),
+                custom_color: None,
             });
         }
         out.sort_by_key(|m| m.start);

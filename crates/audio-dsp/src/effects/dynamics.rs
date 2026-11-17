@@ -3,19 +3,10 @@
 //! Detection is stereo-linked (the loudest channel drives one common gain) so the image does
 //! not shift. Gain computers work in dB; attack/release are one-pole smoothers on the gain.
 
+use super::util::{coef, lin_db};
 use crate::oversample::{Interpolator, PolyphaseBank, true_peak_factor};
 use crate::{AudioEffect, ParamSpec, ParamValues, Smoothed, Unit, block_len, db_to_gain, param_plumbing};
 use std::collections::VecDeque;
-
-/// One-pole coefficient for a time constant in ms.
-fn coef(ms: f32, sr: f32) -> f32 {
-    if ms <= 0.0 { 0.0 } else { (-1.0 / (ms * 0.001 * sr)).exp() }
-}
-
-#[inline]
-fn lin_to_db(x: f32) -> f32 {
-    20.0 * (x.max(1e-10)).log10()
-}
 
 /// Static compressor curve with a quadratic soft knee (output level in dB for input level `x`).
 pub fn compressor_curve(x: f32, threshold: f32, ratio: f32, knee: f32) -> f32 {
@@ -140,17 +131,17 @@ impl AudioEffect for Compressor {
             }
             let level_db = if self.rms {
                 self.ms = self.rms_coef * self.ms + (1.0 - self.rms_coef) * sq;
-                if self.ms < 1e-30 {
+                if !(1e-30..=f32::MAX).contains(&self.ms) {
                     self.ms = 0.0;
                 }
                 10.0 * self.ms.max(1e-20).log10()
             } else {
-                lin_to_db(peak)
+                lin_db(peak)
             };
             let target = self.curve(level_db) - level_db;
             let c = if target < self.env { self.att } else { self.rel };
             self.env = c * self.env + (1.0 - c) * target;
-            if self.env.abs() < 1e-9 {
+            if !(1e-9..=f32::MAX).contains(&self.env.abs()) {
                 self.env = 0.0;
             }
             let g = self.input * db_to_gain(self.env) * self.makeup.tick();
@@ -232,7 +223,7 @@ impl AudioEffect for Gate {
         let n = block_len(channels);
         for i in 0..n {
             let peak = channels.iter().fold(0.0f32, |a, c| a.max(c[i].abs()));
-            let level = lin_to_db(peak);
+            let level = lin_db(peak);
             let target = self.curve(level) - level;
             if target >= self.env {
                 // Opening (or staying open): attack.
@@ -244,6 +235,9 @@ impl AudioEffect for Gate {
                 self.hold_left -= 1;
             } else {
                 self.env = self.rel * self.env + (1.0 - self.rel) * target;
+                if !self.env.is_finite() {
+                    self.env = 0.0;
+                }
             }
             let g = db_to_gain(self.env);
             for ch in channels.iter_mut() {
@@ -436,6 +430,9 @@ impl AudioEffect for Limiter {
         let mut greq = [1.0f32; 8];
         let mut gout = [1.0f32; 8];
         let nch = nch.min(greq.len());
+        // the gain of the block's last sample and its deepest one, for the meters
+        let mut last_g = None;
+        let mut deepest_g = 1.0f32;
         for i in 0..n {
             let g_in = self.in_gain.tick();
             let det_pos = (self.wpos + dlen - self.det_delay) % dlen;
@@ -470,8 +467,12 @@ impl AudioEffect for Limiter {
             }
             self.wpos = (self.wpos + 1) % dlen;
             self.t += 1;
-            self.gr_meter = lin_to_db(deepest);
-            self.gr_peak = self.gr_peak.min(self.gr_meter);
+            last_g = Some(deepest);
+            deepest_g = deepest_g.min(deepest);
+        }
+        if let Some(g) = last_g {
+            self.gr_meter = lin_db(g);
+            self.gr_peak = self.gr_peak.min(lin_db(deepest_g));
         }
     }
 }
@@ -521,7 +522,7 @@ mod tests {
                 let mut l = vec![v; 48000];
                 let mut r = vec![-v; 48000];
                 c.process(&mut [&mut l, &mut r]);
-                let out_db = lin_to_db(l[47999]);
+                let out_db = lin_db(l[47999]);
                 let expect = compressor_curve(level_db, -20.0, 4.0, 0.0) + 3.0;
                 assert!((out_db - expect).abs() < 0.05, "det {detector} in {level_db}: {out_db} vs {expect}");
                 assert_eq!(l[47999], -r[47999]);
@@ -541,7 +542,7 @@ mod tests {
             c.reset();
             let mut x = vec![db_to_gain(level_db); 48000];
             c.process(&mut [&mut x]);
-            assert!((lin_to_db(x[47999]) - expect).abs() < 0.05, "in {level_db}: {} vs {expect}", lin_to_db(x[47999]));
+            assert!((lin_db(x[47999]) - expect).abs() < 0.05, "in {level_db}: {} vs {expect}", lin_db(x[47999]));
         }
         assert!((c.transfer_db(0, -40.0).unwrap_or(f32::NAN) + 28.0).abs() < 1e-3);
     }
@@ -557,7 +558,7 @@ mod tests {
         c.process(&mut [&mut x]);
         // After one time constant ~63% of the final reduction (in dB) is applied.
         let final_db = compressor_curve(0.0, -20.0, 20.0, 0.0);
-        let at_tau = lin_to_db(x[480]);
+        let at_tau = lin_db(x[480]);
         assert!((at_tau / final_db - 0.632).abs() < 0.02, "{at_tau} / {final_db}");
     }
 
@@ -573,11 +574,11 @@ mod tests {
         let quiet = db_to_gain(-50.0);
         let mut x: Vec<f32> = (0..48000).map(|i| if i < 24000 { loud } else { quiet }).collect();
         g.process(&mut [&mut x]);
-        assert!((lin_to_db(x[23999]) + 10.0).abs() < 0.01);
+        assert!((lin_db(x[23999]) + 10.0).abs() < 0.01);
         // During hold (100 ms) the gate stays open.
-        assert!((lin_to_db(x[24000 + 2400]) + 50.0).abs() < 0.01);
+        assert!((lin_db(x[24000 + 2400]) + 50.0).abs() < 0.01);
         // Well after hold + release: attenuated by the full range.
-        assert!((lin_to_db(x[47999]) + 90.0).abs() < 0.1, "{}", lin_to_db(x[47999]));
+        assert!((lin_db(x[47999]) + 90.0).abs() < 0.1, "{}", lin_db(x[47999]));
         assert!((expander_curve(-40.0, -30.0, 2.0, 60.0) + 50.0).abs() < 1e-6);
     }
 
@@ -662,6 +663,6 @@ mod tests {
         lim.process(&mut [&mut x]);
         let tail = &x[24000..];
         let peak = tail.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        assert!((lin_to_db(peak) + 6.0).abs() < 0.3, "{}", lin_to_db(peak));
+        assert!((lin_db(peak) + 6.0).abs() < 0.3, "{}", lin_db(peak));
     }
 }

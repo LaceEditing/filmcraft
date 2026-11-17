@@ -1328,6 +1328,7 @@ impl<'a, 'i> Writer<'a, 'i> {
     // Sequences
     // -----------------------------------------------------------------------------------------
 
+    #[allow(clippy::cognitive_complexity)]
     fn sequence(&mut self, project: &Project, seq: &Sequence, pseq: Node<'a, 'i>) -> Result<Vec<WrittenTrack>> {
         let edits_before = self.edit_count();
         self.sample_ticks = TICKS_PER_SECOND / i64::from(seq.settings.sample_rate.max(1));
@@ -1850,6 +1851,7 @@ impl<'a, 'i> Writer<'a, 'i> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::cognitive_complexity)]
     fn patch_clip(
         &mut self,
         project: &Project,

@@ -165,6 +165,7 @@ fn detects_gzipped_and_plain_projects() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn imports_bins_media_sequences_clips_and_effects() {
     let (imp, report) = import(&gzip(doc().as_bytes()), Some("/edits/show"));
     let p = &imp.project;
@@ -504,6 +505,7 @@ fn premiere_titles_come_in_as_graphics_with_their_text() {
 
 /// A mask component as Premiere saves one (`AE.ADBE AEMask2`): the path by hash, Position /
 /// Anchor Point, Feather, Expansion, Inverted and Type (parameters found by `ParameterID`).
+#[allow(clippy::too_many_arguments)]
 fn mask_xml(id: u32, path_hash: &str, path_keys: Option<&str>, pos: &str, anchor: &str, feather: f64, expansion: f64, inverted: bool, kind: u32) -> String {
     let p = |n: u32| id + n;
     let keys = path_keys.map(|k| format!("<Keyframes>{k}</Keyframes>")).unwrap_or_default();

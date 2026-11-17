@@ -21,6 +21,9 @@ fn marker(start: i64, name: &str) -> Marker {
         comment: "note".into(),
         kind: MarkerKind::Comment,
         color: Label::Green,
+        url: String::new(),
+        author: String::new(),
+        custom_color: None,
     }
 }
 

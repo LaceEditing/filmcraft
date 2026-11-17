@@ -351,6 +351,9 @@ fn the_first_marker_of_a_sequence_creates_its_marker_list() {
         comment: String::new(),
         kind: filmcraft_project::MarkerKind::Comment,
         color: filmcraft_project::Label::Green,
+        url: String::new(),
+        author: String::new(),
+        custom_color: None,
     });
     let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
     let back = read(&out);
@@ -981,12 +984,13 @@ fn new_sequences_synthetic_items_and_bins_are_built() {
             has_alpha: false,
             bitrate: None,
             hdr: None,
+            color_assumed: None,
         }),
     };
     let matte = p.add_item(
         "Orange",
         filmcraft_project::Label::Iris,
-        ItemKind::Media(filmcraft_project::MediaClip {
+        ItemKind::Media(Box::new(filmcraft_project::MediaClip {
             media: filmcraft_project::MediaRef::Generator(filmcraft_media::generators::Generator::ColorMatte { color: [1.0, 0.5, 0.0, 1.0] }),
             info,
             interpret: Default::default(),
@@ -996,7 +1000,7 @@ fn new_sequences_synthetic_items_and_bins_are_built() {
             offline: false,
             proxy: None,
             identity: None,
-        }),
+        })),
         None,
     );
     let new_seq = p.new_sequence("Made Here", settings, 2, 1, None);

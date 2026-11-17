@@ -61,7 +61,7 @@ pub fn font_picker(
     auto_id: &str,
 ) -> Option<String> {
     let t = app.tokens;
-    let id = egui::Id::new(("font-picker", salt));
+    let id = egui::Id::unique(("font-picker", salt));
     let mut st: PickerState = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     // the field, drawn like a combo box
     let (r, resp) = ui.allocate_exact_size(vec2(width, ui.spacing().interact_size.y.max(22.0)), Sense::click());
@@ -217,7 +217,7 @@ pub fn style_picker(
         }
     }
     let mut picked = None;
-    let r = egui::ComboBox::from_id_salt(("font-style", salt)).selected_text(style).width(width).height(320.0).show_ui(ui, |ui| {
+    let r = craft_ui::ComboBox::from_id_salt(("font-style", salt)).selected_text(style).width(width).height(320.0).show_ui(ui, |ui| {
         for s in &list {
             let o = ui.selectable_label(*s == style, *s);
             app.auto.add(&format!("{auto_id}.option.{s}"), o.rect, s);

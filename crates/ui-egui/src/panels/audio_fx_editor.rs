@@ -23,8 +23,10 @@
 //!   many (one per parameter group), checkboxes for switches and radio buttons for choices.
 //!
 //! Knobs and sliders drag (Shift: finer); their blue values scrub and take typed numbers;
-//! double-clicking a knob resets it. Drags preview locally and commit one `effects.setParam` /
-//! `mixer.setInsert` on release (one undo step).
+//! double-clicking a knob resets it. Drags preview locally and commit on release (one undo step):
+//! `effects.setParam` on a clip; on an insert `mixer.setValue` on the parameter's lane
+//! (`fx.<slot>.<param>`) for a number, so an automated lane that is read gets a keyframe at the
+//! playhead, and `mixer.setInsert` for switches and choices.
 //!
 //! Automation ids (`<fx>` = effect id): `fxEditor.<fx>.param.<param>` (knobs, sliders, EQ bands),
 //! `…value.<param>` (their numbers), `…toggle.<param>` (checkboxes), `…choice.<param>.<i>`
@@ -46,6 +48,7 @@ use serde_json::{Value, json};
 use crate::FilmcraftApp;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
+use crate::widgets::HotNumberOptions;
 
 /// What an editor window edits.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +82,20 @@ pub fn has_editor(effect: &str) -> bool {
     filmcraft_project::find_effect(effect).is_some_and(|d| d.kind == filmcraft_project::EffectKind::Audio && !d.intrinsic)
 }
 
+/// Whether the Track Fx Editor can edit `effect` as a mixer insert: a graphical editor, or the
+/// generic one for any effect with parameters (inserts have no Effect Controls rows, #1758).
+pub fn can_edit_insert(effect: &str) -> bool {
+    has_editor(effect) || generic_params(effect).next().is_some()
+}
+
+/// The parameters the generic editor shows: numbers, switches and choices.
+fn generic_params(effect: &str) -> impl Iterator<Item = &'static filmcraft_project::ParamDef> {
+    filmcraft_project::find_effect(effect)
+        .into_iter()
+        .flat_map(|d| d.params.iter())
+        .filter(|p| matches!(p.kind, ParamKind::Float { .. } | ParamKind::Bool | ParamKind::Choice(_)))
+}
+
 /// Open (or raise) the editor for a target.
 pub fn open(app: &mut FilmcraftApp, target: FxTarget) {
     if let Some(res) = resolve(app, &target) {
@@ -106,7 +123,7 @@ fn resolve(app: &FilmcraftApp, target: &FxTarget) -> Option<Resolved> {
             let (tid, it) = seq.find_item(ClipId(*clip))?;
             let inst = it.effects.get(*index)?.clone();
             let tr = seq.track(tid);
-            let mt = it.source_time_at(ph.clamp(it.start, it.end() - Tick(1)));
+            let mt = it.effect_time_at(ph.clamp(it.start, it.end() - Tick(1)));
             Some(Resolved {
                 inst,
                 mt,
@@ -129,10 +146,13 @@ fn key(target: &FxTarget) -> String {
     }
 }
 
-/// Command that sets one parameter on the target.
-fn set_cmd(target: &FxTarget, pid: &str, v: Value) -> (String, Value) {
+/// Command that sets one parameter on the target. A number on an insert goes through its mixer
+/// lane (`fx.<slot>.<param>`), which writes a keyframe at the playhead when the lane is automated
+/// and read, and sets the value otherwise; switches and choices are plain settings.
+fn set_cmd(target: &FxTarget, pid: &str, v: Value, lane: bool) -> (String, Value) {
     match target {
         FxTarget::Clip { clip, index } => ("effects.setParam".into(), json!({"clip": clip, "effect": index, "param": pid, "value": v})),
+        FxTarget::Insert { strip, slot } if lane => ("mixer.setValue".into(), json!({"strip": strip, "lane": format!("fx.{slot}.{pid}"), "value": v})),
         FxTarget::Insert { strip, slot } => ("mixer.setInsert".into(), json!({"strip": strip, "slot": slot, "params": {pid: v}})),
     }
 }
@@ -227,12 +247,13 @@ impl Ed<'_> {
         self.def(pid).and_then(|p| p.default.as_f64()).unwrap_or(0.0)
     }
     fn commit(&mut self, pid: &str, v: f64) {
-        let val = match self.def(pid).map(|p| &p.kind) {
-            Some(ParamKind::Bool) => json!(v >= 0.5),
-            Some(ParamKind::Choice(_)) => json!(v.max(0.0).round() as u64),
-            _ => json!(v),
+        let (val, lane) = match self.def(pid).map(|p| &p.kind) {
+            Some(ParamKind::Bool) => (json!(v >= 0.5), false),
+            Some(ParamKind::Choice(_)) => (json!(v.max(0.0).round() as u64), false),
+            Some(ParamKind::Float { min, max, .. }) => (json!(v.clamp(*min, *max)), true),
+            _ => (json!(v), false),
         };
-        self.acts.push(set_cmd(self.target, pid, val));
+        self.acts.push(set_cmd(self.target, pid, val, lane));
         // keep showing the new value until the project catches up this frame
         self.drafts.insert(pid.to_string(), v);
     }
@@ -279,9 +300,11 @@ impl Ed<'_> {
         let v = self.v(pid);
         let suffix = if unit.is_empty() || unit.starts_with(':') { unit.to_string() } else { format!(" {unit}") };
         let mut vui = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(align)));
-        let id = egui::Id::new(("fx-value", self.target.clone(), pid));
+        let id = egui::Id::unique(("fx-value", self.target.clone(), pid));
         let dec = shown_decimals(v, dec);
-        let (resp, nv) = crate::widgets::hot_number(&mut vui, id, v, (hi - lo).abs().max(1e-6) / 250.0, (min, max), dec, &suffix, &self.t);
+        let label = self.def(pid).map_or(pid, |d| crate::i18n::t(d.label));
+        let options = HotNumberOptions::new((hi - lo).abs().max(1e-6) / 250.0, (min, max), dec, &suffix, &self.t);
+        let (resp, nv) = crate::widgets::hot_number(&mut vui, label, id, v, options);
         self.auto(format!("fxEditor.{}.value.{pid}", self.fx), resp.rect, &format!("{v:.dec$}{suffix}"));
         if let Some(n) = nv {
             if resp.dragged() {
@@ -306,7 +329,7 @@ impl Ed<'_> {
         let radius = if compact { 15.0 } else { 18.0 };
         let c = pos2(cell.center().x, cell.min.y + radius + 6.0);
         let kr = Rect::from_center_size(c, vec2(radius * 2.0 + 6.0, radius * 2.0 + 6.0));
-        let resp = ui.interact(kr, egui::Id::new(("fx-knob", self.target.clone(), pid)), Sense::click_and_drag());
+        let resp = ui.interact(kr, egui::Id::unique(("fx-knob", self.target.clone(), pid)), Sense::click_and_drag());
         let v = self.v(pid);
         let u = self.to_u(pid, v);
         let col = if resp.hovered() || resp.dragged() { Color32::WHITE } else { KNOB };
@@ -377,7 +400,7 @@ impl Ed<'_> {
         p.line_segment([pos2(track.min.x, ty - 6.0), pos2(track.min.x, ty + 3.0)], Stroke::new(1.0, DIM));
         p.line_segment([pos2(track.max.x, ty - 6.0), pos2(track.max.x, ty + 3.0)], Stroke::new(1.0, DIM));
         let hit = track.expand2(vec2(8.0, 12.0));
-        let resp = ui.interact(hit, egui::Id::new(("fx-slider", self.target.clone(), pid)), Sense::click_and_drag());
+        let resp = ui.interact(hit, egui::Id::unique(("fx-slider", self.target.clone(), pid)), Sense::click_and_drag());
         let v = self.v(pid);
         let x = track.min.x + self.to_u(pid, v) * track.width();
         let col = if resp.hovered() || resp.dragged() { Color32::WHITE } else { KNOB };
@@ -453,7 +476,7 @@ impl Ed<'_> {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("{label}:")).color(LABEL).size(13.0));
                 let mut sel = cur;
-                let r = egui::ComboBox::from_id_salt(("fx-choice", self.target.clone(), pid))
+                let r = craft_ui::ComboBox::from_id_salt(("fx-choice", self.target.clone(), pid))
                     .width(170.0)
                     .selected_text(opts.get(cur).copied().unwrap_or(""))
                     .show_ui(ui, |ui| {
@@ -507,7 +530,7 @@ fn shown_decimals(v: f64, dec: usize) -> usize {
 /// The live gain reduction of every metered track effect, decaying back to zero (20 dB/s) once
 /// the mix stops reporting it. Read once per frame.
 fn live_meters(app: &FilmcraftApp, ctx: &egui::Context) -> HashMap<(u64, usize), [f32; 4]> {
-    let id = egui::Id::new("fx-editor-meters");
+    let id = egui::Id::unique("fx-editor-meters");
     let frame = ctx.cumulative_frame_nr();
     let (last, mut st): (u64, HashMap<(u64, usize), [f32; 4]>) = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
     if last == frame && frame != 0 {
@@ -563,7 +586,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         };
         // the window belongs to the effect it was opened on, not to its slot
         let opened_on = app.ui.audio_fx_editor_effects.entry(key(&target)).or_insert_with(|| res.inst.effect.clone());
-        if !has_editor(&res.inst.effect) || *opened_on != res.inst.effect {
+        let editable = match target {
+            FxTarget::Insert { .. } => can_edit_insert(&res.inst.effect),
+            FxTarget::Clip { .. } => has_editor(&res.inst.effect),
+        };
+        if !editable || *opened_on != res.inst.effect {
             close.push(target);
             continue;
         }
@@ -571,7 +598,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         let kind = if matches!(target, FxTarget::Clip { .. }) { tl!("Clip Fx Editor") } else { tl!("Track Fx Editor") };
         let title = format!("{kind} - {name}: {}", res.place);
         let k = key(&target);
-        let drafts_id = egui::Id::new(("fx-editor-drafts", &k));
+        let drafts_id = egui::Id::unique(("fx-editor-drafts", &k));
         let drafts: HashMap<String, f64> = ctx.data(|d| d.get_temp(drafts_id)).unwrap_or_default();
         let fx_id = res.inst.effect.clone();
         let enabled = res.inst.enabled;
@@ -610,7 +637,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         };
         let mut closed = false;
         let frame = egui::Frame::new().fill(BG).stroke(Stroke::new(1.0, LINE)).corner_radius(3.0).shadow(ctx.global_style().visuals.window_shadow);
-        egui::Window::new(title.clone()).id(egui::Id::new(("fx-editor", &k))).title_bar(false).collapsible(false).resizable(false).frame(frame).show(
+        egui::Window::new(title.clone()).id(egui::Id::unique(("fx-editor", &k))).title_bar(false).collapsible(false).resizable(false).frame(frame).show(
             ctx,
             |ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -636,6 +663,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 p.get("param")
                     .and_then(Value::as_str)
                     .map(str::to_string)
+                    .or_else(|| p.get("lane").and_then(Value::as_str).and_then(|l| l.splitn(3, '.').nth(2)).map(str::to_string))
                     .or_else(|| p.get("params").and_then(Value::as_object).and_then(|o| o.keys().next().cloned()))
             })
             .collect();
@@ -682,7 +710,7 @@ fn title_bar(ui: &mut egui::Ui, ed: &mut Ed, title: &str, closed: &mut bool) {
     let clip = ui.painter().with_clip_rect(Rect::from_min_max(r.min, pos2(r.max.x - 40.0, r.max.y)));
     clip.text(pos2(r.min.x + 12.0, r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(14.0), Color32::from_gray(0xe6));
     let xr = Rect::from_min_max(pos2(r.max.x - 36.0, r.min.y + 4.0), pos2(r.max.x - 6.0, r.max.y - 4.0));
-    let resp = ui.interact(xr, egui::Id::new(("fx-editor-close", ed.target.clone())), Sense::click()).on_hover_text(tl!("Close"));
+    let resp = ui.interact(xr, egui::Id::unique(("fx-editor-close", ed.target.clone())), Sense::click()).on_hover_text(tl!("Close"));
     if resp.hovered() {
         ui.painter().rect_filled(xr, 2.0, RED);
     }
@@ -700,7 +728,8 @@ fn header(ui: &mut egui::Ui, ed: &mut Ed, enabled: bool, presets: &[(String, Eff
     // power button: lit when the effect plays, dark and struck when bypassed
     let pc = pos2(r.min.x + 22.0, r.center().y);
     let pr = Rect::from_center_size(pc, vec2(24.0, 24.0));
-    let presp = ui.interact(pr, egui::Id::new(("fx-editor-power", ed.target.clone())), Sense::click()).on_hover_text(if enabled { "Bypass" } else { "Enable" });
+    let presp =
+        ui.interact(pr, egui::Id::unique(("fx-editor-power", ed.target.clone())), Sense::click()).on_hover_text(if enabled { "Bypass" } else { "Enable" });
     let col = if !enabled {
         RED
     } else if presp.hovered() {
@@ -724,7 +753,7 @@ fn header(ui: &mut egui::Ui, ed: &mut Ed, enabled: bool, presets: &[(String, Eff
     }
     p.text(pos2(r.min.x + 48.0, r.center().y), Align2::LEFT_CENTER, "Presets:", FontId::proportional(13.5), LABEL);
     // saving: a name field in place of the menu
-    let naming_id = egui::Id::new(("fx-preset-name", ed.target.clone()));
+    let naming_id = egui::Id::unique(("fx-preset-name", ed.target.clone()));
     let mut naming: Option<String> = ui.data(|d| d.get_temp(naming_id));
     let field = Rect::from_min_max(pos2(r.min.x + 112.0, r.center().y - 12.0), pos2(r.max.x - 70.0, r.center().y + 12.0));
     let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::left_to_right(egui::Align::Center)));
@@ -743,23 +772,24 @@ fn header(ui: &mut egui::Ui, ed: &mut Ed, enabled: bool, presets: &[(String, Eff
             te.request_focus();
         }
     } else {
-        let resp = egui::ComboBox::from_id_salt(("fx-presets", ed.target.clone())).width(field.width() - 8.0).selected_text(current).show_ui(&mut fui, |ui| {
-            let names = std::iter::once(DEFAULT_SETTINGS.to_string()).chain(presets.iter().map(|(n, _)| n.clone()));
-            for n in names {
-                let r = ui.selectable_label(n == current, &n);
-                ed.auto(format!("fxEditor.{}.presets.{n}", ed.fx), r.rect, &n);
-                if r.clicked() {
-                    let mut pa = preset_target(ed.target);
-                    pa["preset"] = json!(n);
-                    ed.acts.push(("presets.applySettings".into(), pa));
+        let resp =
+            craft_ui::ComboBox::from_id_salt(("fx-presets", ed.target.clone())).width(field.width() - 8.0).selected_text(current).show_ui(&mut fui, |ui| {
+                let names = std::iter::once(DEFAULT_SETTINGS.to_string()).chain(presets.iter().map(|(n, _)| n.clone()));
+                for n in names {
+                    let r = ui.selectable_label(n == current, &n);
+                    ed.auto(format!("fxEditor.{}.presets.{n}", ed.fx), r.rect, &n);
+                    if r.clicked() {
+                        let mut pa = preset_target(ed.target);
+                        pa["preset"] = json!(n);
+                        ed.acts.push(("presets.applySettings".into(), pa));
+                    }
                 }
-            }
-        });
+            });
         ed.auto(format!("fxEditor.{}.presets", ed.fx), resp.response.rect, "Presets");
     }
     // save the current settings as a preset; delete the chosen one (your presets only)
     let sr = Rect::from_center_size(pos2(r.max.x - 50.0, r.center().y), vec2(24.0, 24.0));
-    let sresp = ui.interact(sr, egui::Id::new(("fx-preset-save", ed.target.clone())), Sense::click()).on_hover_text("Save Preset…");
+    let sresp = ui.interact(sr, egui::Id::unique(("fx-preset-save", ed.target.clone())), Sense::click()).on_hover_text("Save Preset…");
     icons::paint(ui.painter(), sr.shrink(4.0), Icon::NewItem, if sresp.hovered() { Color32::WHITE } else { KNOB });
     ed.auto(format!("fxEditor.{}.presets.save", ed.fx), sr, "Save Preset…");
     if sresp.clicked() {
@@ -767,7 +797,7 @@ fn header(ui: &mut egui::Ui, ed: &mut Ed, enabled: bool, presets: &[(String, Eff
     }
     let can_delete = user.iter().any(|u| u == current);
     let dr = Rect::from_center_size(pos2(r.max.x - 22.0, r.center().y), vec2(24.0, 24.0));
-    let dresp = ui.interact(dr, egui::Id::new(("fx-preset-delete", ed.target.clone())), Sense::click()).on_hover_text("Delete Preset");
+    let dresp = ui.interact(dr, egui::Id::unique(("fx-preset-delete", ed.target.clone())), Sense::click()).on_hover_text("Delete Preset");
     icons::paint(
         ui.painter(),
         dr.shrink(4.0),
@@ -1137,9 +1167,9 @@ fn peq_drag_target(pointer: Pos2, grab: egui::Vec2, r: Rect, half: f64) -> (f64,
 
 fn parametric(ui: &mut egui::Ui, ed: &mut Ed) {
     let k = key(ed.target);
-    let range_id = egui::Id::new(("peq-range30", &k));
-    let sel_id = egui::Id::new(("peq-selected", &k));
-    let grab_id = egui::Id::new(("peq-grab", &k));
+    let range_id = egui::Id::unique(("peq-range30", &k));
+    let sel_id = egui::Id::unique(("peq-selected", &k));
+    let grab_id = egui::Id::unique(("peq-grab", &k));
     let range_30: bool = ui.ctx().data(|d| d.get_temp(range_id)).unwrap_or(false);
     let mut selected: Option<String> = ui.ctx().data(|d| d.get_temp(sel_id));
     let mut grab: egui::Vec2 = ui.ctx().data(|d| d.get_temp(grab_id)).unwrap_or_default();
@@ -1161,7 +1191,7 @@ fn parametric(ui: &mut egui::Ui, ed: &mut Ed) {
         let g = if kind == PeqKind::Pass { 0.0 } else { ed.v(&g_id) };
         let c = pos2(x_of(ed.v(&f_id), r), y_of(g, r, half));
         let nr = Rect::from_center_size(c, vec2(16.0, 16.0));
-        let resp = ui.interact(nr, egui::Id::new(("peq-node", ed.target.clone(), pre)), Sense::click_and_drag());
+        let resp = ui.interact(nr, egui::Id::unique(("peq-node", ed.target.clone(), pre)), Sense::click_and_drag());
         if resp.clicked() || resp.drag_started() {
             selected = Some(pre.to_string());
         }
@@ -1348,7 +1378,7 @@ fn peq_table(ui: &mut egui::Ui, ed: &mut Ed) {
     for (i, (label, pre, _)) in PEQ_NODES.iter().enumerate() {
         let b = cell(rr, i).shrink2(vec2(4.0, 0.0));
         let pid = format!("{pre}_on");
-        let resp = ui.interact(b, egui::Id::new(("peq-band", ed.target.clone(), *pre)), Sense::click());
+        let resp = ui.interact(b, egui::Id::unique(("peq-band", ed.target.clone(), *pre)), Sense::click());
         let on = ed.on(&pid);
         let fill = if on { Color32::from_gray(0x50) } else { Color32::from_gray(0x0c) };
         ui.painter().rect_filled(b, 3.0, fill);
@@ -1369,7 +1399,7 @@ fn peq_slope(ui: &mut egui::Ui, ed: &mut Ed, pid: &str, r: Rect) {
     let cur = ed.v(pid).max(0.0).round() as usize;
     let mut sel = cur;
     let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(r));
-    let resp = egui::ComboBox::from_id_salt(("peq-slope", ed.target.clone(), pid))
+    let resp = craft_ui::ComboBox::from_id_salt(("peq-slope", ed.target.clone(), pid))
         .width(r.width())
         .selected_text(egui::RichText::new(opts.get(cur).copied().unwrap_or("")).size(11.5))
         .show_ui(&mut cui, |ui| {
@@ -1387,7 +1417,7 @@ fn peq_slope(ui: &mut egui::Ui, ed: &mut Ed, pid: &str, r: Rect) {
 fn peq_shelf_switch(ui: &mut egui::Ui, ed: &mut Ed, pre: &str, r: Rect) {
     let pid = format!("{pre}_steep");
     let b = Rect::from_center_size(pos2(r.max.x - 14.0, r.center().y), vec2(26.0, 20.0));
-    let resp = ui.interact(b, egui::Id::new(("peq-steep", ed.target.clone(), pre)), Sense::click());
+    let resp = ui.interact(b, egui::Id::unique(("peq-steep", ed.target.clone(), pre)), Sense::click());
     let steep = ed.on(&pid);
     if resp.hovered() {
         ui.painter().rect_stroke(b, 3.0, Stroke::new(1.0, Color32::from_gray(0x90)), StrokeKind::Inside);
@@ -1433,7 +1463,7 @@ fn graphic(ui: &mut egui::Ui, ed: &mut Ed) {
         let v = ed.v(&pid);
         let ky = track.center().y - (v / 24.0) as f32 * track.height() * 0.5;
         let knob = Rect::from_center_size(pos2(x, ky), vec2(colw.min(18.0), 8.0));
-        let id = egui::Id::new(("geq-band", ed.target.clone(), i));
+        let id = egui::Id::unique(("geq-band", ed.target.clone(), i));
         let resp = ui.interact(knob.union(track).expand(3.0), id, Sense::click_and_drag());
         ui.painter().rect_filled(knob, 2.0, if resp.hovered() || resp.dragged() { Color32::WHITE } else { KNOB });
         ui.painter().text(pos2(x, area.max.y - 22.0), Align2::CENTER_CENTER, format!("{v:+.0}"), Tokens::ui(9.0), ed.t.hot_text);
@@ -1515,7 +1545,7 @@ fn multiband(ui: &mut egui::Ui, ed: &mut Ed) {
     for (k, pid) in ["xo1", "xo2", "xo3"].iter().enumerate() {
         let x = edges[k + 1];
         let hr = Rect::from_center_size(pos2(x, r.center().y), vec2(10.0, r.height()));
-        let resp = ui.interact(hr, egui::Id::new(("mb-xo", ed.target.clone(), k)), Sense::drag());
+        let resp = ui.interact(hr, egui::Id::unique(("mb-xo", ed.target.clone(), k)), Sense::drag());
         ui.painter().line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(if resp.hovered() || resp.dragged() { 2.5 } else { 1.5 }, Color32::WHITE));
         ui.painter().text(pos2(x + 3.0, r.min.y + 2.0), Align2::LEFT_TOP, format!("{:.0} Hz", xo[k]), Tokens::ui(9.5), ed.t.hot_text);
         ed.auto(format!("fxEditor.{}.{pid}", ed.fx), hr, "Crossover");

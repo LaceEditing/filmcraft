@@ -117,6 +117,9 @@ fn kit(path: &str, out_dir: &str) -> Result<String, String> {
         comment: String::new(),
         kind: MarkerKind::Comment,
         color: filmcraft_project::Label::Green,
+        url: String::new(),
+        author: String::new(),
+        custom_color: None,
     });
     m.id = MarkerId(next + 3);
     m.start = Tick(5 * S);

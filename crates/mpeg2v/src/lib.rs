@@ -44,6 +44,9 @@ use headers::{EXTENSION, GROUP_START, PICTURE_START, SEQUENCE_END, SEQUENCE_HEAD
 use mc::Frame;
 use slice::{PicParams, Target, decode_slice, slice_row};
 
+/// One access unit must not retain an unbounded number of cropped decoded pictures.
+const MAX_OUTPUT_PICTURES_PER_ACCESS_UNIT: usize = 8;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid MPEG video: {0}")]
@@ -423,6 +426,9 @@ pub struct Decoder {
     gray: Option<Arc<Frame>>,
     pending: Option<Pending>,
     out: Vec<Picture>,
+    output_overflow: bool,
+    /// After a refused access unit the references are gone: only an I picture restarts decoding.
+    need_intra: bool,
     errors: usize,
     last_error: Option<&'static str>,
     threads: bool,
@@ -447,6 +453,8 @@ impl Decoder {
             gray: None,
             pending: None,
             out: Vec::new(),
+            output_overflow: false,
+            need_intra: false,
             errors: 0,
             last_error: None,
             threads: cfg!(feature = "threads"),
@@ -476,6 +484,7 @@ impl Decoder {
     /// Decode a chunk of the elementary stream holding whole pictures (an access unit) tagged
     /// with `pts`. Returns the pictures that became displayable, in display order.
     pub fn decode(&mut self, data: &[u8], pts: i64) -> Result<Vec<Picture>> {
+        self.output_overflow = false;
         let codes = start_codes(data);
         let mut err = None;
         for (k, &(pos, code)) in codes.iter().enumerate() {
@@ -554,6 +563,12 @@ impl Decoder {
         }
         self.apply_sequence();
         self.finish_picture(data, pts);
+        if self.output_overflow {
+            // the references of a refused access unit are stale: drop them and wait for an I picture
+            self.reset();
+            self.need_intra = true;
+            return Err(Error::Invalid("access unit produces too many decoded pictures".into()));
+        }
         let out = std::mem::take(&mut self.out);
         match err {
             Some(e) if out.is_empty() && self.seq.is_none() => Err(e),
@@ -571,7 +586,7 @@ impl Decoder {
         {
             a.shown = true;
             let p = to_picture(&a.frame, &a.meta);
-            self.out.push(p);
+            self.push_output(p);
         }
         std::mem::take(&mut self.out)
     }
@@ -584,6 +599,8 @@ impl Decoder {
         self.building = None;
         self.pending = None;
         self.out.clear();
+        self.output_overflow = false;
+        self.need_intra = false;
         self.closed_gop = false;
     }
 
@@ -597,7 +614,11 @@ impl Decoder {
             Ok(s) => {
                 let changed = self.seq.as_ref().is_none_or(|o| o.mb_width != s.mb_width || o.mb_height != s.mb_height || o.info.chroma != s.info.chroma);
                 if changed {
+                    // the reset must not hide an overflow already seen in this access unit
+                    let (overflow, need_intra) = (self.output_overflow, self.need_intra);
                     self.reset();
+                    self.output_overflow = overflow;
+                    self.need_intra = need_intra;
                 }
                 self.seq = Some(s);
             }
@@ -607,6 +628,14 @@ impl Decoder {
 
     fn finish_picture(&mut self, data: &[u8], pts: i64) {
         let Some(pd) = self.pending.take() else { return };
+        if self.output_overflow {
+            return; // the access unit is already refused: do not allocate or decode more pictures for it
+        }
+        if pd.slices.is_empty() {
+            self.errors += 1;
+            self.last_error = Some("picture has no slices");
+            return;
+        }
         let Some(seq) = self.seq.clone() else {
             self.errors += 1;
             return;
@@ -625,6 +654,14 @@ impl Decoder {
             return;
         }
         let ptype = pd.ph.coding_type;
+        if self.need_intra {
+            // an MPEG-1 D picture is intra coded, so it restarts decoding like an I picture
+            if ptype != PictureType::I && !(ptype == PictureType::D && !mpeg2) {
+                self.errors += 1;
+                return; // its references went with the refused access unit
+            }
+            self.need_intra = false;
+        }
         let (shx, shy) = seq.shifts();
         let (w, h) = (seq.mb_width * 16, seq.mb_height * 16);
         let (cw, ch) = (w >> shx, h >> shy);
@@ -642,6 +679,9 @@ impl Decoder {
             } else {
                 self.complete(b.frame, b.meta);
             }
+        }
+        if self.output_overflow {
+            return; // pairing an unpaired field output the last allowed picture: refuse before allocating and decoding this one
         }
         // B pictures need their forward reference unless the GOP is closed
         if ptype == PictureType::B && second.is_none() && (self.bwd.is_none() || (self.fwd.is_none() && !self.closed_gop)) {
@@ -706,13 +746,21 @@ impl Decoder {
             if let Some(mut prev) = self.bwd.take() {
                 if !prev.shown {
                     prev.shown = true;
-                    self.out.push(to_picture(&prev.frame, &prev.meta));
+                    self.push_output(to_picture(&prev.frame, &prev.meta));
                 }
                 self.fwd = Some(prev);
             }
             self.bwd = Some(Anchor { frame: Arc::new(frame), meta, shown: false });
         } else {
-            self.out.push(to_picture(&frame, &meta));
+            self.push_output(to_picture(&frame, &meta));
+        }
+    }
+
+    fn push_output(&mut self, picture: Picture) {
+        if self.out.len() >= MAX_OUTPUT_PICTURES_PER_ACCESS_UNIT {
+            self.output_overflow = true;
+        } else {
+            self.out.push(picture);
         }
     }
 }

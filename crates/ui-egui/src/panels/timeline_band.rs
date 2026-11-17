@@ -131,7 +131,7 @@ enum BandDrag {
 }
 
 fn drag_id() -> egui::Id {
-    egui::Id::new("tl-band-drag")
+    egui::Id::unique("tl-band-drag")
 }
 
 /// The parameter with a drag in progress applied: a keyframe moved to (`time`, `value`), or the
@@ -164,6 +164,7 @@ fn previewed(p: &Param, kind: TrackKind, drag: BandDrag, key_to: Option<(Tick, f
 
 /// Draw the bands of the clips shown and handle their editing (after the timeline's own
 /// interaction, so they sit on top of it).
+#[allow(clippy::cognitive_complexity)]
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &Layout, vclip: Rect, aclip: Rect) {
     // (not while the timeline drags something of its own)
     if app.tl.drag.as_ref().is_some_and(|d| !matches!(d, Drag::Scrub { .. })) {
@@ -256,7 +257,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     continue;
                 }
                 let hr = Rect::from_center_size(c, vec2(11.0, 11.0));
-                let resp = ui.interact(hr, egui::Id::new(("band-kf", it.id.0, i)), Sense::click_and_drag());
+                let resp = ui.interact(hr, egui::Id::unique(("band-kf", it.id.0, i)), Sense::click_and_drag());
                 let hot = resp.hovered() || matches!(mine, Some(BandDrag::Key { index, .. }) if index == i);
                 icons::paint(
                     &paint,
@@ -286,7 +287,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 }
                 if hot && matches!(mine, Some(BandDrag::Key { .. })) {
                     let label = if r.kind == TrackKind::Video { format!("Opacity {v:.1} %") } else { format!("Volume {v:.2} dB") };
-                    egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new("band-kf-tip"), egui::PopupAnchor::Pointer).show(|ui| {
+                    egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::unique("band-kf-tip"), egui::PopupAnchor::Pointer).show(|ui| {
                         ui.label(label);
                     });
                 }
@@ -321,7 +322,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 } else {
                     let v = left_or_static(&p, mine).unwrap_or(0.0);
                     let label = if r.kind == TrackKind::Video { format!("Opacity {v:.1} %") } else { format!("Volume {v:.2} dB") };
-                    egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new("band-line-tip"), egui::PopupAnchor::Pointer).show(|ui| {
+                    egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::unique("band-line-tip"), egui::PopupAnchor::Pointer).show(|ui| {
                         ui.label(label);
                     });
                 }

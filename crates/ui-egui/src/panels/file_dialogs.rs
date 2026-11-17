@@ -1,8 +1,10 @@
-//! The crash-recovery prompt and the Revert confirmation (Settings ▸ Auto Save lives in
-//! `panels::settings`).
+//! The crash-recovery prompt, the Revert confirmation and the replace prompt for a save dialog's
+//! answer that got its extension added (`native_dialogs`). Settings ▸ Auto Save lives in
+//! `panels::settings`.
 //!
 //! Automation ids: `recovery.item.<n>`, `recovery.recover`, `recovery.discard`, `recovery.later`;
-//! `revert.yes`, `revert.no`; `saveNotes.note.<n>`, `saveNotes.ok`; `saveFailed.ok`.
+//! `revert.yes`, `revert.no`; `overwrite.replace`, `overwrite.cancel`; `saveNotes.note.<n>`, `saveNotes.ok`;
+//! `saveFailed.ok`.
 
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, Ui, vec2};
 use serde_json::json;
@@ -29,11 +31,11 @@ impl FileDialogState {
     }
 }
 
-fn modal_frame(t: &Tokens) -> Frame {
+pub(crate) fn modal_frame(t: &Tokens) -> Frame {
     Frame::new().fill(t.panel_bg).stroke(Stroke::new(1.0, t.separator)).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(0))
 }
 
-fn button(app: &mut FilmcraftApp, ui: &mut Ui, id: &str, label: &str, primary: bool) -> bool {
+pub(crate) fn button(app: &mut FilmcraftApp, ui: &mut Ui, id: &str, label: &str, primary: bool) -> bool {
     let t = app.tokens;
     let text = RichText::new(label).size(13.0).color(if primary { Color32::WHITE } else { t.text });
     let b = egui::Button::new(text)
@@ -55,7 +57,7 @@ pub fn show_recovery(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     }
     let mut choice = app.file_dialogs.recovery_choice.min(items.len() - 1);
     let mut open = true;
-    egui::Modal::new(egui::Id::new("recovery-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("recovery-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
         ui.set_width(520.0);
         Frame::new().inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 20 }).show(ui, |ui| {
             ui.label(RichText::new(tl!("Recover Unsaved Changes")).size(18.0).strong().color(t.text));
@@ -123,7 +125,7 @@ pub fn show_save_failed(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let t = app.tokens;
     let Some(e) = app.file_dialogs.save_failed.clone() else { return false };
     let mut open = true;
-    let r = egui::Modal::new(egui::Id::new("save-failed-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
+    let r = egui::Modal::new(egui::Id::unique("save-failed-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
         ui.set_width(560.0);
         Frame::new().inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 20 }).show(ui, |ui| {
             ui.label(RichText::new("The project was not saved").size(18.0).strong().color(t.text));
@@ -156,7 +158,7 @@ pub fn show_revert(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let t = app.tokens;
     let file = app.session.path.as_deref().and_then(|p| std::path::Path::new(p).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut open = true;
-    let r = egui::Modal::new(egui::Id::new("revert-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
+    let r = egui::Modal::new(egui::Id::unique("revert-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
         ui.set_width(460.0);
         Frame::new().inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 20 }).show(ui, |ui| {
             ui.label(RichText::new(tl!("Revert")).size(18.0).strong().color(t.text));
@@ -179,7 +181,44 @@ pub fn show_revert(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
         });
     });
     // (the modal's own close also fires on Escape: not while a drag is being cancelled, #580)
-    open && !(r.should_close() && !ctx.input(|i| i.pointer.any_down()))
+    open && (!r.should_close() || ctx.input(|i| i.pointer.any_down()))
+}
+
+/// "“cut.fcproj” already exists in “edits”. Do you want to replace it?" for a save dialog's answer
+/// that names an existing file once its extension was added (drawn after every other dialog, so
+/// it stays on top). Escape cancels.
+pub fn show_overwrite(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    let Some(path) = app.overwrite_prompt_path().map(std::path::PathBuf::from) else { return };
+    let t = app.tokens;
+    let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let folder = path.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut answer = None;
+    let r = egui::Modal::new(egui::Id::unique("overwrite-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
+        ui.set_width(460.0);
+        Frame::new().inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 20 }).show(ui, |ui| {
+            ui.label(RichText::new(tl!("Replace File")).size(18.0).strong().color(t.text));
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(RichText::new(tlf!("“{file}” already exists in “{folder}”. Do you want to replace it?", file, folder)).size(13.5).color(t.text));
+            ui.add_space(18.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if button(app, ui, "overwrite.replace", tl!("Replace"), true) {
+                    answer = Some(true);
+                }
+                if button(app, ui, "overwrite.cancel", tl!("Cancel"), false) {
+                    answer = Some(false);
+                }
+            });
+        });
+    });
+    // (the modal's own close also fires on Escape: not while a drag is being cancelled, #580)
+    if answer.is_none() && r.should_close() && !ctx.input(|i| i.pointer.any_down()) {
+        answer = Some(false);
+    }
+    if let Some(replace) = answer {
+        app.answer_overwrite(replace);
+    }
 }
 
 /// "Saved, but not everything is in the Premiere Pro project": what Save could not write (the same
@@ -189,7 +228,7 @@ pub fn show_save_notes(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let Some((path, notes)) = app.file_dialogs.save_notes.clone() else { return false };
     let file = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
     let mut open = true;
-    let r = egui::Modal::new(egui::Id::new("save-notes-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
+    let r = egui::Modal::new(egui::Id::unique("save-notes-modal")).frame(modal_frame(&t)).show(ctx, |ui| {
         ui.set_width(560.0);
         Frame::new().inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 20 }).show(ui, |ui| {
             ui.label(RichText::new("Not everything was saved").size(18.0).strong().color(t.text));

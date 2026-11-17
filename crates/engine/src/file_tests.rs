@@ -137,6 +137,19 @@ fn importing_a_folder_makes_bins_of_its_media() {
     assert_eq!(names(&drops, &s), ["a.wav"]);
 }
 
+/// #1545: `file.newProject` answers with the project it made (name and revision, as
+/// `project_inspect` reports them) instead of `null`.
+#[test]
+fn new_project_answers_with_its_name_and_revision() {
+    let mut s = Session::default();
+    let r = s.execute("file.newProject", json!({"name": "Trailer"})).unwrap();
+    assert_eq!(r["name"], "Trailer");
+    assert_eq!(r["revision"].as_u64(), Some(s.revision));
+    assert_eq!(s.project.name, "Trailer");
+    let r = s.execute("file.newProject", json!({})).unwrap();
+    assert_eq!(r["name"], "Untitled", "the default name");
+}
+
 /// Opening the demo after a saved project must not keep that path: Save would overwrite it.
 #[test]
 fn open_demo_project_clears_saved_path_so_save_does_not_overwrite() {

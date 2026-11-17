@@ -191,6 +191,7 @@ fn damaged_values_never_panic() {
 /// per setting): each reads as set in Premiere, and written again reads the same.
 #[test]
 #[ignore = "needs a title kit saved by Premiere (FC_TITLE_KIT)"]
+#[allow(clippy::cognitive_complexity)]
 fn premiere_title_kit() {
     let Ok(path) = std::env::var("FC_TITLE_KIT") else { return };
     let bytes = std::fs::read(&path).unwrap();
