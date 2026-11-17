@@ -1552,7 +1552,7 @@ fn files_dropped_from_a_file_manager_are_imported() {
     assert_eq!(d.harness.state().file_hover, None, "the highlight goes with the drop");
     let st = d.harness.state();
     let b = st.session.project.root.find_bin(filmcraft_project::BinId(bin)).unwrap().clone();
-    let names: Vec<String> = b
+    let mut names: Vec<String> = b
         .children
         .iter()
         .map(|c| match c {
@@ -1560,6 +1560,8 @@ fn files_dropped_from_a_file_manager_are_imported() {
             BinEntry::Bin(sub) => format!("[{}]", sub.name),
         })
         .collect();
+    // both arrive in the bin (the order they are listed in is the panel's sort, not checked here)
+    names.sort();
     assert_eq!(names, ["[Folder]", "one.wav"], "{}", items(&mut d));
     // dropped outside it (the timeline): the next frame, into the bin the panel shows
     ftx.send(filmcraft_ui_egui::FileDrag::Hover(egui::pos2(1500.0, 900.0))).unwrap();

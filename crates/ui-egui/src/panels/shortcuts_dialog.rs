@@ -1136,9 +1136,11 @@ mod key_label_tests {
 
     #[test]
     fn keys_widen_to_fill_the_dialog_up_to_one_and_a_half_times_their_height() {
-        let (ux, uy) = key_units(vec2(1320.0, 360.0));
+        // wide enough for the keyboard with the fork's numeric keypad at 70 px a unit
+        let wide = KEYBOARD_UNITS_W * 70.0;
+        let (ux, uy) = key_units(vec2(wide, 360.0));
         assert!((uy - 360.0 / 6.2).abs() < 0.01);
-        assert!((ux - 1320.0 / KEYBOARD_UNITS_W).abs() < 0.01, "{ux}");
+        assert!((ux - wide / KEYBOARD_UNITS_W).abs() < 0.01, "{ux}");
         let (ux, uy) = key_units(vec2(3000.0, 360.0));
         assert!((ux - uy * MAX_KEY_ASPECT).abs() < 0.01);
     }

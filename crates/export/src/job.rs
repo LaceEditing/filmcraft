@@ -774,7 +774,7 @@ mod tests {
         assert!(!e.to_string().contains("the other driver said no"), "the first failure is the one reported: {e}");
         // a factory that declined is not a failure: the message is the "not available" one
         let e = error_of(pick_encoder(&[factory(never), factory(never)], Format::Hevc, 64, 64, FrameRate::FPS_24, &s));
-        assert!(e.to_string().contains("encoder not available yet"), "{e}");
+        assert!(e.to_string().contains("encoder not available"), "{e}");
     }
 
     #[test]

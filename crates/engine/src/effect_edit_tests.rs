@@ -134,13 +134,14 @@ fn effects_copy_paste_remove_and_reorder() {
     let (blur, tint) = (idx(&ia, "gaussian_blur"), idx(&ia, "tint"));
     s.execute("effects.setParam", json!({"clip": a.0, "effect": blur, "param": "blurriness", "value": 33.0})).unwrap();
 
-    // copy Blur and Tint, paste on B: both arrive before B's fixed effects, with their values
+    // copy Blur and Tint, paste on B: both arrive after B's fixed effects, where `effects.apply` puts
+    // them since upstream #1879, with their values
     s.execute("effects.copy", json!({"clip": a.0, "indices": [blur, tint]})).unwrap();
     let before = s.history.undo.len();
     s.execute("effects.paste", json!({"clips": [b.0]})).unwrap();
     assert_eq!(s.history.undo.len(), before + 1);
     let ib = item(&s, b);
-    assert!(idx(&ib, "gaussian_blur") < idx(&ib, "motion") && idx(&ib, "tint") < idx(&ib, "motion"));
+    assert!(idx(&ib, "gaussian_blur") > idx(&ib, "motion") && idx(&ib, "tint") > idx(&ib, "motion"));
     assert_eq!(ib.effects[idx(&ib, "gaussian_blur")].params["blurriness"].value, ParamValue::Float(33.0));
 
     // reorder on A: Invert to the front of the standard effects; fixed effects stay put

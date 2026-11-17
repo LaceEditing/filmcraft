@@ -183,6 +183,14 @@ impl FilmcraftApp {
             // timeline clip. A transition shown in the panel is the exception: `edit.clear` removes
             // it, as it does from the Timeline, and Ripple Delete is consumed.
             if self.ui.focused == PanelKind::EffectControls && matches!(id.as_str(), "edit.clear" | "edit.rippleDelete") {
+                // the panel's own multi-selection first: the selected keyframes, else several
+                // selected effects (one selected effect, or a mask, is handled below)
+                if id == "edit.clear" && (!self.ui.kf_selected.is_empty() || self.ui.fx_selected.len() > 1) {
+                    if let Some(Err(e)) = crate::panels::effect_controls::route(self, &id) {
+                        self.ui.status = e;
+                    }
+                    continue;
+                }
                 // the clips the panel shows: the selected video clip and its linked audio clip, so a
                 // selection on any row the panel displays is removable
                 let shown = crate::panels::effect_controls::selected_clips(self);
@@ -500,7 +508,9 @@ mod exact_modifier_tests {
         if cfg!(target_os = "macos") {
             assert!(fired(PanelKind::Timeline, Key::N, cmd() | Modifiers::ALT | Modifiers::CTRL).is_empty());
         }
-        assert!(fired(PanelKind::Timeline, Key::N, cmd() | Modifiers::ALT | Modifiers::SHIFT).is_empty(), "nor Cmd+Alt+Shift+N");
+        // off macOS that chord is Premiere's Add Range Marker (the fork's Windows keymap): it runs that, never New Project
+        let extra_shift = fired(PanelKind::Timeline, Key::N, cmd() | Modifiers::ALT | Modifiers::SHIFT);
+        assert!(!extra_shift.iter().any(|id| id == "file.newProject"), "nor Cmd+Alt+Shift+N: {extra_shift:?}");
     }
 
     #[test]

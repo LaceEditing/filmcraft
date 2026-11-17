@@ -490,7 +490,9 @@ fn premiere_titles_come_in_as_graphics_with_their_text() {
     let e = clip.effect("graphic_text").expect("a text layer");
     let v = |id: &str| e.params.get(id).map(|p| p.value.clone()).unwrap();
     assert_eq!(v("text"), ParamValue::Text("50".into()));
-    assert_eq!((v("font"), v("font_style")), (ParamValue::Text("FatFrank".into()), ParamValue::Text("Heavy".into())));
+    // an installed FatFrank (Adobe Fonts are scanned) names its own style; else the name gives it
+    let (family, style) = filmcraft_text::fonts::by_postscript("FatFrank-Heavy").unwrap_or(("FatFrank".into(), "Heavy".into()));
+    assert_eq!((v("font"), v("font_style")), (ParamValue::Text(family), ParamValue::Text(style)));
     assert!(matches!(v("size"), ParamValue::Float(s) if (s - 399.41).abs() < 1e-2));
     assert_eq!(
         (v("stroke"), v("stroke_width"), v("box_width"), v("align")),

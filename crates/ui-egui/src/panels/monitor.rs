@@ -616,7 +616,7 @@ fn asked_before(app: &mut FilmcraftApp, prefix: &str, key: FrameKey, playing: bo
     before
 }
 
-/// Whether Motion or Transform of a selected clip under the playhead is the selected effect: its
+/// Whether Motion, Transform or Corner Pin of a selected clip under the playhead is the selected effect: its
 /// on-screen handles (`transform_handles`) then take the picture instead of the selected clip's
 /// box (`motion_overlay`), so one press never drives both.
 fn transform_selected(app: &FilmcraftApp) -> bool {
@@ -628,7 +628,7 @@ fn transform_selected(app: &FilmcraftApp) -> bool {
             .and_then(|i| it.effects.get(i))
             .filter(|e| e.enabled)
             .and_then(|e| e.def())
-            .is_some_and(|d| d.id == "motion" || d.id == "transform")
+            .is_some_and(|d| matches!(d.id, "motion" | "transform" | "corner_pin"))
 }
 
 /// 1 when playing forward, -1 backward.
