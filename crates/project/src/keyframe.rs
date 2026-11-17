@@ -288,7 +288,8 @@ impl Param {
         }
         let span = (b.time - a.time).0 as f64;
         let u = (t - a.time).0 as f64 / span;
-        let e = ease(a, b, u);
+        let comps = |j: usize| k[j].value.components();
+        let e = ease(a, b, side_slope(k, i, i + 1, comps), side_slope(k, i + 1, i, comps), u);
         let ca = a.value.components();
         let cb = b.value.components();
         if ca.len() != cb.len() {
@@ -335,7 +336,20 @@ impl Param {
             return va;
         }
         let u = (t - a.time).0 as f64 / (b.time - a.time).0 as f64;
-        va + (vb - va) * ease(a, b, u)
+        let scalar = |j: usize| [s(&k[j].value)];
+        va + (vb - va) * ease(a, b, side_slope(k, i, i + 1, scalar), side_slope(k, i + 1, i, scalar), u)
+    }
+
+    /// The speeds key `j` plays with (incoming, outgoing; as [`Keyframe::in_slope`] and
+    /// [`Keyframe::out_slope`]): its own, or Auto Bézier's worked out from its neighbours.
+    pub fn key_slopes(&self, j: usize) -> (Option<f64>, Option<f64>) {
+        let k = &self.keyframes;
+        if j >= k.len() {
+            return (None, None);
+        }
+        let comps = |i: usize| k[i].value.components();
+        let side = |other: Option<usize>| other.filter(|&o| o < k.len()).and_then(|o| side_slope(k, j, o, comps));
+        (side(j.checked_sub(1)), side(Some(j + 1)))
     }
 
     pub fn vec2_at(&self, t: Tick) -> Vec2 {
@@ -351,10 +365,45 @@ impl Param {
     }
 }
 
-/// Temporal easing for u∈[0,1] between two keyframes (1D cubic Bezier in time/value space). As in
-/// Premiere, a keyframe's interpolation shapes both of its sides: the segment leaves `a` as `a`
-/// says and reaches `b` as `b` says (a Bézier key followed by a Linear one arrives in a line).
-fn ease(a: &Keyframe, b: &Keyframe, u: f64) -> f64 {
+/// The speed of key `j` on its side towards its neighbour `other`: its own, or for Auto Bézier
+/// [`auto_slope`].
+fn side_slope<C: AsRef<[f64]>>(k: &[Keyframe], j: usize, other: usize, val: impl Fn(usize) -> C) -> Option<f64> {
+    let key = &k[j];
+    match key.interp {
+        Interpolation::AutoBezier => auto_slope(k, j, other, val),
+        _ if other > j => key.out_slope,
+        _ => key.in_slope,
+    }
+}
+
+/// Auto Bézier's speed at key `j` towards its neighbour `other`, relative to that segment's
+/// straight line. A key between two others moves at the slope between them (After Effects'
+/// rule); an end key at half its segment's slope, or a position along it (Round 5 B6: Premiere's
+/// two-key Auto Bézier stores and plays 0.5 for Scale, Rotation and Opacity, 1 for Position).
+/// `None` (flat) across a segment that does not move.
+fn auto_slope<C: AsRef<[f64]>>(k: &[Keyframe], j: usize, other: usize, val: impl Fn(usize) -> C) -> Option<f64> {
+    let t = |i: usize| k[i].time.0 as f64;
+    let (vj, vo) = (val(j), val(other));
+    let dt = t(other) - t(j);
+    let seg = vj.as_ref().iter().zip(vo.as_ref()).map(|(a, b)| (b - a) / dt);
+    let dd: f64 = seg.clone().map(|d| d * d).sum();
+    if dd.is_nan() || dd <= 1e-24 {
+        return None;
+    }
+    if j == 0 || j + 1 >= k.len() {
+        return Some(if matches!(k[j].value, ParamValue::Vec2(_)) { 1.0 } else { 0.5 });
+    }
+    let (prev, next) = (val(j - 1), val(j + 1));
+    let span = t(j + 1) - t(j - 1);
+    let dot: f64 = prev.as_ref().iter().zip(next.as_ref()).map(|(a, b)| (b - a) / span).zip(seg).map(|(m, d)| m * d).sum();
+    Some(dot / dd)
+}
+
+/// Temporal easing for u∈[0,1] between two keyframes (1D cubic Bezier in time/value space), with
+/// the speeds leaving `a` and reaching `b` ([`side_slope`]). As in Premiere, a keyframe's
+/// interpolation shapes both of its sides: the segment leaves `a` as `a` says and reaches `b` as
+/// `b` says (a Bézier key followed by a Linear one arrives in a line).
+fn ease(a: &Keyframe, b: &Keyframe, out_slope: Option<f64>, in_slope: Option<f64>, u: f64) -> f64 {
     let out_ease = matches!(a.interp, Interpolation::Bezier | Interpolation::AutoBezier | Interpolation::ContinuousBezier | Interpolation::EaseOut);
     let in_ease = matches!(b.interp, Interpolation::Bezier | Interpolation::AutoBezier | Interpolation::ContinuousBezier | Interpolation::EaseIn);
     if !out_ease && !in_ease {
@@ -366,13 +415,13 @@ fn ease(a: &Keyframe, b: &Keyframe, u: f64) -> f64 {
     let slope = |m: Option<f64>| m.filter(|m| m.is_finite()).map_or(0.0, |m| m.clamp(-10.0, 10.0));
     let (x1, y1) = if out_ease {
         let i = a.out_influence.clamp(0.01, 1.0);
-        (i, i * slope(a.out_slope))
+        (i, i * slope(out_slope))
     } else {
         (1.0 / 3.0, 1.0 / 3.0)
     };
     let (x2, y2) = if in_ease {
         let i = b.in_influence.clamp(0.01, 1.0);
-        (1.0 - i, 1.0 - i * slope(b.in_slope))
+        (1.0 - i, 1.0 - i * slope(in_slope))
     } else {
         (2.0 / 3.0, 2.0 / 3.0)
     };
@@ -467,6 +516,31 @@ mod tests {
         let to_linear = ramp((1.0 / 3.0, Some(0.0)), (1.0 / 3.0, None), Interpolation::Linear);
         let (early, late) = (to_linear.f64_at(Tick(100)), to_linear.f64_at(Tick(990)) - to_linear.f64_at(Tick(980)));
         assert!(early < 10.0 && late > 0.5, "eased start, no ease at the end: {early} {late}");
+    }
+
+    /// Auto Bézier works its speeds out from the neighbours: half the line's speed at the ends of a
+    /// two-key ramp (Premiere's 2 s opacity ramp is at 20 % a quarter of the way: 52 of 255), the
+    /// position along the line, and an inner key the slope between its neighbours.
+    #[test]
+    fn auto_bezier_works_out_its_speeds() {
+        let auto = |values: &[ParamValue]| {
+            let mut p = Param::new(values[0].clone());
+            for (i, v) in values.iter().enumerate() {
+                p.put_keyframe(Tick(i as i64 * 1000), v.clone());
+            }
+            p.keyframes.iter_mut().for_each(|k| k.interp = Interpolation::AutoBezier);
+            p
+        };
+        let ramp = auto(&[ParamValue::Float(0.0), ParamValue::Float(100.0)]);
+        assert!((ramp.f64_at(Tick(250)) - 20.3).abs() < 0.1, "{}", ramp.f64_at(Tick(250)));
+        assert!((ramp.scalar_at(Tick(250)) - ramp.f64_at(Tick(250))).abs() < 1e-9);
+        assert_eq!(ramp.key_slopes(0), (None, Some(0.5)));
+        let path = auto(&[ParamValue::Vec2(Vec2::new(0.0, 0.0)), ParamValue::Vec2(Vec2::new(100.0, 50.0))]);
+        assert!((path.vec2_at(Tick(250)).x - 25.0).abs() < 1e-6, "{:?}", path.vec2_at(Tick(250)));
+        // up to 100, then held there: the middle key arrives at half the first segment's speed
+        let rise = auto(&[ParamValue::Float(0.0), ParamValue::Float(100.0), ParamValue::Float(100.0)]);
+        assert_eq!(rise.key_slopes(1), (Some(0.5), None));
+        assert!((rise.f64_at(Tick(1500)) - 100.0).abs() < 1e-9);
     }
 
     #[test]

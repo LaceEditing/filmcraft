@@ -820,11 +820,14 @@ fn segment_speed(slope: f64, unit: f64, a: &Key, b: &Key) -> f64 {
     if dt > 0.0 && speed.is_finite() { speed } else { 0.0 }
 }
 
+/// A keyframe's interpolation from its codes (Round 5 B6, set in Effect Controls: Auto Bézier is
+/// (5, 4), its speeds half the segment's slope at the ends; Continuous Bézier is (5, 2), each key
+/// leaving at the speed it arrives at).
 fn interp_of(kind: (u8, u8)) -> Interpolation {
     match kind {
         (4, _) => Interpolation::Hold,
-        (5, 2) => Interpolation::AutoBezier,
-        (5, 4) => Interpolation::ContinuousBezier,
+        (5, 4) => Interpolation::AutoBezier,
+        (5, 2) => Interpolation::ContinuousBezier,
         (5, _) => Interpolation::Bezier,
         _ => Interpolation::Linear,
     }
@@ -835,8 +838,8 @@ fn kind_of(i: Interpolation) -> (u8, u8) {
         Interpolation::Linear => (0, 0),
         Interpolation::Hold => (4, 0),
         Interpolation::Bezier | Interpolation::EaseIn | Interpolation::EaseOut => (5, 0),
-        Interpolation::AutoBezier => (5, 2),
-        Interpolation::ContinuousBezier => (5, 4),
+        Interpolation::AutoBezier => (5, 4),
+        Interpolation::ContinuousBezier => (5, 2),
     }
 }
 
@@ -902,9 +905,9 @@ pub(crate) fn to_param(c: &Canon, conv: Conv, ctx: &Ctx) -> Param {
                 kf.out_influence = k.infl.1.min(1.0);
             }
         }
-        // a Bézier key's handles carry its speeds (Auto and Continuous Bézier speeds are
-        // Premiere's own to work out again, so theirs are not used)
-        if kf.interp == Interpolation::Bezier {
+        // a Bézier or Continuous Bézier key's handles carry its speeds, which Premiere plays;
+        // Auto Bézier's are worked out from the neighbours ([`Param::key_slopes`])
+        if matches!(kf.interp, Interpolation::Bezier | Interpolation::ContinuousBezier) {
             (kf.in_slope, kf.out_slope) = k.slope;
         }
         p.keyframes.push(kf);
@@ -921,14 +924,14 @@ pub(crate) fn to_param(c: &Canon, conv: Conv, ctx: &Ctx) -> Param {
 pub(crate) fn from_param(p: &Param, conv: Conv, ctx: &Ctx) -> Option<Canon> {
     let value = from_value(&p.value, conv, ctx)?;
     let mut keys = Vec::with_capacity(p.keyframes.len());
-    for k in &p.keyframes {
+    for (j, k) in p.keyframes.iter().enumerate() {
         keys.push(Key {
             t: key_time(k.time.0),
             v: from_value(&k.value, conv, ctx)?,
             kind: kind_of(k.interp),
             infl: if k.interp == Interpolation::Linear { (0.0, 0.0) } else { (k.in_influence, k.out_influence) },
             slope: match k.interp {
-                Interpolation::Bezier => (k.in_slope, k.out_slope),
+                Interpolation::Bezier | Interpolation::AutoBezier | Interpolation::ContinuousBezier => p.key_slopes(j),
                 // FilmCraft's presets as Premiere Bézier keys: flat on the eased side, the line's
                 // own speed on the other
                 Interpolation::EaseIn => (Some(0.0), Some(1.0)),

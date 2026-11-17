@@ -234,7 +234,7 @@ fn imports_bins_media_sequences_clips_and_effects() {
     let blur = b.effect("gaussian_blur").expect("Gaussian Blur imported");
     let keys = &blur.params["blurriness"].keyframes;
     assert_eq!(keys.iter().map(|k| (k.time, k.value.as_f64().unwrap())).collect::<Vec<_>>(), vec![(Tick(20 * S), 0.0), (Tick(22 * S), 40.0)]);
-    assert_eq!((keys[0].interp, keys[1].interp), (Interpolation::Bezier, Interpolation::AutoBezier));
+    assert_eq!((keys[0].interp, keys[1].interp), (Interpolation::Bezier, Interpolation::ContinuousBezier));
     assert_eq!((keys[1].in_influence, keys[1].out_influence), (0.25, 0.5));
     assert_eq!(blur.params["repeat_edge"].value, ParamValue::Bool(true));
     assert_eq!(blur.params["dimensions"].value, ParamValue::Choice(1), "0-based popup index");
