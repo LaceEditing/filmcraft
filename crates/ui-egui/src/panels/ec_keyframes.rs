@@ -601,7 +601,7 @@ pub(crate) fn graph_rows(
                 "{}  ·  {v:.dec$}",
                 filmcraft_time::format_time(lane.tl_of(k.time), rate, false, filmcraft_time::TimeDisplay::Timecode, 48000)
             ));
-            resp.context_menu(|ui| crate::panels::effect_controls::keyframe_menu(app, ui, clip.0, &menu_keys, actions));
+            resp.context_menu(|ui| crate::panels::effect_controls::keyframe_menu_checked(app, ui, clip.0, &menu_keys, Some(k.interp), actions));
             if resp.drag_started_by(egui::PointerButton::Primary) {
                 started = Some(GraphDrag {
                     start: ui.input(|i| i.pointer.press_origin()).unwrap_or(kp),

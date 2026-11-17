@@ -336,7 +336,7 @@ fn effect_controls_text_accessible_name_follows_language() {
     d.frames(4);
     let es = filmcraft_ui_egui::i18n::Language::Es;
     assert_eq!(
-        d.harness.get_by_role_and_label(Role::TextInput, es.tr("Source Text")).value().as_deref(),
+        d.harness.get_by_role_and_label(Role::MultilineTextInput, es.tr("Source Text")).value().as_deref(),
         Some("Night Drive"),
         "the translated accessible name and the same value"
     );
@@ -801,49 +801,6 @@ fn pick(d: &mut Driver, label: &str) {
     d.frames(3);
 }
 
-/// #3539: Effect Controls' Text rows for Font and Font Style are drop-downs of the installed
-/// families and styles (like the Text panel's), and picking one applies it to the text layer.
-#[test]
-fn effect_controls_font_and_style_are_drop_downs_that_apply() {
-    let mut d = Driver::demo();
-    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
-    let clip = d.exec("graphics.newText", json!({"text": "Night Drive"}))["clip"].as_u64().unwrap();
-    d.exec("timeline.select", json!({"clips": [clip]}));
-    d.ok("ui.panel.show", json!({"panel": "Effect Controls"}));
-    d.frames(4);
-    let fams = filmcraft_text::families();
-    let fam = fams.iter().map(|(f, _)| f.clone()).find(|f| f != "Inter").expect("another family");
-    let font = d
-        .ok("ui.elements", json!({"prefix": "effectControls.text."}))
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|e| e["id"].as_str())
-        .find(|id| id.ends_with(".font"))
-        .expect("font row")
-        .to_string();
-    // the Text rows sit below the fold of the short panel: scroll them into view
-    for _ in 0..10 {
-        if d.rect(&font)[1] < 440.0 {
-            break;
-        }
-        d.ok("ui.scroll", json!({"x": 150.0, "y": 300.0, "dy": -120.0}));
-        d.frames(2);
-    }
-    let r = d.rect(&font);
-    assert!(r[2] <= 150.0 + 0.5, "the drop-down never asks for more than the value column holds: {r:?}");
-    d.ok("ui.click", json!({"id": font}));
-    d.frames(3);
-    // every visible option is addressable by id (review of #3588)
-    let opts = d.ok("ui.elements", json!({"prefix": format!("{font}.option.")}));
-    let want = format!("{font}.option.{fam}");
-    assert!(opts.as_array().unwrap().iter().any(|e| e["id"].as_str() == Some(want.as_str())), "no {want}");
-    pick(&mut d, &fam);
-    assert_eq!(text_param(&mut d, clip, "font"), Some(filmcraft_project::ParamValue::Text(fam.clone())), "picking a family applies it");
-    // the style list follows the family
-    let style_id = font.replace(".font", ".font_style");
-    d.ok("ui.click", json!({"id": style_id}));
-    d.frames(3);
-    pick(&mut d, "Bold Italic");
-    assert_eq!(text_param(&mut d, clip, "font_style"), Some(filmcraft_project::ParamValue::Text("Bold Italic".into())), "picking a style applies it");
-}
+// Upstream's #3539 test of its Font / Font Style drop-downs in Effect Controls is not carried: the
+// fork draws those rows with its searchable font picker (`effectControls.graphic_text.font`),
+// covered by the font picker test above.

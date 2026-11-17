@@ -1215,17 +1215,8 @@ fn param_value_widget(
     set
 }
 
-/// A lane keyframe's or a graph point's menu, for it or for the selected keyframes of its clip
-/// when it is one of them (`keys` as the `effects.*Keyframes` commands take them; a mask
-/// parameter's keep their mask). The rows and their order are Premiere's, with no heading: Copy
-/// and Clear, the five temporal interpolations, then Ease In and Ease Out (Cut, Paste and Select
-/// All are the Edit menu's, by the focused panel).
-pub(crate) fn keyframe_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, clip: u64, keys: &[Value], actions: &mut Vec<(String, Value)>) {
-    keyframe_menu_checked(app, ui, clip, keys, None, actions);
-}
-
-/// [`keyframe_menu`] with the right-clicked keyframe's interpolation, `current`, as the checked
-/// row (`None`: no row is reported as checkable).
+/// The menu of a right-clicked keyframe (or of the selected ones), with the right-clicked
+/// keyframe's interpolation, `current`, as the checked row (`None`: no row is reported as checkable).
 pub(crate) fn keyframe_menu_checked(
     app: &mut FilmcraftApp,
     ui: &mut egui::Ui,

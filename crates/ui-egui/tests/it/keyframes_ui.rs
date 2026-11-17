@@ -866,14 +866,14 @@ fn keyframe_menu_has_premieres_rows_and_checks_the_current_interpolation() {
     }
 }
 
-/// #265: with every keyframe selected (⌘A in Effect Controls), Clear from a keyframe's menu still
-/// deletes only the right-clicked keyframe. This pins today's behaviour; Clear acting on the whole
-/// selection, as in Premiere, comes with Select All back in the menu.
+/// With every keyframe selected (⌘A in Effect Controls), Clear from a keyframe's menu deletes the
+/// whole selection, as in Premiere (the fork's Effect Controls selection; upstream's #265 test
+/// pinned its interim behaviour, where only the right-clicked keyframe went).
 #[test]
-fn keyframe_menu_clear_deletes_only_the_clicked_keyframe_of_a_selection() {
+fn keyframe_menu_clear_deletes_the_whole_selection() {
     let (mut d, clip) = Driver::demo();
-    let (diamond, time) = three_keyframes_first_easing_in(&mut d, &clip);
-    let selected = |d: &mut Driver| d.ok("ui.inspect", json!({}))["ui"]["keyframe_selection"].as_array().map_or(0, Vec::len);
+    let (diamond, _) = three_keyframes_first_easing_in(&mut d, &clip);
+    let selected = |d: &mut Driver| d.harness.state().ui.kf_selected.len();
     d.ok("ui.set", json!({"focused": "EffectControls"}));
     d.ok("ui.key", json!({"key": "Cmd+A"}));
     d.frames(2);
@@ -882,6 +882,5 @@ fn keyframe_menu_clear_deletes_only_the_clicked_keyframe_of_a_selection() {
     d.click("effectControls.keyframeMenu.clear");
     let scale = d.scale(&clip).0;
     let position = d.parameter(&clip, "motion", "position").keyframes.len();
-    assert_eq!((scale.len(), position), (1, 1), "2 of 3 keyframes remain: {scale:?}");
-    assert!(!scale.contains(&time), "the right-clicked Scale keyframe is the one deleted");
+    assert_eq!((scale.len(), position), (0, 0), "every selected keyframe is deleted: {scale:?}");
 }
