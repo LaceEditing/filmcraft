@@ -137,6 +137,23 @@ fn pan_laws() {
     assert!(close(l[5], 0.5 * bl, 1e-6) && close(r[5], 0.5 * br, 1e-6) && br == 1.0 && close(bl, std::f32::consts::FRAC_1_SQRT_2, 1e-6));
 }
 
+/// An automated track fader moves along its travel between keyframes, as a clip's Level does
+/// (Premiere Pro 2027's renders of track faders: half way down 0 → −20 dB is −7.53 dB, half way
+/// down a fade to silence −13.45 dB).
+#[test]
+fn track_volume_automation_ramps_along_the_fader() {
+    for (to, half_db) in [(-20.0, -7.529), (filmcraft_project::mixer::FADER_MIN_DB, -13.446)] {
+        let mut r = Rig::new(&[dc]);
+        r.track(0).lane_mut(LANE_VOLUME).unwrap().keyframes = vec![kf(0, 0.0), kf(48_000, to)];
+        let [l, _] = r.mix(24_000, 64);
+        assert!(close(l[0], 0.5 * 10f32.powf(half_db / 20.0), 1e-4), "to {to} dB: {} vs {}", l[0], 0.5 * 10f32.powf(half_db / 20.0));
+        // at the last keyframe and after it: the keyframe's level (silence at the floor)
+        let [l, _] = r.mix(48_000, 64);
+        let end = if to <= filmcraft_project::mixer::FADER_MIN_DB { 0.0 } else { 0.5 * 10f32.powf(to as f32 / 20.0) };
+        assert!(close(l[0], end, 1e-5), "to {to} dB at the end: {}", l[0]);
+    }
+}
+
 /// The gains Premiere Pro 2027 rendered for a stereo clip's Balance (and a stereo track's pan):
 /// the side turned to stays at unity, the other side follows a quarter cosine.
 #[test]
@@ -222,16 +239,21 @@ fn volume_automation_is_sample_accurate_and_block_invariant() {
     }
     let whole = r.mix(0, 2000);
     for k in [0usize, 1, 63, 64, 65, 127, 128, 500, 999, 1000, 1500, 1550, 1599, 1600] {
-        let db = if k <= 1000 {
-            -20.0 * k as f64 / 1000.0
-        } else if k <= 1500 {
-            -20.0
-        } else if k <= 1600 {
-            -20.0 + 20.0 * (k - 1500) as f64 / 100.0
-        } else {
-            0.0
+        // between keyframes the fader's travel moves in a straight line (`crate::fader`)
+        let ramp = |from: f64, to: f64, u: f64| {
+            let (a, b) = (crate::fader::position(from), crate::fader::position(to));
+            crate::fader::gain(a + (b - a) * u)
         };
-        let want = 0.5 * 10f64.powf(db / 20.0);
+        let gain = if k <= 1000 {
+            ramp(0.0, -20.0, k as f64 / 1000.0)
+        } else if k <= 1500 {
+            0.1
+        } else if k <= 1600 {
+            ramp(-20.0, 0.0, (k - 1500) as f64 / 100.0)
+        } else {
+            1.0
+        };
+        let want = 0.5 * gain;
         assert!((whole[0][k] as f64 - want).abs() < 1e-6, "sample {k}: {} vs {want}", whole[0][k]);
     }
     // the same range cut into odd-sized requests is bit-identical

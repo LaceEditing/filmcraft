@@ -236,6 +236,10 @@ struct Lane<'a> {
     ov: Option<Override>,
     /// Switch lanes (mute) hold between keyframes whatever their interpolation.
     hold: bool,
+    /// A fader's level (the volume lane, in dB): between its keyframes the fader's travel moves in
+    /// a straight line, as Premiere's does ([`crate::fader`]; its renders of automated track
+    /// faders follow the same law as a clip's Level keyframes, within 0.001 dB).
+    fader: bool,
 }
 
 impl<'a> Lane<'a> {
@@ -243,7 +247,7 @@ impl<'a> Lane<'a> {
         let reads = track.mixer.mode.reads();
         let param = track.lane(key).filter(|p| reads && p.is_animated());
         let hold = filmcraft_project::mixer::lane_info(key).is_some_and(|i| i.hold);
-        Lane { param, stat: track.lane_static(key).unwrap_or(0.0), ov: ovs.get(&(strip, key.to_string())).copied(), hold }
+        Lane { param, stat: track.lane_static(key).unwrap_or(0.0), ov: ovs.get(&(strip, key.to_string())).copied(), hold, fader: key == LANE_VOLUME }
     }
     fn auto(&self, t: Tick) -> f64 {
         match self.param {
@@ -251,6 +255,11 @@ impl<'a> Lane<'a> {
             Some(p) if self.hold => {
                 let i = p.keyframes.partition_point(|k| k.time <= t);
                 p.keyframes[i.saturating_sub(1)].value.as_f64().unwrap_or(0.0)
+            }
+            // a fader at its floor is silent: the bottom of the travel
+            Some(p) if self.fader => {
+                let travel = |db: f64| if db <= filmcraft_project::mixer::FADER_MIN_DB { 0.0 } else { crate::fader::position(db) };
+                crate::fader::db(p.scalar_at_mapped(t, travel))
             }
             Some(p) => p.scalar_at(t),
         }
