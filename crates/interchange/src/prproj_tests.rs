@@ -734,6 +734,26 @@ fn sequence_markers_on_the_sequence_and_clip_gain_are_read() {
 /// clip's own `Panner`. A setting at 1 (hard right) is saved with no value.
 #[test]
 fn track_mix_master_and_clip_pan_are_read() {
+    let text = doc_with_mixer();
+    let (imp, _) = import(text.as_bytes(), None);
+    let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+    let (a1, a2) = (&seq.audio_tracks[0], &seq.audio_tracks[1]);
+    assert_eq!((a1.channels, a1.volume_db, a1.pan), (filmcraft_project::AudioChannels::Stereo, 0.0, 0.0));
+    assert_eq!((a2.channels, a2.pan), (filmcraft_project::AudioChannels::Mono, -100.0));
+    assert!((a2.volume_db + 6.0).abs() < 1e-9, "{}", a2.volume_db);
+    assert!((seq.master_volume_db + 3.0).abs() < 1e-9, "{}", seq.master_volume_db);
+    let balance = a1.items[0].effect("panner").and_then(|e| e.param("balance")).map(|p| p.value.clone());
+    assert_eq!(balance, Some(ParamValue::Float(100.0)));
+    // a clip without a Panner keeps FilmCraft's centred default
+    let (imp, _) = import(doc().as_bytes(), None);
+    let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+    assert!(seq.audio_tracks[0].items[0].effect("panner").and_then(|e| e.param("balance")).is_none_or(|p| p.value == ParamValue::Float(0.0)));
+    assert_eq!(seq.master_volume_db, 0.0);
+}
+
+/// [`doc`] with the Audio Track Mixer's objects: a mono track A2 with its fader at −6 dB, panned
+/// hard left; the Mix at −3 dB; the A1 clip's Balance at +100 (saved with no value).
+pub(crate) fn doc_with_mixer() -> String {
     let class = "a714635e-a628-4b27-9d59-77eba47dbc1a";
     let fader = |id: u32, gain: Option<f64>| {
         let value = gain.map(|g| format!("<StartKeyframe>-91445760000000000,{g},0,0,0,0,0,0</StartKeyframe>")).unwrap_or_default();
@@ -774,20 +794,7 @@ fn track_mix_master_and_clip_pan_are_read() {
         .replace("</ClipTrackItem></AudioClipTrackItem>", "</ClipTrackItem><Panner ObjectRef=\"940\"/></AudioClipTrackItem>")
         .replace("</PremiereData>", &format!("{objects}</PremiereData>"));
     assert!(text.contains("MasterTrack") && text.contains("Panner ObjectRef=\"940\""), "the fixture changed");
-    let (imp, _) = import(text.as_bytes(), None);
-    let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
-    let (a1, a2) = (&seq.audio_tracks[0], &seq.audio_tracks[1]);
-    assert_eq!((a1.channels, a1.volume_db, a1.pan), (filmcraft_project::AudioChannels::Stereo, 0.0, 0.0));
-    assert_eq!((a2.channels, a2.pan), (filmcraft_project::AudioChannels::Mono, -100.0));
-    assert!((a2.volume_db + 6.0).abs() < 1e-9, "{}", a2.volume_db);
-    assert!((seq.master_volume_db + 3.0).abs() < 1e-9, "{}", seq.master_volume_db);
-    let balance = a1.items[0].effect("panner").and_then(|e| e.param("balance")).map(|p| p.value.clone());
-    assert_eq!(balance, Some(ParamValue::Float(100.0)));
-    // a clip without a Panner keeps FilmCraft's centred default
-    let (imp, _) = import(doc().as_bytes(), None);
-    let seq = imp.project.sequences().find_map(|i| i.as_sequence()).unwrap();
-    assert!(seq.audio_tracks[0].items[0].effect("panner").and_then(|e| e.param("balance")).is_none_or(|p| p.value == ParamValue::Float(0.0)));
-    assert_eq!(seq.master_volume_db, 0.0);
+    text
 }
 
 /// The FilmCraft effect `id` that the test clip's Premiere audio filter `filter` comes in as, with

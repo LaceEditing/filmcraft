@@ -191,7 +191,20 @@ committed).
   linear, 1 = 0 dB, and `Mute`) and its `Panner`; `AudioTrack/ChannelType` 0 is a mono track (stereo
   tracks write none). The Mix is the audio group's `MasterTrack` → `AudioMixTrack`, laid out the
   same way. Premiere pans a mono clip on a stereo track with the −3 dB constant-power law (Round 5
-  B3), as FilmCraft now does.
+  B3), as FilmCraft now does. A clip's panner has component id 4294967040 (a track's 4294967280)
+  and its parameter writes `IsTimeVarying` false while it holds one value; as every audio setting
+  at the top of its range, +100 is saved with no value. FilmCraft writes a clip's pan this way:
+  into the clip's panner where it has one, else in a new one once the pan leaves the centre.
+- Track automation: a fader's `Volume` keeps its keyframes like any parameter (`StartKeyframe`,
+  `CurrentValue`, `Keyframes`), at sequence times, as linear gains (0 is silence). FilmCraft reads
+  them into the track's volume lane and writes that lane into a new project's faders. Between
+  keyframes Premiere Pro 2027 moves the fader's travel in a straight line, for a track's fader
+  and a clip's Level alike (`filmcraft_render::fader`). Pan, mute and send automation and the
+  Mix's own are not read or written (the first value is).
+- Versions: Premiere Pro 2027 (27.0) saves `Project` 46, `Clip` 19 and `Media` 31 where 26.x
+  saved 45, 18 and 30; what FilmCraft writes into them is the same. A new project is stamped
+  with 2027's (stamped with the older ones, 2027 asks to convert it into a copy first); objects
+  added to a project opened from Premiere take that document's own (`prproj_new::Versions`).
 - Clip ▸ Video Options ▸ Scale to Frame Size is `ScaleToFramePolicy` 1 on the track item's clip.
 - Other effects map onto the FilmCraft effect of the same name (`Gaussian Blur (Legacy)` →
   Gaussian Blur): their numeric, angle, boolean and point parameters by name. A name an effect
@@ -331,7 +344,7 @@ A FilmCraft project that did not come from Premiere becomes a new `.prproj` (`pr
   templates and borrowed layouts, which nothing refers to, are dropped last.
 - Left out, and listed in the report: effects and transitions with no layout to borrow, graphics /
   titles, adjustment layers, generated media (clips of them), captions, submixes, track effects,
-  pan, mute and solo, time remapping, clip pan / channel volume, masks, audio gain.
+  mute and solo, pan / mute / send automation, time remapping, channel volume, masks.
 - Media paths: FilmCraft's local paths are written as the Premiere machine sees them, with the
   drive mapping the engine learns from the Premiere projects it has opened (a media path
   `L:\Editing\a.mp4` in one of them that exists here as `/mnt/LocalDisk/Editing/a.mp4` maps

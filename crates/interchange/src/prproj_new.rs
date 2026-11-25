@@ -23,7 +23,8 @@
 //!
 //! Not written (each listed in the report): effects and transitions with no model, graphics /
 //! titles, generated media other than colour mattes and black video, captions, track effects,
-//! mute and solo, and 5.1 or adaptive tracks (written as stereo ones).
+//! mute and solo, track automation other than a fader's volume, and 5.1 or adaptive tracks
+//! (written as stereo ones).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
@@ -51,7 +52,7 @@ const FADER_MAX: &str = "5.6234130859375";
 /// Premiere's "Custom" sequence editing mode (any frame size and rate) and its preview preset.
 const CUSTOM_MODE: &str = "9678af98-a7b7-4bdb-b477-7ac9c8df4a4e";
 /// The component id Premiere gives every panner.
-const PANNER_ID: &str = "4294967280";
+const PANNER_ID: &str = intrinsic::TRACK_PANNER_ID;
 /// Length of the template clips (the writer retimes every copy).
 const TEMPLATE_LENGTH: i64 = TICKS_PER_SECOND;
 /// Channel Volume has a level per possible channel (Left, Right and 30 more, as Premiere saves it).
@@ -60,7 +61,8 @@ const CHANNEL_VOLUME_SLOTS: usize = 32;
 /// Class ids (and object versions) of the objects the seed writes.
 mod class {
     pub use crate::prproj_intrinsic::class::*;
-    pub const PROJECT: (&str, u32) = ("62ad66dd-0dcd-42da-a660-6d8fbde94876", 45);
+    // (a new project is stamped as Premiere Pro 2027 saves one: see `Versions`)
+    pub const PROJECT: (&str, u32) = ("62ad66dd-0dcd-42da-a660-6d8fbde94876", 46);
     pub const ROOT_ITEM: (&str, u32) = ("1c307a89-9318-47d7-a583-bf2553736543", 1);
     pub const BIN_ITEM: (&str, u32) = ("dbfd6653-24da-480e-a35e-ba45e9504e4b", 1);
     pub const CLIP_ITEM: (&str, u32) = ("cb4e0ed7-aca1-4171-8525-e3658dec06dd", 1);
@@ -89,7 +91,8 @@ mod class {
     pub const CHANNEL_GROUPS: (&str, u32) = ("a3127a8c-95d4-456e-a7f5-171b3f922426", 1);
     pub const CHANNEL_VECTOR: (&str, u32) = ("333d203b-3a53-4195-8894-fc7523ff3dc7", 1);
     pub const CHANNEL: (&str, u32) = ("5c89aa7a-89a6-4483-becd-f2b1def42316", 1);
-    pub const MEDIA: (&str, u32) = ("7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff", 30);
+    /// A media object's class; its version is the document's ([`super::Versions`]).
+    pub const MEDIA: &str = "7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff";
     pub const VIDEO_STREAM: (&str, u32) = ("a36e4719-3ec6-4a0c-ab11-8b4aab377aa5", 23);
     pub const AUDIO_STREAM: (&str, u32) = ("0b5cf52f-2b85-4863-890b-8844b64ecfe9", 8);
     pub const SEQUENCE: (&str, u32) = ("6a15d903-8739-11d5-af2d-9b7855ad8974", 12);
@@ -104,9 +107,7 @@ mod class {
     pub const AUDIO_CHAIN: (&str, u32) = ("3cb131d1-d3c0-47ae-a19a-bdf75ea11674", 4);
     pub const FADER: (&str, u32) = ("1a38c583-ed5c-11d5-abc4-c1cbf61ec590", 3);
     pub const METER: (&str, u32) = ("72ea4700-f615-11d5-abc4-c186585e63e0", 2);
-    pub const STEREO_PANNER: (&str, u32) = ("7bf86a01-efbe-11d5-abc4-c1ce2b1e9090", 1);
     pub const DEFAULT_PANNER: (&str, u32) = ("33a94282-ee2c-11d5-abc4-c1cd7f9e3c10", 2);
-    pub const MONO_PANNER: (&str, u32) = ("33a94283-ee2c-11d5-abc4-c1cd7f9e3c10", 1);
     pub const VIDEO_TRACK_ITEM: (&str, u32) = ("368b0406-29e3-4923-9fcd-094fbf9a1089", 8);
     pub const AUDIO_TRACK_ITEM: (&str, u32) = ("064ec682-9ba6-11d5-af2d-9ca32c7d6164", 11);
     pub const SUB_CLIP: (&str, u32) = ("e0c58dc9-dbdd-4166-aef7-5db7e3f22e84", 6);
@@ -194,6 +195,7 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
     let mut unwritten: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut transitions = 0usize;
     let mut track_settings = 0usize;
+    let mut automation = 0usize;
     let mut captions = 0usize;
     let mut submixes = 0usize;
     for it in work.items.values_mut() {
@@ -201,6 +203,10 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
         let seq = std::sync::Arc::make_mut(seq);
         captions += seq.caption_tracks.len();
         submixes += seq.submix_tracks.len();
+        // a track's volume automation is written; its other lanes and the Mix's are not
+        let animated = |lanes: &BTreeMap<String, filmcraft_project::Param>, written: &str| lanes.iter().any(|(k, p)| k != written && !p.keyframes.is_empty());
+        automation += usize::from(animated(&seq.master_mixer.lanes, ""));
+        automation += seq.audio_tracks.iter().filter(|t| animated(&t.mixer.lanes, filmcraft_project::mixer::LANE_VOLUME)).count();
         for t in seq.all_tracks_mut() {
             let audio = t.kind == TrackKind::Audio;
             let before = t.transitions.len();
@@ -242,9 +248,7 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
                     };
                     match e.effect.as_str() {
                         "time_remap" if e.params.keys().any(|p| changed(p)) => *unwritten.entry("time remapping").or_insert(0) += 1,
-                        "channel_volume" | "panner" if e.params.keys().any(|p| changed(p)) => {
-                            *unwritten.entry("clip panning and channel volume").or_insert(0) += 1
-                        }
+                        "channel_volume" if e.params.keys().any(|p| changed(p)) => *unwritten.entry("channel volume").or_insert(0) += 1,
                         "opacity" if changed("blend") => *unwritten.entry("blend modes").or_insert(0) += 1,
                         _ => {}
                     }
@@ -270,6 +274,9 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
     }
     if track_settings > 0 {
         report.warn(format!("track effects, mute and solo of {track_settings} track(s) were not written (track volume and pan were)"));
+    }
+    if automation > 0 {
+        report.warn(format!("pan, mute and send automation of {automation} track(s) was not written (track volume automation was)"));
     }
     if captions > 0 {
         report.warn(format!("{captions} caption track(s) were not written"));
@@ -626,6 +633,37 @@ struct Seed<'p> {
     sources: HashMap<ItemId, Sources>,
     media_uid: Vec<(ItemId, String)>,
     sequence_uid: Vec<(ItemId, String)>,
+    versions: Versions,
+}
+
+/// The object versions Premiere Pro 2027 (27.0) bumped: it saves `Project` 46, `Clip` 19 and
+/// `Media` 31 where 26.x saved 45, 18 and 30. What FilmCraft writes into them is the same either
+/// way (2027 added only optional elements), but a project stamped with the older numbers makes
+/// 2027 ask to convert it into a copy first. A new project takes 2027's; objects added to a
+/// project opened from Premiere take that document's own, so it stays one version throughout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Versions {
+    pub(crate) clip: u32,
+    pub(crate) media: u32,
+}
+
+impl Versions {
+    pub(crate) const PREMIERE_2027: Versions = Versions { clip: 19, media: 31 };
+    pub(crate) const PREMIERE_2026: Versions = Versions { clip: 18, media: 30 };
+
+    /// The versions a document uses: those of a `Clip` and a `Media` it has, else by its
+    /// `Project` (46 and later is 2027's).
+    pub(crate) fn of(root: Node<'_, '_>) -> Versions {
+        let version = |n: Node<'_, '_>| n.attribute("Version").and_then(|v| v.trim().parse::<u32>().ok());
+        let project = root.children().filter(|n| n.has_tag_name("Project") && n.attribute("ObjectID").is_some()).find_map(version);
+        let default = if project.is_none_or(|v| v >= 46) { Versions::PREMIERE_2027 } else { Versions::PREMIERE_2026 };
+        let media = root.children().filter(|n| n.has_tag_name("Media")).find_map(version);
+        let clip = root
+            .children()
+            .filter(|n| matches!(n.tag_name().name(), "VideoClip" | "AudioClip"))
+            .find_map(|n| n.children().filter(|c| c.has_tag_name("Clip")).find_map(version));
+        Versions { clip: clip.unwrap_or(default.clip), media: media.unwrap_or(default.media) }
+    }
 }
 
 fn attrs(c: (&str, u32)) -> String {
@@ -673,6 +711,7 @@ impl<'p> Seed<'p> {
             sources: HashMap::new(),
             media_uid: Vec::new(),
             sequence_uid: Vec::new(),
+            versions: Versions::PREMIERE_2027,
         }
     }
 
@@ -984,11 +1023,12 @@ impl<'p> Seed<'p> {
         )
     }
 
-    fn clip_body(markers: u64, source: u64, range: Option<(i64, i64)>, clip_id: &str, master: bool) -> String {
+    fn clip_body(&self, markers: u64, source: u64, range: Option<(i64, i64)>, clip_id: &str, master: bool) -> String {
         let range = range.map(|(i, o)| format!("<OutPoint>{o}</OutPoint><InPoint>{i}</InPoint>")).unwrap_or_default();
         let in_use = if master { "<InUse>false</InUse>" } else { "" };
+        let version = self.versions.clip;
         format!(
-            "<Clip Version=\"18\"><MarkerOwner Version=\"1\"><Markers ObjectRef=\"{markers}\"/></MarkerOwner><Source ObjectRef=\"{source}\"/>{range}<ClipID>{clip_id}</ClipID>{in_use}</Clip>"
+            "<Clip Version=\"{version}\"><MarkerOwner Version=\"1\"><Markers ObjectRef=\"{markers}\"/></MarkerOwner><Source ObjectRef=\"{source}\"/>{range}<ClipID>{clip_id}</ClipID>{in_use}</Clip>"
         )
     }
 
@@ -1000,7 +1040,7 @@ impl<'p> Seed<'p> {
     /// clip is not marked).
     fn video_clip_of(&mut self, markers: u64, source: u64, range: Option<(i64, i64)>, master: bool, adjustment: bool) -> u64 {
         let clip_id = self.uuid();
-        let mut body = Self::clip_body(markers, source, range, &clip_id, master);
+        let mut body = self.clip_body(markers, source, range, &clip_id, master);
         if adjustment {
             body.push_str("<AdjustmentLayer>true</AdjustmentLayer>");
         }
@@ -1012,7 +1052,7 @@ impl<'p> Seed<'p> {
         let clip_id = self.uuid();
         let body = format!(
             "{}{}{}",
-            Self::clip_body(markers, source, range, &clip_id, master),
+            self.clip_body(markers, source, range, &clip_id, master),
             list("SecondaryContents", "SecondaryContentItem", &channels, false),
             el("AudioChannelLayout", if mono { MONO } else { STEREO })
         );
@@ -1109,7 +1149,7 @@ impl<'p> Seed<'p> {
         self.uobj(
             &media_uid,
             "Media",
-            class::MEDIA,
+            (class::MEDIA, self.versions.media),
             &format!(
                 "{streams}{rel}{}<ImplementationID>{IMPORTER}</ImplementationID>{}<FileKey>{key}</FileKey>{infinite}{conformed}{}",
                 el("FilePath", &win),
@@ -1207,7 +1247,7 @@ impl<'p> Seed<'p> {
             // a mono track as Premiere saves one (Round 5 B3): mono fader, meter and panner, and
             // `ChannelType` 0 on the track; its chain lists them with no layout of its own
             let mono = track.is_some_and(|t| t.channels == AudioChannels::Mono);
-            let fader = self.fader(sample, volume, mono);
+            let fader = self.fader(sample, volume, track.and_then(|t| t.lane(filmcraft_project::mixer::LANE_VOLUME)), mono);
             let meter = self.meter(sample, mono);
             let chain_layout =
                 if mono { String::new() } else { format!("<FrameRate>{sample}</FrameRate>{}<ChannelType>1</ChannelType>", el("AudioChannelLayout", STEREO)) };
@@ -1230,7 +1270,7 @@ impl<'p> Seed<'p> {
             audio_tracks.push(t);
         }
         // the master track
-        let fader = self.fader(sample, seq.master_volume_db, false);
+        let fader = self.fader(sample, seq.master_volume_db, None, false);
         let meter = self.meter(sample, false);
         let master_chain = self.obj(
             "AudioComponentChain",
@@ -1337,27 +1377,22 @@ impl<'p> Seed<'p> {
         } else {
             String::new()
         };
-        let name = if mono { "Pan" } else { "Balance" };
-        let param = self.obj("AudioComponentParam", class::AUDIO_PARAM, &format!("{value}<Name>{name}</Name><IsInverted>true</IsInverted>"));
-        let (tag, class, layout, kind, output) = if mono {
-            ("MonoToStereoPanProcessor", class::MONO_PANNER, MONO, 0, el("OutputAudioChannelLayout", STEREO))
-        } else {
-            ("StereoToStereoPanProcessor", class::STEREO_PANNER, STEREO, 1, String::new())
-        };
-        self.obj(
-            tag,
-            class,
-            &format!(
-                "<PanProcessor Version=\"3\"><AudioComponent Version=\"3\"><Component Version=\"7\">{}<ID>{PANNER_ID}</ID></Component><FrameRate>{sample}</FrameRate>{}<ChannelType>{kind}</ChannelType><AudioComponentType>0</AudioComponentType></AudioComponent>{output}</PanProcessor>",
-                list("Params", "Param", &[param], false),
-                el("AudioChannelLayout", layout)
-            ),
-        )
+        intrinsic::panner(self, PANNER_ID, sample, &value, mono)
     }
 
-    /// A track fader at `db` (linear; 1.0 is 0 dB), of a mono track or a stereo one.
-    fn fader(&mut self, sample: i64, db: f64, mono: bool) -> u64 {
-        let value = if db.is_finite() && db.abs() > 1e-9 {
+    /// A track fader at `db` (linear; 1.0 is 0 dB), of a mono track or a stereo one. `lane` is
+    /// the fader's automation, the track's volume lane: its keyframes (at sequence times) are
+    /// written as Premiere writes a parameter's (`StartKeyframe`, `CurrentValue`, `Keyframes`).
+    fn fader(&mut self, sample: i64, db: f64, lane: Option<&filmcraft_project::Param>, mono: bool) -> u64 {
+        let automated = lane.filter(|p| !p.keyframes.is_empty()).and_then(|p| crate::prproj_fx::fader_text(p, filmcraft_project::mixer::FADER_MIN_DB));
+        let value = if let Some(t) = automated {
+            format!(
+                "<StartKeyframe>{}</StartKeyframe><CurrentValue>{}</CurrentValue><Keyframes>{}</Keyframes>",
+                escape(&t.start_keyframe),
+                escape(&t.current),
+                escape(&t.keyframes.unwrap_or_default())
+            )
+        } else if db.is_finite() && db.abs() > 1e-9 {
             let g = 10f64.powf(db.clamp(-200.0, 15.0) / 20.0);
             format!("<StartKeyframe>{NO_TIME},{},0,0,0,0,0,0</StartKeyframe><CurrentValue>{}</CurrentValue>", num(g), num(g))
         } else {
@@ -1713,8 +1748,9 @@ pub(crate) struct Added {
 
 /// Build what `req` asks for with object ids from `next_id` and UUIDs from `seed` (the same
 /// request gives the same objects).
-pub(crate) fn add_to_existing(project: &Project, opts: &CreateOptions, req: &AddRequest, next_id: u64, seed: u64) -> Added {
+pub(crate) fn add_to_existing(project: &Project, opts: &CreateOptions, req: &AddRequest, next_id: u64, seed: u64, versions: Versions) -> Added {
     let mut s = Seed::new(project, opts);
+    s.versions = versions;
     s.next_id = next_id;
     s.hash = seed | 1;
     s.sources = req.existing.clone();
@@ -1898,7 +1934,7 @@ impl Seed<'_> {
         self.uobj(
             &media_uid,
             "Media",
-            class::MEDIA,
+            (class::MEDIA, self.versions.media),
             &format!(
                 "{streams}{prefs}<FilePath>{fourcc}</FilePath><ImplementationID>{SYNTHETIC_IMPORTER}</ImplementationID>{}<Infinite>true</Infinite>{conformed}<ActualMediaFilePath>{fourcc}</ActualMediaFilePath>",
                 el("Title", title)

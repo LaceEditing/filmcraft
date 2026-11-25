@@ -1624,3 +1624,123 @@ fn editing_the_title_holding_shared_data_keeps_it_for_the_others() {
     let t = back.sequences().next().and_then(|i| i.as_sequence()).unwrap().video_tracks[1].items[0].effect("graphic_text").unwrap().clone();
     assert_eq!(t.params["text"].value, ParamValue::Text("60".into()));
 }
+
+fn set_pan(c: &mut TrackItem, pan: f64) {
+    if c.effect("panner").is_none()
+        && let Some(def) = filmcraft_project::find_effect("panner")
+    {
+        c.effects.push(def.instance());
+    }
+    c.effect_mut("panner").unwrap().params.insert("balance".into(), Param::new(ParamValue::Float(pan)));
+}
+
+fn pan_of(p: &Project) -> Option<ParamValue> {
+    let seq = p.sequence(seq_id(p)).unwrap();
+    seq.audio_tracks[0].items[0].effect("panner").and_then(|e| e.params.get("balance")).map(|p| p.value.clone())
+}
+
+/// A clip's pan changed in FilmCraft is written back: a clip Premiere saved without a panner
+/// gets one, a clip that has one gets the new value in it (back at the centre included), and a
+/// copy of the clip takes its own panner.
+#[test]
+fn clip_pan_changed_in_filmcraft_is_written() {
+    let plain = doc();
+    let (imp, _) = import(plain.as_bytes(), Some("/edits/show"));
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    assert_eq!(pan_of(&p), Some(ParamValue::Float(0.0)), "the document's clip is centred");
+    assert!(!plain.contains("<ID>4294967040</ID>"), "and has no panner of its own");
+    set_pan(&mut p.sequence_mut(sid).unwrap().audio_tracks[0].items[0], -30.0);
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let first = String::from_utf8(out).unwrap();
+    assert!(!report.mentions("pan"), "{report}");
+    assert!(problems(&first).is_empty(), "{:?}", problems(&first));
+    assert_eq!(first.matches("<ID>4294967040</ID>").count(), 1);
+    assert!(first.contains(",0.35,0,0,0,0,0,0</StartKeyframe><CurrentValue>0.35</CurrentValue>"), "(-30 + 100) / 200");
+
+    // again, from the project Premiere now has: the value changes in the panner that is there
+    let (imp, _) = import(first.as_bytes(), Some("/edits/show"));
+    let mut p = imp.project;
+    assert_eq!(pan_of(&p), Some(ParamValue::Float(-30.0)));
+    let split = ClipId(p.alloc_id());
+    {
+        let a1 = &mut p.sequence_mut(sid).unwrap().audio_tracks[0];
+        set_pan(&mut a1.items[0], 40.0);
+        // the second half of the clip, panned its own way
+        let mut right = a1.items[0].clone();
+        let half = Tick(a1.items[0].duration.0 / 2);
+        a1.items[0].duration = half;
+        right.id = split;
+        right.start = Tick(right.start.0 + half.0);
+        right.source_in = Tick(right.source_in.0 + half.0);
+        right.duration = Tick(right.duration.0 - half.0);
+        set_pan(&mut right, -100.0);
+        a1.items.insert(1, right);
+    }
+    let (out, report) = export(&p, first.as_bytes(), &[], None).unwrap();
+    let second = String::from_utf8(out).unwrap();
+    assert!(problems(&second).is_empty(), "{report} {:?}", problems(&second));
+    assert_eq!(second.matches("<ID>4294967040</ID>").count(), 2, "the copy has a panner of its own");
+    let back = read(second.as_bytes());
+    let a1 = &back.sequence(seq_id(&back)).unwrap().audio_tracks[0];
+    let pans: Vec<_> = a1.items.iter().take(2).map(|c| c.effect("panner").and_then(|e| e.params.get("balance")).map(|p| p.value.clone())).collect();
+    assert_eq!(pans, [Some(ParamValue::Float(40.0)), Some(ParamValue::Float(-100.0))]);
+
+    // back to the centre: the panner stays, at 0.5
+    let (imp, _) = import(second.as_bytes(), Some("/edits/show"));
+    let mut p = imp.project;
+    set_pan(&mut p.sequence_mut(sid).unwrap().audio_tracks[0].items[0], 0.0);
+    let (out, _) = export(&p, second.as_bytes(), &[], None).unwrap();
+    assert_eq!(pan_of(&read(&out)), Some(ParamValue::Float(0.0)));
+    assert!(String::from_utf8(out).unwrap().contains(",0.5,0,0,0,0,0,0</StartKeyframe>"));
+}
+
+/// The Audio Track Mixer's settings changed in FilmCraft are written back into the Premiere
+/// tracks' own objects: a track's fader (its level, or its automation as keyframes at sequence
+/// times), its pan, and the Mix's fader. Unchanged, the document stays as it is.
+#[test]
+fn track_fader_pan_and_the_mix_fader_are_written_back() {
+    use filmcraft_project::Keyframe;
+    use filmcraft_project::mixer::LANE_VOLUME;
+    let plain = crate::prproj::tests::doc_with_mixer();
+    let (imp, _) = import(plain.as_bytes(), Some("/edits/show"));
+    let (out, report) = export(&imp.project, plain.as_bytes(), &[], None).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), plain, "{report}");
+
+    let mut p = imp.project;
+    let sid = seq_id(&p);
+    {
+        let q = p.sequence_mut(sid).unwrap();
+        q.audio_tracks[1].pan = 40.0;
+        q.audio_tracks[1].lane_mut(LANE_VOLUME).unwrap().keyframes =
+            vec![Keyframe::new(Tick(S), ParamValue::Float(0.0)), Keyframe::new(Tick(3 * S), ParamValue::Float(-20.0))];
+        q.master_volume_db = 2.0;
+    }
+    let (out, report) = export(&p, plain.as_bytes(), &[], None).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(problems(&text).is_empty(), "{report} {:?}", problems(&text));
+    assert!(text.contains(&format!("<Keyframes>{S},1.,0,0,0,0,0,0;{},0.1,0,0,0,0,0,0;</Keyframes>", 3 * S)), "the fader's automation");
+    let back = read(text.as_bytes());
+    let seq = back.sequence(seq_id(&back)).unwrap();
+    let a2 = &seq.audio_tracks[1];
+    assert_eq!(a2.pan, 40.0);
+    let keys: Vec<(i64, f64)> = a2
+        .lane(LANE_VOLUME)
+        .map(|l| l.keyframes.iter().map(|k| (k.time.0, k.value.as_f64().map_or(f64::NAN, |v| (v * 1e6).round() / 1e6))).collect())
+        .unwrap_or_default();
+    assert_eq!(keys, [(S, 0.0), (3 * S, -20.0)]);
+    assert!((seq.master_volume_db - 2.0).abs() < 1e-9, "{}", seq.master_volume_db);
+
+    // a plain level again: the keyframes go
+    {
+        let q = p.sequence_mut(sid).unwrap();
+        q.audio_tracks[1].mixer.lanes.remove(LANE_VOLUME);
+        q.audio_tracks[1].volume_db = -12.0;
+    }
+    let (out, _) = export(&p, text.as_bytes(), &[], None).unwrap();
+    let again = String::from_utf8(out).unwrap();
+    assert!(!again.contains("<Keyframes>") || again.matches("<Keyframes>").count() == plain.matches("<Keyframes>").count(), "the automation is gone");
+    let back = read(again.as_bytes());
+    let a2 = &back.sequence(seq_id(&back)).unwrap().audio_tracks[1];
+    assert!((a2.volume_db + 12.0).abs() < 1e-9 && a2.lane(LANE_VOLUME).is_none_or(|l| l.keyframes.is_empty()), "{}", a2.volume_db);
+}

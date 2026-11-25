@@ -24,7 +24,13 @@ pub(crate) mod class {
     pub const BOOL_PARAM: (&str, u32) = ("cc12343e-f113-4d3b-ae05-b287db77d461", 10);
     pub const SLIDER_PARAM: (&str, u32) = ("a4ff2d6e-7ac2-44f8-9d52-17d9ca50e542", 10);
     pub const POPUP_PARAM: (&str, u32) = ("6e02e8bb-2569-46b2-8ab1-4ab11c43e9c8", 10);
+    pub const STEREO_PANNER: (&str, u32) = ("7bf86a01-efbe-11d5-abc4-c1ce2b1e9090", 1);
+    pub const MONO_PANNER: (&str, u32) = ("33a94283-ee2c-11d5-abc4-c1cd7f9e3c10", 1);
 }
+
+/// The component id Premiere gives a track's panner, and a clip's.
+pub(crate) const TRACK_PANNER_ID: &str = "4294967280";
+pub(crate) const CLIP_PANNER_ID: &str = "4294967040";
 
 /// Somewhere new objects go: `obj` adds one (`<tag ObjectID=… ClassID=… Version=…>body</tag>`)
 /// and returns its id.
@@ -151,6 +157,30 @@ pub(crate) fn audio_filter(o: &mut impl Objects, params: &[u64], id: u32, name: 
             el("AudioChannelLayout", layout),
             el("FilterMatchName", &format!("{name} {suffix}")),
             el("ChannelConfigData", config)
+        ),
+    )
+}
+
+/// A panner with component id `id` ([`TRACK_PANNER_ID`] or [`CLIP_PANNER_ID`]): a stereo
+/// signal's Balance, or a mono one's Pan into the stereo mix. `value` is the parameter's own
+/// elements ahead of its name (`StartKeyframe`, `CurrentValue`, `Keyframes`, `IsTimeVarying`;
+/// none of the first two at +100, which Premiere saves with no value, as every audio setting at
+/// the top of its range). `sample` is ticks per audio sample.
+pub(crate) fn panner(o: &mut impl Objects, id: &str, sample: i64, value: &str, mono: bool) -> u64 {
+    let name = if mono { "Pan" } else { "Balance" };
+    let param = o.obj("AudioComponentParam", class::AUDIO_PARAM, &format!("{value}<Name>{name}</Name><IsInverted>true</IsInverted>"));
+    let (tag, class, layout, kind, output) = if mono {
+        ("MonoToStereoPanProcessor", class::MONO_PANNER, MONO, 0, el("OutputAudioChannelLayout", STEREO))
+    } else {
+        ("StereoToStereoPanProcessor", class::STEREO_PANNER, STEREO, 1, String::new())
+    };
+    o.obj(
+        tag,
+        class,
+        &format!(
+            "<PanProcessor Version=\"3\"><AudioComponent Version=\"3\"><Component Version=\"7\">{}<ID>{id}</ID></Component><FrameRate>{sample}</FrameRate>{}<ChannelType>{kind}</ChannelType><AudioComponentType>0</AudioComponentType></AudioComponent>{output}</PanProcessor>",
+            list("Params", "Param", &[param]),
+            el("AudioChannelLayout", layout)
         ),
     )
 }

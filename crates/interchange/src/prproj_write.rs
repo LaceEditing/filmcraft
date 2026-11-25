@@ -222,7 +222,7 @@ fn add_new_items(project: &Project, text: &str, sequences: &[ItemId], dest_dir: 
     let next = ix.ids.keys().filter_map(|k| k.parse::<u64>().ok()).max().unwrap_or(0) + 1;
     let opts = crate::prproj_new::CreateOptions { dest_dir: dest_dir.map(str::to_string), path_map: path_prefixes(project, &ix), models: Vec::new() };
     let seed_hash = u64::from(prproj_graph::crc32(text.as_bytes())) << 16 ^ text.len() as u64;
-    let added = crate::prproj_new::add_to_existing(project, &opts, &req, next, seed_hash);
+    let added = crate::prproj_new::add_to_existing(project, &opts, &req, next, seed_hash, crate::prproj_new::Versions::of(root));
     let r = root.range();
     let src = &text[r.clone()];
     let close = "</PremiereData>";
@@ -504,6 +504,16 @@ impl intrinsic::Objects for Fragment {
         let id = self.next;
         self.next += 1;
         self.objs.push(format!("<{tag} ObjectID=\"{id}\" ClassID=\"{}\" Version=\"{}\">{body}</{tag}>\n\t", c.0, c.1));
+        id
+    }
+}
+
+/// New objects of the document being written (a clip's panner), appended with the others.
+impl intrinsic::Objects for Writer<'_, '_> {
+    fn obj(&mut self, tag: &str, c: (&str, u32), body: &str) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.created.push(format!("<{tag} ObjectID=\"{id}\" ClassID=\"{}\" Version=\"{}\">{body}</{tag}>\n\t", c.0, c.1));
         id
     }
 }
@@ -1418,6 +1428,20 @@ impl<'a, 'i> Writer<'a, 'i> {
                 {
                     self.set_child(tinst, t, "Name", &ft.name);
                 }
+                // the Audio Track Mixer's fader (with its automation) and pan
+                if kind == TrackKind::Audio && in_filmcraft {
+                    if inst_is_copy(&self.instances, tinst) {
+                        let touched = ft.volume_db.abs() > 1e-9 || ft.pan.abs() > 1e-9 || ft.mixer.lanes.values().any(|p| !p.keyframes.is_empty());
+                        if touched {
+                            self.report.warn(format!(
+                                "track \"{}\": its volume and pan were not written (a track added in FilmCraft copies a Premiere track's mixer)",
+                                ft.name
+                            ));
+                        }
+                    } else {
+                        self.track_mix(ft, pt);
+                    }
+                }
                 let mut items: Vec<&TrackItem> = ft.items.iter().collect();
                 items.sort_by_key(|c| c.start);
                 // (start, position in Premiere's list) → id: FilmCraft's clips, and Premiere's clips
@@ -1503,6 +1527,7 @@ impl<'a, 'i> Writer<'a, 'i> {
             }
         }
         self.links(seq, pseq, &written_ids);
+        self.mix_fader(seq, pseq);
         self.sequence_duration(seq, pseq);
         // anything changed: cached renders describe the old arrangement
         let edits_after = self.edit_count();
@@ -1893,6 +1918,10 @@ impl<'a, 'i> Writer<'a, 'i> {
                 _ => {}
             }
         }
+        // the clip's Panner (a stereo clip's Balance, a mono clip's Pan)
+        if kind == TrackKind::Audio {
+            self.clip_pan(c, obj, inst, copies);
+        }
         // transitions belong to the original clip only; `transitions` re-adds the kept ones
         if inst_is_copy(&self.instances, inst)
             && let Some(cti) = child(obj, "ClipTrackItem")
@@ -2244,6 +2273,140 @@ impl<'a, 'i> Writer<'a, 'i> {
         {
             self.needs.entry(key.to_string()).or_default().merge(need);
         }
+    }
+
+    /// A track's fader and pan as FilmCraft has them, written where they differ from the Premiere
+    /// track's: the fader's `Volume` with its automation (the track's volume lane), and the
+    /// panner's `Balance` / `Pan`. Pan automation Premiere has comes in as its first value: it is
+    /// left alone unless FilmCraft's pan moved away from that value.
+    fn track_mix(&mut self, ft: &filmcraft_project::Track, pt: Node<'a, 'i>) {
+        use filmcraft_project::mixer::{FADER_MAX_DB, FADER_MIN_DB, LANE_VOLUME};
+        let ctx = Ctx { speed: 1.0, frame: (0.0, 0.0), src: (0.0, 0.0) };
+        if let Some(volume) = crate::prproj::fader_volume(&self.ix, pt) {
+            let level = ft
+                .lane(LANE_VOLUME)
+                .filter(|p| !p.keyframes.is_empty())
+                .cloned()
+                .unwrap_or_else(|| filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(ft.volume_db)));
+            self.write_fader(volume, &level, (FADER_MIN_DB, FADER_MAX_DB), &ctx);
+        }
+        let pan = self.ix.follow(pt, &["AudioTrack", "Panner"]).and_then(|p| crate::prproj::pan_setting(&self.ix, p));
+        if let Some(pnode) = pan {
+            let want = filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(ft.pan));
+            let Some(fc) = prproj_fx::from_param(&want, crate::prproj::PAN, &ctx) else { return };
+            let pr = prproj_fx::decode(pnode, crate::prproj::PAN);
+            let unchanged = match &pr {
+                // (its first value is what FilmCraft was given)
+                Some(pr) => {
+                    prproj_fx::same(&prproj_fx::Canon { value: pr.keys.first().map_or(pr.value.clone(), |k| k.v.clone()), keys: Vec::new() }, &fc, &ctx)
+                }
+                None => false,
+            };
+            if !unchanged {
+                if pr.as_ref().is_some_and(|pr| !pr.keys.is_empty()) {
+                    self.report.warn(format!("track \"{}\": its pan automation was replaced by the pan set in FilmCraft", ft.name));
+                }
+                let t = prproj_fx::encode(pnode, None, &fc, &ctx);
+                let pi = self.here(pnode);
+                self.write_param(pi, pnode, &t);
+            }
+        }
+    }
+
+    /// The Mix's fader: its level where FilmCraft's differs from the first value Premiere has (its
+    /// automation, which FilmCraft does not read, is left alone otherwise).
+    fn mix_fader(&mut self, seq: &Sequence, pseq: Node<'a, 'i>) {
+        use filmcraft_project::mixer::{FADER_MAX_DB, FADER_MIN_DB};
+        let ctx = Ctx { speed: 1.0, frame: (0.0, 0.0), src: (0.0, 0.0) };
+        let Some(mix) = prproj_graph::track_group(&self.ix, pseq, "AudioTrackGroup").and_then(|g| self.ix.follow(g, &["MasterTrack"])) else { return };
+        let Some(volume) = crate::prproj::fader_volume(&self.ix, mix) else { return };
+        let have = prproj_fx::decode(volume, prproj_fx::Conv::Float);
+        if let Some(pr) = have.as_ref().filter(|pr| !pr.keys.is_empty()) {
+            let first = prproj_fx::fader_param(
+                &prproj_fx::Canon { value: pr.keys.first().map_or(pr.value.clone(), |k| k.v.clone()), keys: Vec::new() },
+                (FADER_MIN_DB, FADER_MAX_DB),
+            );
+            if matches!(first.value, filmcraft_project::ParamValue::Float(db) if (db - seq.master_volume_db).abs() < 1e-6) {
+                return;
+            }
+            self.report.warn("the Mix's volume automation was replaced by the level set in FilmCraft");
+        }
+        let level = filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(seq.master_volume_db));
+        self.write_fader(volume, &level, (FADER_MIN_DB, FADER_MAX_DB), &ctx);
+    }
+
+    /// Write a fader's `Volume` (a linear gain; one saved with no value is at 0 dB) where
+    /// FilmCraft's level, in dB within `range`, differs from it.
+    fn write_fader(&mut self, volume: Node<'a, 'i>, level: &filmcraft_project::Param, range: (f64, f64), ctx: &Ctx) {
+        let Some(fc) = prproj_fx::fader_canon(level, range.0) else { return };
+        let unity = || prproj_fx::Canon { value: prproj_fx::Val::F(1.0), keys: Vec::new() };
+        let pr = prproj_fx::decode(volume, prproj_fx::Conv::Float);
+        // compared as FilmCraft holds it (dB within the fader's range), so a level outside the
+        // range in Premiere is not rewritten for having been clamped
+        let as_filmcraft = |c: &prproj_fx::Canon| prproj_fx::fader_canon(&prproj_fx::fader_param(c, range), range.0);
+        let have = as_filmcraft(pr.as_ref().unwrap_or(&unity()));
+        if have.as_ref().is_some_and(|h| prproj_fx::same(h, &fc, ctx)) {
+            return;
+        }
+        let t = prproj_fx::encode(volume, pr.as_ref(), &fc, ctx);
+        let pi = self.here(volume);
+        self.write_param(pi, volume, &t);
+    }
+
+    /// A clip's pan. Premiere keeps a clip's Balance (stereo) or Pan (mono) in a pan processor of
+    /// the clip's own, which a clip whose pan was never touched does not have: FilmCraft's value is
+    /// written into the clip's panner where it differs, and a clip without one gets one when its
+    /// pan leaves the centre (laid out as Premiere Pro 2027 saves it).
+    fn clip_pan(&mut self, c: &TrackItem, obj: Node<'a, 'i>, inst: usize, copies: &HashMap<&'a str, usize>) {
+        const PAN: prproj_fx::Conv = crate::prproj::PAN;
+        // (a pan is a number: no frame size is used; key times as the importer reads them)
+        let ctx = Ctx { speed: 1.0, frame: (0.0, 0.0), src: (0.0, 0.0) };
+        let want = c
+            .effect("panner")
+            .filter(|e| e.enabled)
+            .and_then(|e| e.params.get("balance"))
+            .cloned()
+            .unwrap_or_else(|| filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(0.0)));
+        let Some(fc) = prproj_fx::from_param(&want, PAN, &ctx) else { return };
+        let panner = self.ix.follow(obj, &["Panner"]);
+        let param = panner.and_then(|p| crate::prproj::pan_setting(&self.ix, p));
+        if let Some(pnode) = param {
+            let pr = prproj_fx::decode(pnode, PAN);
+            if pr.as_ref().is_some_and(|pr| prproj_fx::same(pr, &fc, &ctx)) {
+                return;
+            }
+            let t = prproj_fx::encode(pnode, pr.as_ref(), &fc, &ctx);
+            let pi = self.inst_of(pnode, copies);
+            self.write_param(pi, pnode, &t);
+            return;
+        }
+        let centred = fc.keys.is_empty() && matches!(fc.value, prproj_fx::Val::F(v) if (v - 0.5).abs() < 1e-9);
+        if centred {
+            return;
+        }
+        if panner.is_some() {
+            self.report.warn(format!("\"{}\": its pan was not written (the Premiere clip's panner has no pan setting)", c.name));
+            return;
+        }
+        // mono or stereo, as the clip's component chain says
+        let chain = self.ix.follow(obj, &["ClipTrackItem", "ComponentOwner", "Components"]);
+        let Some(mono) = chain.and_then(chain_is_mono) else {
+            self.report.warn(format!("\"{}\": its pan was not written (the clip is neither mono nor stereo)", c.name));
+            return;
+        };
+        let t = prproj_fx::encode_new(&fc, &ctx);
+        let top = fc.keys.is_empty() && matches!(fc.value, prproj_fx::Val::F(v) if v >= 1.0);
+        let mut value = String::new();
+        if !top {
+            value.push_str(&format!("<StartKeyframe>{}</StartKeyframe><CurrentValue>{}</CurrentValue>", escape(&t.start_keyframe), escape(&t.current)));
+        }
+        match &t.keyframes {
+            Some(k) => value.push_str(&format!("<Keyframes>{}</Keyframes>", escape(k))),
+            None => value.push_str("<IsTimeVarying>false</IsTimeVarying>"),
+        }
+        let sample = self.sample_ticks;
+        let id = intrinsic::panner(self, intrinsic::CLIP_PANNER_ID, sample, &value, mono);
+        self.insert(inst, obj, &format!("<Panner ObjectRef=\"{id}\"/>"));
     }
 
     /// Write a parameter's new text (`StartKeyframe`, `Keyframes`, `IsTimeVarying`, `CurrentValue`).

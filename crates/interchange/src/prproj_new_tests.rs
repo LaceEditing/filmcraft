@@ -372,3 +372,135 @@ fn titles_are_written_into_new_projects() {
     assert!(texts.iter().any(|t| t.contains("Big words") && t.contains("140.0")), "{texts:?}");
     assert!(texts.iter().any(|t| t.contains("small words") && t.contains("50.0")), "{texts:?}");
 }
+
+/// Set a clip's pan (its Panner's Balance), adding the Panner where the clip has none.
+fn set_pan(c: &mut filmcraft_project::TrackItem, pan: f64) {
+    if c.effect("panner").is_none()
+        && let Some(def) = filmcraft_project::find_effect("panner")
+    {
+        c.effects.push(def.instance());
+    }
+    c.effect_mut("panner").unwrap().params.insert("balance".into(), Param::new(ParamValue::Float(pan)));
+}
+
+fn pan_of(c: &filmcraft_project::TrackItem) -> Option<ParamValue> {
+    c.effect("panner").and_then(|e| e.params.get("balance")).map(|p| p.value.clone())
+}
+
+/// A clip's pan is written as Premiere Pro 2027 saves it: a pan processor of the clip's own (a
+/// stereo clip's Balance, a mono clip's Pan, component id 4294967040), saved as (pan + 100) / 200
+/// with no value at +100; a clip whose pan is centred has none.
+#[test]
+fn clip_pan_is_written() {
+    let (mut p, main, _) = project();
+    {
+        let q = p.sequence_mut(main).unwrap();
+        set_pan(&mut q.audio_tracks[0].items[0], -50.0);
+        set_pan(&mut q.audio_tracks[1].items[0], 100.0);
+    }
+    let (bytes, report) = create(&p, &opts()).unwrap();
+    assert!(!report.mentions("pan"), "{report}");
+    let (xml, _) = prproj_graph::decompress(&bytes).unwrap();
+    let text = String::from_utf8(xml).unwrap();
+    assert!(crate::prproj_write::problems(&text).is_empty(), "{:?}", crate::prproj_write::problems(&text));
+    assert_eq!(text.matches("<ID>4294967040</ID>").count(), 2, "one panner per panned clip");
+    assert!(text.contains(&format!(
+        "<StartKeyframe>{NO_TIME},0.25,0,0,0,0,0,0</StartKeyframe><CurrentValue>0.25</CurrentValue><IsTimeVarying>false</IsTimeVarying><Name>Balance</Name><IsInverted>true</IsInverted>"
+    )));
+    // +100 on the mono clip: Pan with no value
+    assert!(text.contains("<IsTimeVarying>false</IsTimeVarying><Name>Pan</Name><IsInverted>true</IsInverted>"));
+    let (back, _) = read(&bytes);
+    let seq = back.items.values().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
+    assert_eq!(pan_of(&seq.audio_tracks[0].items[0]), Some(ParamValue::Float(-50.0)));
+    assert_eq!(pan_of(&seq.audio_tracks[1].items[0]), Some(ParamValue::Float(100.0)));
+    assert_eq!(clips(&back, "Main Edit", TrackKind::Audio), clips(&p, "Main Edit", TrackKind::Audio));
+
+    // a centred pan writes no panner on the clip
+    {
+        let q = p.sequence_mut(main).unwrap();
+        set_pan(&mut q.audio_tracks[0].items[0], 0.0);
+        set_pan(&mut q.audio_tracks[1].items[0], 0.0);
+    }
+    let (bytes, _) = create(&p, &opts()).unwrap();
+    let (xml, _) = prproj_graph::decompress(&bytes).unwrap();
+    assert!(!String::from_utf8(xml).unwrap().contains("<ID>4294967040</ID>"));
+}
+
+/// A track's volume automation is written into its fader as keyframes at sequence times, on the
+/// fader's own scale (a linear gain, 1 at 0 dB, 0 at silence), and comes back as it was; the
+/// other lanes are reported.
+#[test]
+fn track_volume_automation_is_written_and_read() {
+    use filmcraft_project::mixer::{LANE_PAN, LANE_VOLUME};
+    use filmcraft_project::{Interpolation, Keyframe};
+    let (mut p, main, _) = project();
+    let key = |s: i64, db: f64| Keyframe::new(Tick(s * S), ParamValue::Float(db));
+    {
+        let q = p.sequence_mut(main).unwrap();
+        let lane = q.audio_tracks[0].lane_mut(LANE_VOLUME).unwrap();
+        lane.keyframes = vec![key(1, 0.0), key(3, -20.0), key(5, -96.0), key(6, 6.0)];
+        lane.keyframes[1].interp = Interpolation::Hold;
+        q.audio_tracks[1].lane_mut(LANE_PAN).unwrap().keyframes = vec![key(1, -50.0), key(2, 50.0)];
+    }
+    let (bytes, report) = create(&p, &opts()).unwrap();
+    assert!(report.mentions("pan, mute and send automation of 1 track(s) was not written"), "{report}");
+    let (xml, _) = prproj_graph::decompress(&bytes).unwrap();
+    let text = String::from_utf8(xml).unwrap();
+    assert!(crate::prproj_write::problems(&text).is_empty(), "{:?}", crate::prproj_write::problems(&text));
+    // 0 dB is 1, -20 dB 0.1 (held), silence 0, +6 dB 1.995…
+    let written = text.split("<Keyframes>").nth(1).and_then(|s| s.split("</Keyframes>").next()).expect("the fader's keyframes");
+    for key in [format!("{S},1.,0,0,0,0,0,0;"), format!("{},0.1,4,0,", 3 * S), format!("{},0.,0,0,0,0,0,0;", 5 * S), format!("{},1.99526231496", 6 * S)] {
+        assert!(written.contains(&key), "{key} in {written}");
+    }
+    let (back, report) = read(&bytes);
+    assert!(!report.mentions("automation"), "{report}");
+    let seq = back.items.values().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
+    let lane = seq.audio_tracks[0].lane(LANE_VOLUME).expect("the volume lane");
+    let got: Vec<(i64, f64, Interpolation)> = lane
+        .keyframes
+        .iter()
+        .map(|k| (k.time.0 / S, if let ParamValue::Float(v) = k.value { (v * 1000.0).round() / 1000.0 } else { f64::NAN }, k.interp))
+        .collect();
+    assert_eq!(got, [(1, 0.0, Interpolation::Linear), (3, -20.0, Interpolation::Hold), (5, -96.0, Interpolation::Linear), (6, 6.0, Interpolation::Linear)]);
+    assert!(seq.audio_tracks[1].lane(LANE_VOLUME).is_none_or(|l| l.keyframes.is_empty()));
+}
+
+/// A new project carries the object versions Premiere Pro 2027 saves (`Project` 46, `Clip` 19,
+/// `Media` 31): stamped with 26.x's (45, 18, 30), 2027 asks to convert it into a copy first.
+#[test]
+fn a_new_project_is_stamped_as_premiere_2027_saves_one() {
+    let (p, _, _) = project();
+    let (bytes, _) = create(&p, &opts()).unwrap();
+    let (xml, _) = prproj_graph::decompress(&bytes).unwrap();
+    let text = String::from_utf8(xml).unwrap();
+    let d = crate::xml::parse(&text).unwrap();
+    let root = d.root_element();
+    let version = |tag: &str| -> Vec<&str> {
+        let mut v: Vec<&str> =
+            root.descendants().filter(|n| n.has_tag_name(tag) && n.attribute("ObjectRef").is_none()).filter_map(|n| n.attribute("Version")).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    assert_eq!(version("Clip"), ["19"]);
+    assert_eq!(version("Media"), ["31"]);
+    assert!(root.children().any(|n| n.has_tag_name("Project") && n.attribute("ObjectID").is_some() && n.attribute("Version") == Some("46")));
+    assert_eq!(Versions::of(root), Versions::PREMIERE_2027);
+}
+
+/// Objects added to a project opened from Premiere take that document's versions: its own
+/// `Clip` and `Media`, else those that go with its `Project`.
+#[test]
+fn additions_take_the_versions_of_the_document_they_join() {
+    let of = |xml: &str| Versions::of(crate::xml::parse(xml).unwrap().root_element());
+    let old = r#"<PremiereData Version="3"><Project ObjectRef="1"/><Project ObjectID="1" Version="45"/></PremiereData>"#;
+    assert_eq!(of(old), Versions::PREMIERE_2026);
+    let new = r#"<PremiereData Version="3"><Project ObjectRef="1"/><Project ObjectID="1" Version="46"/></PremiereData>"#;
+    assert_eq!(of(new), Versions::PREMIERE_2027);
+    // a document's own objects win over its Project's number
+    let mixed = r#"<PremiereData Version="3"><Project ObjectID="1" Version="46"/><Media ObjectUID="m" Version="30"/><VideoClip ObjectID="2" Version="11"><Clip Version="18"/></VideoClip></PremiereData>"#;
+    assert_eq!(of(mixed), Versions { clip: 18, media: 30 });
+    // hostile numbers fall back to the Project's
+    let odd = r#"<PremiereData Version="3"><Project ObjectID="1" Version="x"/><Media ObjectUID="m" Version="-4"/></PremiereData>"#;
+    assert_eq!(of(odd), Versions::PREMIERE_2027);
+}

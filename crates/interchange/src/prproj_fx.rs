@@ -920,6 +920,46 @@ pub(crate) fn to_param(c: &Canon, conv: Conv, ctx: &Ctx) -> Param {
     p
 }
 
+/// A track fader's Volume as FilmCraft keeps it: Premiere saves a linear gain (1 is 0 dB), FilmCraft
+/// a level in dB within `range`, keyframes at their sequence times. A handle's speed is in the
+/// units it was saved in, so the keys come in without theirs (a straight or held segment has
+/// none; an eased one keeps its shape, not its exact speed).
+pub(crate) fn fader_param(c: &Canon, range: (f64, f64)) -> Param {
+    let db = |v: &ParamValue| match v {
+        ParamValue::Float(g) if *g > 0.0 => ParamValue::Float((20.0 * g.log10()).clamp(range.0, range.1)),
+        _ => ParamValue::Float(range.0),
+    };
+    let mut p = to_param(c, Conv::Float, &Ctx { speed: 1.0, frame: (0.0, 0.0), src: (0.0, 0.0) });
+    p.value = db(&p.value);
+    for k in &mut p.keyframes {
+        k.value = db(&k.value);
+        (k.in_slope, k.out_slope) = (None, None);
+    }
+    p
+}
+
+/// The text of a track fader's Volume for FilmCraft's level `p` (dB, keyframes at sequence
+/// times): the inverse of [`fader_param`]. Silence (`floor` dB or lower) is a gain of 0.
+pub(crate) fn fader_text(p: &Param, floor: f64) -> Option<ParamText> {
+    let ctx = Ctx { speed: 1.0, frame: (0.0, 0.0), src: (0.0, 0.0) };
+    Some(encode_new(&fader_canon(p, floor)?, &ctx))
+}
+
+/// FilmCraft's fader level `p` (dB) in Premiere's terms: linear gains, keyframes at sequence times.
+pub(crate) fn fader_canon(p: &Param, floor: f64) -> Option<Canon> {
+    let gain = |v: &ParamValue| match v {
+        ParamValue::Float(db) if db.is_finite() && *db > floor => ParamValue::Float(10f64.powf(db.min(15.0) / 20.0)),
+        _ => ParamValue::Float(0.0),
+    };
+    let mut linear = p.clone();
+    linear.value = gain(&linear.value);
+    for k in &mut linear.keyframes {
+        k.value = gain(&k.value);
+        (k.in_slope, k.out_slope) = (None, None);
+    }
+    from_param(&linear, Conv::Float, &Ctx { speed: 1.0, frame: (0.0, 0.0), src: (0.0, 0.0) })
+}
+
 /// FilmCraft → Premiere. `None` when the value has another shape than the conversion expects.
 pub(crate) fn from_param(p: &Param, conv: Conv, ctx: &Ctx) -> Option<Canon> {
     let value = from_value(&p.value, conv, ctx)?;
@@ -1032,9 +1072,17 @@ fn is_float_param(original: Node<'_, '_>) -> bool {
 }
 
 pub(crate) fn encode(original: Node<'_, '_>, pr: Option<&Canon>, fc: &Canon, ctx: &Ctx) -> ParamText {
+    encode_as(child_text(original, "StartKeyframe"), is_float_param(original), speed_unit(original), pr, fc, ctx)
+}
+
+/// [`encode`] for a float parameter the document does not have yet (no text of its own to keep).
+pub(crate) fn encode_new(fc: &Canon, ctx: &Ctx) -> ParamText {
+    encode_as(None, true, 1.0, None, fc, ctx)
+}
+
+fn encode_as(start_keyframe: Option<&str>, float: bool, unit: f64, pr: Option<&Canon>, fc: &Canon, ctx: &Ctx) -> ParamText {
     let value = fc.keys.first().map(|k| &k.v).unwrap_or(&fc.value);
-    let float = is_float_param(original);
-    let start = match child_text(original, "StartKeyframe") {
+    let start = match start_keyframe {
         Some(s) => {
             let mut f: Vec<String> = s.split(',').map(str::to_string).collect();
             if let Some(slot) = f.get_mut(1) {
@@ -1044,7 +1092,6 @@ pub(crate) fn encode(original: Node<'_, '_>, pr: Option<&Canon>, fc: &Canon, ctx
         }
         None => format!("{STATIC_TIME},{},0,0,0,0,0,0", fmt_key_val(value, float)),
     };
-    let unit = speed_unit(original);
     let keyframes = (!fc.keys.is_empty()).then(|| {
         let mut s = String::new();
         for (i, k) in fc.keys.iter().enumerate() {
