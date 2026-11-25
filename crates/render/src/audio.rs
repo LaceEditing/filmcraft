@@ -307,9 +307,9 @@ fn mix_item(project: &Project, item: &TrackItem, timing: &TrackItem, win: Window
         let mt = timing.source_time_at(t_tl);
         let level = |auto: f64| live.vol.map(|o| o.at(t_tl, auto)).unwrap_or(auto);
         let v = match vol {
-            // the level's keyframes are interpolated in amplitude, as Premiere does
-            Some(e) if live.vol.is_none() => e.param("level").map_or(1.0, |p| p.scalar_at_mapped(mt, |db| f64::from(db_to_gain(db))) as f32),
-            Some(e) => db_to_gain(level(e.f64_at("level", mt))),
+            // between the level's keyframes the fader moves in a straight line, as Premiere's does
+            Some(e) if live.vol.is_none() => e.param("level").map_or(1.0, |p| crate::fader::gain(p.scalar_at_mapped(mt, crate::fader::position)) as f32),
+            Some(e) => db_to_gain(level(e.param("level").map_or(0.0, |p| crate::fader::db(p.scalar_at_mapped(mt, crate::fader::position))))),
             None if live.vol.is_some() => db_to_gain(level(0.0)),
             None => 1.0,
         };

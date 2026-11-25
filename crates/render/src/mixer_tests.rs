@@ -254,12 +254,13 @@ fn clip_volume_and_track_automation_both_apply() {
     assert!(close(l[0], 0.5 * 10f32.powf(-12.0 / 20.0), 1e-6), "{}", l[0]);
 }
 
-/// A clip's Volume keyframes ramp in amplitude, as Premiere's do (measured in the user's Round 5
-/// tests): half way down 0 → −20 dB is −5.2 dB, not −10 dB, and a fade to −∞ (imported as
-/// −200 dB) is a straight line to silence instead of going quiet half way.
+/// Between a clip's Volume keyframes the fader moves in a straight line, as Premiere's does
+/// (`crate::fader`, measured from Premiere Pro 2027's renders): half way down 0 → −20 dB is
+/// −7.53 dB, not −10 dB and not the −5.2 dB of a ramp in amplitude, and half way down a fade to
+/// −∞ it is −13.45 dB.
 #[test]
-fn clip_volume_keyframes_ramp_in_amplitude() {
-    for (to, half) in [(-20.0, (1.0 + 0.1) / 2.0), (-200.0, 0.5)] {
+fn clip_volume_keyframes_ramp_along_the_fader() {
+    for (to, half) in [(-20.0, 10f32.powf(-7.529 / 20.0)), (-287.5, 10f32.powf(-13.446 / 20.0))] {
         let mut r = Rig::new(&[dc]);
         {
             let lvl = r.track(0).items[0].effect_mut("volume").unwrap().param_mut("level").unwrap();
