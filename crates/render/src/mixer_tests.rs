@@ -134,7 +134,30 @@ fn pan_laws() {
     rig.track(0).pan = 50.0;
     let (bl, br) = balance(0.5);
     let [l, r] = rig.mix(0, 64);
-    assert!(close(l[5], 0.5 * bl, 1e-6) && close(r[5], 0.5 * br, 1e-6) && br == 1.0 && bl < 0.6);
+    assert!(close(l[5], 0.5 * bl, 1e-6) && close(r[5], 0.5 * br, 1e-6) && br == 1.0 && close(bl, std::f32::consts::FRAC_1_SQRT_2, 1e-6));
+}
+
+/// The gains Premiere Pro 2027 rendered for a stereo clip's Balance (and a stereo track's pan):
+/// the side turned to stays at unity, the other side follows a quarter cosine.
+#[test]
+fn stereo_balance_follows_premieres_renders() {
+    let measured = [
+        (-100.0, 1.0, 0.0),
+        (-50.0, 1.0, std::f32::consts::FRAC_1_SQRT_2),
+        (-25.0, 1.0, 0.92388),
+        (0.0, 1.0, 1.0),
+        (50.0, std::f32::consts::FRAC_1_SQRT_2, 1.0),
+        (75.0, 0.38268, 1.0),
+        (100.0, 0.0, 1.0),
+    ];
+    for (pan, left, right) in measured {
+        let (l, r) = balance(pan / 100.0);
+        assert!(close(l, left, 1e-5) && close(r, right, 1e-5), "balance {pan}: {l} {r}");
+    }
+    // hostile values: past the ends is the end, not a number is the centre
+    assert_eq!(balance(7.0), (0.0, 1.0));
+    assert_eq!(balance(f32::NEG_INFINITY), (1.0, 0.0));
+    assert_eq!(crate::audio::pan_gains(f32::NAN), (1.0, 1.0));
 }
 
 /// A mix in a scope of its own (an export's) continues only its own effect state. Here another

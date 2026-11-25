@@ -232,13 +232,17 @@ struct ClipLive {
     scope: u64,
 }
 
-/// Balance for stereo signals (clip Panner, stereo track pan): centre = unity on both sides, turning
-/// one way attenuates the other side along the −3 dB constant-power curve (normalised so the
-/// centre is 0 dB); hard left/right silences the opposite side.
+/// Balance for stereo signals (clip Panner, stereo track pan), `pan` −1…1: the side turned to
+/// stays at unity and the other side falls along a quarter cosine, silent at hard left/right.
+/// Premiere Pro 2027's renders, of a clip's Balance and of a stereo track's pan alike: the far
+/// side is at cos 22.5° (−0.69 dB) at 25, cos 45° (−3.01 dB) at 50 and cos 67.5° (−8.34 dB) at 75.
 pub fn pan_gains(pan: f32) -> (f32, f32) {
-    let a = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-    let k = std::f32::consts::SQRT_2;
-    ((a.cos() * k).min(1.0), (a.sin() * k).min(1.0))
+    if pan.is_nan() {
+        return (1.0, 1.0);
+    }
+    let turn = pan.abs().min(1.0);
+    let far = if turn >= 1.0 { 0.0 } else { (turn * std::f32::consts::FRAC_PI_2).cos() };
+    if pan < 0.0 { (1.0, far) } else { (far, 1.0) }
 }
 
 /// `timing` is the clip as stored: keyframed volume and pan are evaluated on its media time, not on
