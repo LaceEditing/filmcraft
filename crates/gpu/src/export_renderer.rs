@@ -262,7 +262,16 @@ mod tests {
     /// [`assert_parity`] with its own bounds on the p99 and the mean.
     fn assert_parity_within(cpu: &Image, gpu: &Image, what: &str, max_p99: u32, max_mean: f64) {
         assert_eq!((cpu.w, cpu.h), (gpu.w, gpu.h), "{what}: size mismatch");
-        let to8 = |img: &Image| -> Vec<u8> { img.over_black_rgba8() };
+        // the premultiplied colour encoded as it is: the measure these bounds were set with (the
+        // output's own flatten, Premiere's, gives a partly transparent pixel its colour's encoded
+        // value times its alpha, which magnifies the CPU's and GPU's slightly different
+        // antialiasing at a transformed layer's edges)
+        let to8 = |img: &Image| -> Vec<u8> {
+            img.px
+                .chunks(4)
+                .flat_map(|p| [0, 1, 2].map(|k| filmcraft_color::linear_to_srgb_u8(p.get(k).copied().unwrap_or(0.0))).into_iter().chain([255]))
+                .collect()
+        };
         let (a, b) = (to8(cpu), to8(gpu));
         let mut d: Vec<u32> = a
             .as_chunks::<4>()

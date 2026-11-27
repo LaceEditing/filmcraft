@@ -608,10 +608,35 @@ fn over_black_rows_match_the_per_value_conversion() {
     crate::image::over_black_row(&v, &mut opaque, false);
     crate::image::over_black_row(&v, &mut with_alpha, true);
     for (i, s) in v.iter().enumerate() {
-        let want = if i % 4 == 3 { (s.clamp(0.0, 1.0) * 255.0).round() as u8 } else { filmcraft_color::linear_to_srgb_u8(*s) };
+        // a partly transparent pixel: its colour's encoded value times its alpha
+        let a = v[i / 4 * 4 + 3];
+        let want = if i % 4 == 3 {
+            (s.clamp(0.0, 1.0) * 255.0).round() as u8
+        } else if a > 0.0 && a < 1.0 {
+            ((filmcraft_color::linear_to_srgb((s / a).clamp(0.0, 1.0)) * a * 255.0 + 0.5).clamp(0.0, 255.0)) as u8
+        } else {
+            filmcraft_color::linear_to_srgb_u8(*s)
+        };
         assert_eq!(with_alpha[i], want, "{s:e} at {i}");
         assert_eq!(opaque[i], if i % 4 == 3 { 255 } else { want }, "{s:e} at {i}");
     }
+}
+
+/// Premiere Pro 27.0 flattens a partly transparent picture onto black as its colour's encoded
+/// value times its alpha (the titles and edges kits: white text's half-covered edge pixel is 128,
+/// a layer at 50 % over nothing half its encoded value); FilmCraft encoded the premultiplied linear
+/// colour (184 for that edge pixel).
+#[test]
+fn over_nothing_flattens_as_premiere_does() {
+    let h = 128.0 / 255.0;
+    let img = Image { w: 4, h: 1, px: vec![h, h, h, h, 1.0, 0.25, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.107, 0.107, 0.107, 0.25] };
+    let o = img.over_black_rgba8();
+    assert_eq!(&o[0..4], &[128, 128, 128, 255], "white half covered");
+    assert_eq!(&o[4..8], &[255, filmcraft_color::linear_to_srgb_u8(0.25), 0, 255], "opaque pixels are unchanged");
+    assert_eq!(&o[8..12], &[0, 0, 0, 255]);
+    // a quarter-covered mid grey: a quarter of its encoded value
+    let want = (filmcraft_color::linear_to_srgb(0.428) * 0.25 * 255.0).round() as u8;
+    assert!((o[12] as i32 - want as i32).abs() <= 1, "{} vs {want}", o[12]);
 }
 
 #[test]

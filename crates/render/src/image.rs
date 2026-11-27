@@ -253,6 +253,12 @@ const BATCH: usize = 64;
 /// [`Image::over_black_with_alpha_rgba8`]. A batch's table indices are computed first, in a loop
 /// that vectorises, and looked up after; per value this is
 /// [`filmcraft_color::linear_to_srgb_u8`], and [`alpha_u8`] for the alpha.
+///
+/// A partly transparent pixel (nothing opaque under it) is flattened as Premiere Pro 2027 flattens
+/// it onto black: its own colour's encoded value times its alpha, not the encoding of its
+/// premultiplied linear colour (measured with the titles and edges kits: an edge pixel of white
+/// text half covered is 128, where the linear way gave 184; a layer at 50 % over nothing is half
+/// its encoded value).
 pub(crate) fn over_black_row(s: &[f32], o: &mut [u8], alpha: bool) {
     let lut = filmcraft_color::linear_to_srgb_u8_table();
     let mut ix = [0u16; BATCH * 4];
@@ -266,6 +272,13 @@ pub(crate) fn over_black_row(s: &[f32], o: &mut [u8], alpha: bool) {
             o[1] = lut[i[1] as usize & 4095];
             o[2] = lut[i[2] as usize & 4095];
             o[3] = if alpha { alpha_u8(s[3]) } else { 255 };
+            let a = s[3];
+            if a > 0.0 && a < 1.0 {
+                for k in 0..3 {
+                    let v = filmcraft_color::linear_to_srgb((s[k] / a).clamp(0.0, 1.0)) * a;
+                    o[k] = (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                }
+            }
         }
     }
 }

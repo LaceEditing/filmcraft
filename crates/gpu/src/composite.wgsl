@@ -445,7 +445,14 @@ fn vs_full(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_full(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let c = clamp(textureLoad(accum, vec2<i32>(pos.xy), 0).rgb, vec3(0.0), vec3(1.0));
+    let px = textureLoad(accum, vec2<i32>(pos.xy), 0);
+    let a = clamp(px.a, 0.0, 1.0);
+    // a partly transparent pixel flattens onto black as Premiere's: its own colour's encoded
+    // value times its alpha (`filmcraft_render::image::over_black_row`)
+    if a > 0.0 && a < 1.0 {
+        return vec4(linear_to_srgb(clamp(px.rgb / a, vec3(0.0), vec3(1.0))) * a, 1.0);
+    }
+    let c = clamp(px.rgb, vec3(0.0), vec3(1.0));
     let lo = c * 12.92;
     let hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
     return vec4(select(hi, lo, c <= vec3(0.0031308)), 1.0);
