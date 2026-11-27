@@ -164,6 +164,27 @@ fn detects_gzipped_and_plain_projects() {
     assert_eq!(Format::from_extension(".PRPROJ"), Some(Format::Prproj));
 }
 
+/// A group heading (control type 11: Ultra Key's Matte Generation, Turbulent Displace's Evolution
+/// Options) stores only whether it is expanded, and a group's end (type 12) nothing: neither is a
+/// setting left out. Before, every Ultra Key in a project reported its four headings as not carried
+/// over, and Turbulent Displace its group end named "Random Seed".
+#[test]
+fn group_markers_are_not_reported_as_left_out() {
+    let heading = r#"<VideoComponentParam ObjectID="960"><Node Version="1"><Properties Version="1"><ECP.Group.Expanded>true</ECP.Group.Expanded></Properties></Node><Name>Matte Generation</Name><ParameterControlType>11</ParameterControlType><ParameterID>4</ParameterID><StartKeyframe>-91445760000000000,false,0,0,0,0,0,0</StartKeyframe><UpperBound>false</UpperBound></VideoComponentParam>"#;
+    let end = r#"<VideoComponentParam ObjectID="961"><Name>Random Seed</Name><ParameterControlType>12</ParameterControlType><ParameterID>5</ParameterID><StartKeyframe>-91445760000000000,false,0,0,0,0,0,0</StartKeyframe><UpperBound>false</UpperBound></VideoComponentParam>"#;
+    let doc = doc()
+        .replace(
+            r#"<Param Index="2" ObjectRef="59"/></Params><ID>2</ID>"#,
+            r#"<Param Index="2" ObjectRef="59"/><Param Index="3" ObjectRef="960"/><Param Index="4" ObjectRef="961"/></Params><ID>2</ID>"#,
+        )
+        .replace(r#"  <VideoFilterComponent ObjectID="54">"#, &format!("  {heading}\n  {end}\n  <VideoFilterComponent ObjectID=\"54\">"));
+    assert!(doc.contains(r#"ObjectRef="961""#) && doc.contains(r#"ObjectID="961""#));
+    let (imp, report) = import(&gzip(doc.as_bytes()), Some("/edits/show"));
+    let seq = imp.project.sequence(imp.sequences[0]).unwrap();
+    assert!(seq.video_tracks[0].items[1].effect("gaussian_blur").is_some(), "{report}");
+    assert!(!report.mentions("Matte Generation") && !report.mentions("Random Seed"), "{report}");
+}
+
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn imports_bins_media_sequences_clips_and_effects() {

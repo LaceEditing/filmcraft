@@ -499,6 +499,15 @@ pub(crate) struct Mapping<'a, 'i> {
 }
 
 /// The mapped parameters of a component and the names of those that could not be mapped.
+/// Whether a parameter only marks a group in Effect Controls and so holds no setting: its heading
+/// (control type 11: Ultra Key's Matte Generation, Turbulent Displace's Evolution Options, a
+/// title's Transform), which stores whether the group is expanded, or its end (type 12, always
+/// `false` in the projects seen; unnamed, or named after the group or its last parameter, as
+/// Turbulent Displace's second "Random Seed").
+pub(crate) fn is_group_marker(p: Node<'_, '_>) -> bool {
+    child_text(p, "ParameterControlType").is_some_and(|t| matches!(t.trim(), "11" | "12"))
+}
+
 pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Mapping<'a, 'i>>, Vec<String>) {
     let mut out = Vec::new();
     let mut unmapped = Vec::new();
@@ -567,7 +576,7 @@ pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Ma
         // −0.1 dB is 0.999, an Attack of a few ms 0.02), on scales not measured yet: none is read
         // or written as if it were in the effect's units
         Target::Effect(def) if def.kind == EffectKind::Audio => {
-            for p in &c.params {
+            for p in c.params.iter().filter(|p| !is_group_marker(**p)) {
                 let Some(name) = child_text(*p, "Name").map(str::trim).filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("Bypass")) else { continue };
                 match AUDIO_PARAMS.iter().find(|(e, n, ..)| *e == def.id && n.eq_ignore_ascii_case(name)) {
                     Some((_, _, param, conv)) if decode(*p, *conv).is_some() => out.push(Mapping { node: *p, effect: def.id, param, conv: *conv }),
@@ -595,13 +604,13 @@ pub(crate) fn mappings<'a, 'i>(c: &Component<'a, 'i>, target: Target) -> (Vec<Ma
             // a name Premiere uses for several parameters of one effect (Lumetri's "Intensity")
             // cannot be mapped by name; each FilmCraft parameter takes at most one value
             let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-            for p in &c.params {
+            for p in c.params.iter().filter(|p| !is_group_marker(**p)) {
                 if let Some(n) = child_text(*p, "Name").map(str::trim).filter(|n| !n.is_empty()) {
                     *counts.entry(n.to_ascii_lowercase()).or_insert(0) += 1;
                 }
             }
             let mut taken = std::collections::HashSet::new();
-            for p in &c.params {
+            for p in c.params.iter().filter(|p| !is_group_marker(**p)) {
                 let Some(name) = child_text(*p, "Name").map(str::trim).filter(|n| !n.is_empty()) else { continue };
                 if counts.get(&name.to_ascii_lowercase()).copied().unwrap_or(0) > 1 {
                     if !unmapped.iter().any(|u| u == name) {

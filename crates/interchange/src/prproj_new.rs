@@ -504,12 +504,12 @@ fn scan(bytes: &[u8], want: &dyn Fn(&Need) -> bool, best: &mut BTreeMap<Need, (u
 }
 
 /// Whether every parameter of `c` named `name` is something other than a setting: a group
-/// heading (control type 11, which only stores whether it is expanded), an audio effect's
+/// heading or end (control types 11 and 12, see `is_group_marker`), an audio effect's
 /// processing state, or a Bypass that is off.
 fn holds_no_setting(c: &crate::prproj_fx::Component<'_, '_>, name: &str) -> bool {
     let named = c.params.iter().filter(|p| crate::xml::child_text(**p, "Name").is_some_and(|n| n.trim().eq_ignore_ascii_case(name)));
     named.into_iter().all(|p| {
-        let heading = crate::xml::child_text(*p, "ParameterControlType").is_some_and(|t| t.trim() == "11");
+        let heading = crate::prproj_fx::is_group_marker(*p);
         let state = matches!(name, "IsProcessing" | "Is Processing" | "Reset");
         let off = name.eq_ignore_ascii_case("Bypass") && crate::prproj_fx::start_value(*p).is_none_or(|v| v == "false" || v == "0");
         heading || state || off
