@@ -249,7 +249,6 @@ fn prepare(project: &Project, report: &mut Report, have: &HashSet<Need>) -> Proj
                     match e.effect.as_str() {
                         "time_remap" if e.params.keys().any(|p| changed(p)) => *unwritten.entry("time remapping").or_insert(0) += 1,
                         "channel_volume" if e.params.keys().any(|p| changed(p)) => *unwritten.entry("channel volume").or_insert(0) += 1,
-                        "opacity" if changed("blend") => *unwritten.entry("blend modes").or_insert(0) += 1,
                         _ => {}
                     }
                 }

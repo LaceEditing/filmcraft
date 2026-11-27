@@ -1280,8 +1280,21 @@ fn encode_as(start_keyframe: Option<&str>, float: bool, unit: f64, pr: Option<&C
             }
             f.join(",")
         }
+        // (a point's with its spatial part, as Premiere writes it)
+        None if matches!(value, Val::P(..)) => format!("{STATIC_TIME},{},0,0,0,0,0,0,5,4,0,0,0,0", fmt_key_val(value, float)),
         None => format!("{STATIC_TIME},{},0,0,0,0,0,0", fmt_key_val(value, float)),
     };
+    // a point keyframe goes on with its spatial part, as the static value's: without it Premiere
+    // Pro 2027 holds the first keyframe's value (measured: Position keyframes written with the
+    // temporal fields only played as a still). Its tangents are zero: a straight path, as
+    // FilmCraft moves a point
+    let spatial = matches!(value, Val::P(..)).then(|| {
+        start_keyframe
+            .map(|s| s.split(',').collect::<Vec<_>>())
+            .filter(|f| f.len() >= 14)
+            .and_then(|f| Some(format!(",{},{},0,0,0,0", f.get(8)?.trim(), f.get(9)?.trim())))
+            .unwrap_or_else(|| ",5,4,0,0,0,0".to_string())
+    });
     let keyframes = (!fc.keys.is_empty()).then(|| {
         let mut s = String::new();
         for (i, k) in fc.keys.iter().enumerate() {
@@ -1314,6 +1327,9 @@ fn encode_as(start_keyframe: Option<&str>, float: bool, unit: f64, pr: Option<&C
                     num(s_out),
                     num(k.infl.1)
                 )),
+            }
+            if let Some(sp) = spatial.as_deref().filter(|_| s.rsplit(';').next().is_some_and(|last| last.split(',').count() < 14)) {
+                s.push_str(sp);
             }
             s.push(';');
         }

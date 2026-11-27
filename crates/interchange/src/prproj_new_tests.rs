@@ -504,3 +504,73 @@ fn additions_take_the_versions_of_the_document_they_join() {
     let odd = r#"<PremiereData Version="3"><Project ObjectID="1" Version="x"/><Media ObjectUID="m" Version="-4"/></PremiereData>"#;
     assert_eq!(of(odd), Versions::PREMIERE_2027);
 }
+
+/// Position keyframes carry their spatial part (`5,4` and four tangent values) as Premiere Pro
+/// 2027 writes each point keyframe: written with the temporal fields only, Premiere played the
+/// clip as a still at the first keyframe's position.
+#[test]
+fn position_keyframes_carry_their_spatial_part() {
+    use filmcraft_project::Keyframe;
+    let (mut p, main, _) = project();
+    {
+        let q = p.sequence_mut(main).unwrap();
+        let motion = q.video_tracks[0].items[0].effect_mut("motion").unwrap();
+        let pos = motion.params.get_mut("position").unwrap();
+        pos.keyframes = vec![
+            Keyframe::new(Tick(0), ParamValue::Vec2(filmcraft_geom::Vec2::new(480.0, 540.0))),
+            Keyframe::new(Tick(2 * S), ParamValue::Vec2(filmcraft_geom::Vec2::new(1440.0, 540.0))),
+        ];
+    }
+    let (bytes, report) = create(&p, &opts()).unwrap();
+    let (xml, _) = prproj_graph::decompress(&bytes).unwrap();
+    let text = String::from_utf8(xml).unwrap();
+    assert!(crate::prproj_write::problems(&text).is_empty(), "{:?}", crate::prproj_write::problems(&text));
+    let d = crate::xml::parse(&text).unwrap();
+    let position = d
+        .descendants()
+        .find(|n| {
+            n.has_tag_name("PointComponentParam")
+                && n.children().any(|c| c.has_tag_name("Name") && c.text() == Some("Position"))
+                && n.children().any(|c| c.has_tag_name("Keyframes"))
+        })
+        .expect("the keyframed Position");
+    let keys = position.children().find(|c| c.has_tag_name("Keyframes")).and_then(|k| k.text()).unwrap();
+    let keys: Vec<&str> = keys.split(';').filter(|k| !k.is_empty()).collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    for k in &keys {
+        let f: Vec<&str> = k.split(',').collect();
+        assert_eq!(f.len(), 14, "{k}");
+        assert_eq!(&f[8..], ["5", "4", "0", "0", "0", "0"], "{k}");
+    }
+    assert!(keys[0].starts_with("0,0.25:0.5,") && keys[1].starts_with(&format!("{},0.75:0.5,", 2 * S)), "{keys:?}");
+    // and it reads back
+    let (back, _) = read(&bytes);
+    let seq = back.items.values().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
+    let first = seq.video_tracks[0].items.iter().find(|c| c.start.0 == 0).unwrap();
+    let pos = first.effect("motion").and_then(|e| e.params.get("position")).unwrap();
+    assert_eq!(pos.keyframes.len(), 2, "{report}");
+    assert_eq!(pos.keyframes[1].value, ParamValue::Vec2(filmcraft_geom::Vec2::new(1440.0, 540.0)));
+}
+
+/// A clip's blend mode is written into a new project (Premiere's code and its menu position) and
+/// is not reported as left out: Premiere Pro 27.0 plays all 22 of the kit's modes within 1 code
+/// value of FilmCraft's render.
+#[test]
+fn blend_modes_are_written_into_a_new_project() {
+    let (mut p, main, _) = project();
+    {
+        let q = p.sequence_mut(main).unwrap();
+        let opacity = q.video_tracks[0].items[0].effect_mut("opacity").unwrap();
+        // Multiply: the menu's fourth mode, Premiere's code 17
+        opacity.params.get_mut("blend").unwrap().value = ParamValue::Choice(3);
+    }
+    let (bytes, report) = create(&p, &opts()).unwrap();
+    assert!(!report.mentions("blend"), "{report}");
+    let (xml, _) = prproj_graph::decompress(&bytes).unwrap();
+    let text = String::from_utf8(xml).unwrap();
+    assert!(text.contains(&format!("<Name>Blend Mode</Name><ParameterControlType>10</ParameterControlType><ParameterID>2</ParameterID><DiscontinuousInterpolate>true</DiscontinuousInterpolate><StartKeyframe>{NO_TIME},17,")), "the code");
+    let (back, _) = read(&bytes);
+    let seq = back.items.values().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
+    let first = seq.video_tracks[0].items.iter().find(|c| c.start.0 == 0).unwrap();
+    assert_eq!(first.effect("opacity").and_then(|e| e.params.get("blend")).map(|p| p.value.clone()), Some(ParamValue::Choice(3)));
+}
