@@ -22,10 +22,9 @@ pub enum FilterType {
     LowPass1,
     /// First-order (6 dB/oct) Butterworth high-pass: −3 dB at `freq`.
     HighPass1,
-    /// Premiere's Parametric Equalizer shelves (measured): the corner `freq` is the shelf's
-    /// pole, its zero sits `gain` away (first order: `A·freq`, second order: `√A·freq`), so the
-    /// curve passes ~3 dB inside the full gain at `freq` and a cut mirrors a boost in dB.
-    /// `q` is unused.
+    /// Premiere's Parametric Equalizer shelves (measured): a Butterworth shelf of the first
+    /// (gentle) or second (steep) order, placed so the curve at `freq` is 3 dB inside the full
+    /// gain ([`Coeffs::shelf`]); a cut mirrors a boost in dB. `q` is unused.
     GentleLowShelf,
     GentleHighShelf,
     SteepLowShelf,
@@ -73,14 +72,33 @@ impl Coeffs {
     }
 
     /// One of Premiere's shelves: a boost's (numerator, denominator); a cut swaps them.
+    ///
+    /// A Butterworth shelf of order N (1 gentle, 2 steep) with gain G has
+    /// |H|² = (x²ᴺ + G²) / (x²ᴺ + 1) at x = f / pole (a low shelf; a high one is its mirror in
+    /// frequency). Premiere places the pole so the curve at `freq` is [`edge_gain`]: 3 dB
+    /// inside the full gain. Measured on Premiere Pro 27.0 renders of 30 tones through the
+    /// Parametric Equalizer's L (40 Hz) and H (18 kHz) at ±9 dB, gentle and steep: every tone
+    /// within 0.012 dB (+9 dB gentle at 40 Hz: 7.46 dB at 25 Hz, 6.00 at 40, 4.18 at 63).
     fn shelf(w0: f64, gain_db: f64, low: bool, steep: bool) -> Coeffs {
-        let a = 10f64.powf(gain_db.abs() / 20.0);
-        let r = a.sqrt();
+        let g = 10f64.powf(gain_db.abs() / 20.0);
+        if g <= 1.0 + 1e-9 || !g.is_finite() {
+            return Coeffs::IDENTITY;
+        }
+        let edge2 = edge_gain(g).powi(2);
+        // x²ᴺ at `freq`, for the pole at 1
+        let ratio = (g * g - edge2) / (edge2 - 1.0);
+        if ratio <= 0.0 || !ratio.is_finite() {
+            return Coeffs::IDENTITY;
+        }
+        // the pole, with `freq` at 1 (a high shelf's is above it)
+        let x = if steep { ratio.powf(0.25) } else { ratio.sqrt() };
+        let p = if low { 1.0 / x } else { x };
+        let (r, s2) = (g.sqrt(), std::f64::consts::SQRT_2);
         let (n, d) = match (low, steep) {
-            (true, false) => ([0.0, 1.0, a], [0.0, 1.0, 1.0]),
-            (false, false) => ([0.0, a, 1.0], [0.0, 1.0, 1.0]),
-            (true, true) => ([1.0, std::f64::consts::SQRT_2 * r, a], [1.0, std::f64::consts::SQRT_2, 1.0]),
-            (false, true) => ([a, std::f64::consts::SQRT_2 * r, 1.0], [1.0, std::f64::consts::SQRT_2, 1.0]),
+            (true, false) => ([0.0, 1.0, g * p], [0.0, 1.0, p]),
+            (false, false) => ([0.0, g, p], [0.0, 1.0, p]),
+            (true, true) => ([1.0, s2 * r * p, g * p * p], [1.0, s2 * p, p * p]),
+            (false, true) => ([g, s2 * r * p, p * p], [1.0, s2 * p, p * p]),
         };
         if gain_db < 0.0 { Self::analog(w0, d, n) } else { Self::analog(w0, n, d) }
     }
@@ -153,6 +171,46 @@ impl Coeffs {
     pub fn magnitude_db(&self, freq: f64, sample_rate: f64) -> f64 {
         20.0 * self.magnitude(freq, sample_rate).log10()
     }
+}
+
+/// The gain at which Premiere's Parametric Equalizer measures a band's width and places a
+/// shelf's corner, for a boost of `g` (linear, ≥ 1): 3 dB inside the full gain, and half the
+/// gain in dB up to 6 dB (where the two meet).
+fn edge_gain(g: f64) -> f64 {
+    const INSIDE: f64 = 0.707_945_784_384_137_9; // −3 dB
+    (g * INSIDE).max(g.sqrt())
+}
+
+/// The cookbook Q ([`FilterType::Peaking`]) of a Parametric Equalizer band set to `q` at `freq`
+/// in Premiere.
+///
+/// Premiere's band is `freq / q` wide where its curve is [`edge_gain`]: 3 dB inside the peak
+/// (or the dip), not at half the gain as the cookbook's, so above 6 dB it is wider than the
+/// cookbook band of the same Q, and the more so the larger the gain. And that width goes into
+/// the filter as tan(width / 2) in radians per sample, where the cookbook's shrinks towards
+/// the top of the spectrum: at 12.8 kHz Premiere's band is 1.8 times as wide.
+///
+/// Measured on Premiere Pro 27.0 renders of 30 tones (the audio effects calibration kits):
+/// band 3 at 800 Hz from ±1.5 to ±6 dB is the cookbook's curve; +9 dB at Q 0.5, 1, 2, 4 and 8,
+/// +12 dB and ±18 dB at Q 2 are this rule's (+12 dB Q 2 is the cookbook's Q 1.07: 6.06 dB at
+/// 1250 Hz where Q 2 gives 3.04); band 5 at 12.8 kHz, +12 dB Q 2, is 6.91 dB at 8 kHz where
+/// the cookbook's width gives 3.96. The filter this gives is within 0.02 dB of every tone.
+pub fn premiere_band_q(q: f64, gain_db: f64, freq: f64, sample_rate: f64) -> f64 {
+    if q <= 0.0 || !q.is_finite() || sample_rate <= 0.0 || !sample_rate.is_finite() || !freq.is_finite() {
+        return q;
+    }
+    let w0 = 2.0 * PI * freq.clamp(1.0, sample_rate * 0.49) / sample_rate;
+    let g = 10f64.powf(if gain_db.is_finite() { gain_db.abs().min(120.0) } else { 0.0 } / 20.0);
+    let edge2 = edge_gain(g).powi(2);
+    // √G × the band's width at the edge gain, for (s² + G·b·s + 1) / (s² + b·s + 1): 1 up to
+    // 6 dB, where the edge is half the gain
+    let wide = if g > 1.0 && edge2 > g * (1.0 + 1e-12) { g.sqrt() * ((edge2 - 1.0) / (g * g - edge2)).sqrt() } else { 1.0 };
+    // (a band wider than the spectrum stays short of tan's pole)
+    let alpha = wide * (w0 / (2.0 * q)).min(1.5).tan();
+    if alpha <= 0.0 || !alpha.is_finite() {
+        return q;
+    }
+    w0.sin() / (2.0 * alpha)
 }
 
 /// One biquad section's state (TDF-II), f64 internally.
@@ -256,6 +314,74 @@ mod tests {
         let hb = Coeffs::design(FilterType::GentleHighShelf, SR, 5010.0, 1.0, 12.1);
         assert!((hb.magnitude_db(3000.0, SR) + hs.magnitude_db(3000.0, SR)).abs() < 1e-6);
         assert!(Coeffs::design(FilterType::SteepHighShelf, SR, 5010.0, 1.0, 0.0).magnitude_db(5000.0, SR).abs() < 1e-9);
+    }
+
+    /// Premiere Pro 27.0's own renders (the audio effects calibration kit): the shelves pass
+    /// 3 dB inside their gain at the set frequency.
+    #[test]
+    fn premiere_shelves_sit_3_db_inside_their_gain_at_the_frequency() {
+        let cases: [(FilterType, f64, f64, &[(f64, f64)]); 4] = [
+            (FilterType::GentleLowShelf, 40.0, 9.0, &[(25.0, 7.46), (40.0, 6.00), (63.0, 4.18), (100.0, 2.42), (250.0, 0.54)]),
+            (FilterType::SteepLowShelf, 40.0, 9.0, &[(25.0, 8.30), (40.0, 5.99), (63.0, 2.44), (100.0, 0.53)]),
+            (FilterType::GentleHighShelf, 18000.0, 9.0, &[(8000.0, 1.09), (12500.0, 2.77), (16000.0, 4.68), (20000.0, 7.37)]),
+            (FilterType::SteepHighShelf, 18000.0, 9.0, &[(10000.0, 0.22), (12500.0, 0.77), (16000.0, 3.32), (20000.0, 8.21)]),
+        ];
+        for (kind, freq, gain, points) in cases {
+            let boost = Coeffs::design(kind, SR, freq, 1.0, gain);
+            let cut = Coeffs::design(kind, SR, freq, 1.0, -gain);
+            for (f, want) in points {
+                assert!((boost.magnitude_db(*f, SR) - want).abs() < 0.02, "{kind:?} at {f} Hz: {}", boost.magnitude_db(*f, SR));
+                assert!((cut.magnitude_db(*f, SR) + want).abs() < 0.02, "{kind:?} cut at {f} Hz");
+            }
+        }
+        // no gain, a hostile gain: nothing, never a NaN
+        for g in [0.0, 1e-12, f64::NAN, f64::INFINITY, 1e9] {
+            let c = Coeffs::design(FilterType::SteepLowShelf, SR, 100.0, 1.0, g);
+            assert!(c.b0.is_finite() && c.a2.is_finite(), "{g}");
+        }
+    }
+
+    /// Premiere Pro 27.0's own renders: a band's width is taken 3 dB inside its peak.
+    #[test]
+    fn premiere_bands_are_as_wide_3_db_inside_the_peak() {
+        // up to 6 dB the cookbook's own band
+        for g in [1.5, 3.0, 6.0, -4.5] {
+            assert!((premiere_band_q(2.0, g, 200.0, SR) - 2.0).abs() < 0.001, "{g}");
+        }
+        // (band, gain, Q set, tone, Premiere's level there)
+        let cases = [
+            (800.0, 12.0, 2.0, 1250.0, 6.06),
+            (800.0, 18.0, 2.0, 1250.0, 11.70),
+            (800.0, -18.0, 2.0, 1250.0, -11.70),
+            (800.0, 9.0, 0.5, 315.0, 5.75),
+            (800.0, 9.0, 8.0, 1000.0, 1.40),
+            (800.0, 6.0, 2.0, 630.0, 3.11),
+            (50.0, 12.0, 1.0, 125.0, 5.40),
+            // towards the top of the spectrum the band keeps its width
+            (3200.0, 18.0, 4.0, 5000.0, 6.98),
+            (12800.0, 12.0, 2.0, 8000.0, 6.91),
+            (12800.0, 6.0, 2.0, 10000.0, 3.48),
+            (12800.0, -12.0, 8.0, 10000.0, -2.91),
+        ];
+        for (band, gain, q, f, want) in cases {
+            let c = Coeffs::design(FilterType::Peaking, SR, band, premiere_band_q(q, gain, band, SR), gain);
+            assert!((c.magnitude_db(f, SR) - want).abs() < 0.02, "{band} Hz {gain} dB Q {q} at {f} Hz: {}", c.magnitude_db(f, SR));
+            assert!((c.magnitude_db(band, SR) - gain).abs() < 1e-6);
+        }
+        // hostile settings give a usable Q, never a NaN
+        for (q, g, f, sr) in [
+            (2.0, f64::NAN, 800.0, SR),
+            (2.0, f64::INFINITY, 800.0, SR),
+            (0.0, 12.0, 800.0, SR),
+            (2.0, 1e9, 800.0, SR),
+            (1e-9, 12.0, 20000.0, SR),
+            (2.0, 12.0, f64::NAN, SR),
+            (2.0, 12.0, 800.0, 0.0),
+            (f64::NAN, 3.0, 800.0, SR),
+        ] {
+            let got = premiere_band_q(q, g, f, sr);
+            assert!(got.is_finite() || q.is_nan(), "{q} {g} {f} {sr}: {got}");
+        }
     }
 
     #[test]

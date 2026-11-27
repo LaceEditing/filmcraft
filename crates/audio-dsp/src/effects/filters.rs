@@ -312,6 +312,7 @@ pub fn butterworth_sections(order: usize) -> [(bool, bool, f32); 4] {
 /// shape (gentle first-order, or steep second-order) rather than the RBJ cookbook's.
 pub struct FullParametricEq {
     pv: ParamValues,
+    sr: f64,
     bank: BandBank,
     out: Smoothed,
 }
@@ -324,6 +325,7 @@ impl FullParametricEq {
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let mut s = FullParametricEq {
             pv: ParamValues::new(Self::PARAMS),
+            sr: f64::from(sample_rate),
             bank: BandBank::new(sample_rate, channels, Self::SLOTS),
             out: Smoothed::with_ms(1.0, sample_rate, SMOOTH_MS),
         };
@@ -343,7 +345,12 @@ impl FullParametricEq {
                 FilterType::GentleHighShelf if p.on(ids[3]) => FilterType::SteepHighShelf,
                 k => k,
             };
-            let q = if kind == FilterType::Peaking { p.v(ids[3]) } else { 1.0 };
+            // (a band's Q is Premiere's: its width 3 dB inside the peak)
+            let q = if kind == FilterType::Peaking {
+                crate::biquad::premiere_band_q(f64::from(p.v(ids[3])), f64::from(p.v(ids[2])), f64::from(p.v(ids[1])), self.sr) as f32
+            } else {
+                1.0
+            };
             bands[i] = (p.on(ids[0]), kind, p.v(ids[1]), p.v(ids[2]), q);
         }
         for slot in 0..4 {

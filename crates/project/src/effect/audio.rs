@@ -341,7 +341,7 @@ pub(super) fn defs() -> Vec<EffectDef> {
             ],
         ),
         // ---- Filter and EQ ----
-        audio("bandpass", "Bandpass", A_FILTER, vec![hz("center", "Center", 1000.0, 20.0, 20000.0), num("q", "Q", 1.0, 0.1, 20.0, "", 2)]),
+        audio("bandpass", "Bandpass", A_FILTER, vec![hz("center", "Center", 1000.0, 20.0, 20000.0), num("q", "Q", 2.575, 0.1, 10.0, "", 2)]),
         audio("bass", "Bass", A_FILTER, vec![db("boost", "Boost", 0.0, -24.0, 24.0)]),
         audio("fft_filter", "FFT Filter", A_FILTER, fft_filter()),
         audio("graphic_eq", "Graphic Equalizer (10 Bands)", A_FILTER, geq(&GEQ10_LABELS)),

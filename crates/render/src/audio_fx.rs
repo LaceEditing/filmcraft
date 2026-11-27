@@ -74,8 +74,8 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
             },
         },
         // Single-band filters via band 1 of the parametric EQ (types: see FILTER_TYPE_NAMES).
-        "highpass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| band(d, 4.0, f(e, "cutoff", t), 0.707) },
-        "lowpass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| band(d, 3.0, f(e, "cutoff", t), 0.707) },
+        "highpass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| pass(d, 4.0, f(e, "cutoff", t)) },
+        "lowpass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| pass(d, 3.0, f(e, "cutoff", t)) },
         "bandpass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| band(d, 6.0, f(e, "center", t), f(e, "q", t)) },
         // Amount 0…100 % → 0…40 dB of reduction.
         "denoise" => Mapping { dsp: "denoise", preroll: |_, _| 1.0, apply: |d, e, t| ignore(d.set_param("reduction", f(e, "amount", t) * 0.4)) },
@@ -148,8 +148,8 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
                 set_if_changed(d, "makeup", f(e, "output", t));
             },
         },
-        "bass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| shelf(d, 1.0, 200.0, f(e, "boost", t)) },
-        "treble" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| shelf(d, 2.0, 4000.0, f(e, "boost", t)) },
+        "bass" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| shelf(d, 1.0, 200.0, f(e, "boost", t), BASS_SHELF) },
+        "treble" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.05, apply: |d, e, t| shelf(d, 2.0, 4000.0, f(e, "boost", t), TREBLE_SHELF) },
         "simple_notch" => Mapping { dsp: "parametric_eq", preroll: |_, _| 0.1, apply: |d, e, t| band(d, 5.0, f(e, "center", t), f(e, "q", t)) },
         "simple_eq" => Mapping {
             dsp: "parametric_eq",
@@ -287,9 +287,34 @@ pub fn latency(effect_id: &str, sample_rate: u32) -> usize {
     mapping(effect_id).and_then(|m| filmcraft_audio_dsp::create_effect(m.dsp, sample_rate as f32, 2)).map_or(0, |d| d.latency())
 }
 
-fn shelf(d: &mut dyn AudioEffect, kind: f32, freq: f32, gain: f32) {
-    band(d, kind, freq, std::f32::consts::FRAC_1_SQRT_2);
+/// The middle term of Premiere's Bass shelf ([`shelf`]).
+const BASS_SHELF: f32 = 0.7435;
+/// The middle term of Premiere's Treble shelf ([`shelf`]).
+const TREBLE_SHELF: f32 = 2.478;
+
+/// Premiere's Bass and Treble: the cookbook shelf (half the gain at `freq`) whose middle term
+/// √A / Q is `k` whatever the gain (A = 10^(dB/40)), so Q = √A / k. Measured on Premiere Pro
+/// 27.0 renders of 30 tones through Bass and Treble (the kit's fx and fxcal projects): with
+/// k 0.7435 (Bass, 200 Hz) and 2.478 (Treble, 4 kHz) every tone is within 0.01 dB at ±9 dB. A
+/// Bass boost overshoots (+12 dB at 125 Hz, −3 dB at 315 Hz for +9 dB) and a cut does not mirror
+/// it; Treble is a slow slope over five octaves.
+fn shelf(d: &mut dyn AudioEffect, kind: f32, freq: f32, gain: f32, k: f32) {
+    let a = 10f32.powf(gain.clamp(-48.0, 48.0) / 40.0);
+    band(d, kind, freq, a.sqrt() / k);
     set_if_changed(d, "b1.gain", gain);
+}
+
+/// Premiere's Highpass and Lowpass: two second-order Butterworth sections in a row (24 dB per
+/// octave, −6 dB at the cutoff). Measured on Premiere Pro 27.0 (the kit's fx project): its
+/// render is twice one section's attenuation in dB at each of 30 tones, to 0.05 dB.
+fn pass(d: &mut dyn AudioEffect, kind: f32, freq: f32) {
+    for b in ["b1", "b2"] {
+        d.set_param(&format!("{b}.on"), 1.0);
+        d.set_param(&format!("{b}.type"), kind);
+        d.set_param(&format!("{b}.freq"), freq);
+        d.set_param(&format!("{b}.q"), std::f32::consts::FRAC_1_SQRT_2);
+        d.set_param(&format!("{b}.gain"), 0.0);
+    }
 }
 
 /// Whether a project audio effect has a DSP implementation (clip effects and mixer inserts).
@@ -498,6 +523,40 @@ mod tests {
         let fx = configured(&inst, Tick::ZERO, 48000).unwrap();
         assert!(fx.response_db(50.0).unwrap() < -40.0, "band 1 off, 24 dB/Oct high-pass at 200 Hz");
         assert!((fx.response_db(2000.0).unwrap() + 6.0).abs() < 0.2, "master gain");
+    }
+
+    /// The simple filters against Premiere Pro 27.0's own renders (the audio effects kit and
+    /// its calibration kit): each tone's level in dB.
+    #[test]
+    fn simple_filters_have_premieres_curves() {
+        use filmcraft_project::ParamValue::Float;
+        let curve = |effect: &str, param: &str, value: f64| {
+            let mut inst = filmcraft_project::find_effect(effect).unwrap().instance();
+            inst.param_mut(param).unwrap().value = Float(value);
+            configured(&inst, Tick::ZERO, 48000).unwrap()
+        };
+        let cases: [(&str, &str, f64, &[(f64, f64)]); 10] = [
+            // a boost overshoots: +12 dB at 125 Hz, −3 dB at 315 Hz
+            ("bass", "boost", 9.0, &[(25.0, 9.12), (125.0, 11.98), (200.0, 4.50), (315.0, -3.02), (1000.0, -0.32)]),
+            // and a cut is not its mirror
+            ("bass", "boost", -9.0, &[(100.0, -9.75), (200.0, -4.50), (400.0, 0.75)]),
+            ("bass", "boost", 18.0, &[(100.0, 23.75)]),
+            ("treble", "boost", 9.0, &[(1000.0, 0.45), (2000.0, 1.64), (4000.0, 4.50), (8000.0, 7.51), (20000.0, 8.96)]),
+            ("treble", "boost", -9.0, &[(1000.0, -1.53), (2000.0, -3.11), (8000.0, -6.02), (16000.0, -8.23)]),
+            ("treble", "boost", -24.0, &[(800.0, -5.63)]),
+            // 24 dB per octave, −6 dB at the cutoff
+            ("highpass", "cutoff", 500.0, &[(125.0, -48.21), (250.0, -24.62), (500.0, -6.02), (1000.0, -0.52)]),
+            ("highpass", "cutoff", 8000.0, &[(1600.0, -59.20)]),
+            ("lowpass", "cutoff", 2000.0, &[(1000.0, -0.52), (2000.0, -6.02), (4000.0, -25.18), (8000.0, -51.38)]),
+            ("lowpass", "cutoff", 15000.0, &[(20000.0, -31.97)]),
+        ];
+        for (effect, param, value, points) in cases {
+            let fx = curve(effect, param, value);
+            for (f, want) in points {
+                let got = fx.response_db(*f).unwrap();
+                assert!((got - want).abs() < 0.05, "{effect} {value} at {f} Hz: {got}, Premiere {want}");
+            }
+        }
     }
 
     #[test]
