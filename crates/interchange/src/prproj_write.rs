@@ -2089,6 +2089,7 @@ impl<'a, 'i> Writer<'a, 'i> {
             // a FilmCraft parameter several Premiere ones map onto (Amplify's Left and Right) was
             // read from the first: unchanged there, none of them is touched
             let mut changed: HashMap<&'static str, bool> = HashMap::new();
+            let mut state: Vec<(Node<'a, 'i>, f64)> = Vec::new();
             for m in maps {
                 if changed.get(m.param) == Some(&false) {
                     continue;
@@ -2122,7 +2123,9 @@ impl<'a, 'i> Writer<'a, 'i> {
                 let t = prproj_fx::encode(m.node, pr.as_ref(), &fc, &ctx);
                 let pi = self.inst_of(m.node, copies);
                 self.write_param(pi, m.node, &t);
+                state.extend(prproj_fx::state_value(&t).map(|v| (m.node, v)));
             }
+            self.audio_state(comp, copies, &state, &c.name);
             if let (Some(e), Target::Effect(_) | Target::Opacity) = (instance, target) {
                 self.masks(comp, e, &ctx, copies, &c.name);
             }
@@ -2209,6 +2212,7 @@ impl<'a, 'i> Writer<'a, 'i> {
                     if lost.len() > 1 { "s" } else { "" }
                 ));
             }
+            let mut added_state: Vec<(Node<'a, 'i>, f64)> = Vec::new();
             for m in maps {
                 let fc_param = e
                     .params
@@ -2224,7 +2228,9 @@ impl<'a, 'i> Writer<'a, 'i> {
                 let t = prproj_fx::encode(m.node, pr.as_ref(), &fc, &ctx);
                 let pi = self.inst_of(m.node, &model_copies);
                 self.write_param(pi, m.node, &t);
+                added_state.extend(prproj_fx::state_value(&t).map(|v| (m.node, v)));
             }
+            self.audio_state(&model, &model_copies, &added_state, &c.name);
             if text_layer {
                 // its text and formatting
                 self.write_title(&model, e, &model_copies, &c.name);
@@ -2273,6 +2279,57 @@ impl<'a, 'i> Writer<'a, 'i> {
         {
             self.needs.entry(key.to_string()).or_default().merge(need);
         }
+    }
+
+    /// An audio effect's own state, in step with the parameters just written (`changed`: each
+    /// parameter and its new value). Premiere plays that state, not the parameters
+    /// ([`prproj_fx::param_list`]): without this a setting written into the parameters alone
+    /// showed in no render.
+    fn audio_state(&mut self, comp: &prproj_fx::Component<'a, 'i>, copies: &HashMap<&'a str, usize>, changed: &[(Node<'a, 'i>, f64)], clip: &str) {
+        if changed.is_empty() || !comp.node.has_tag_name("AudioFilterComponent") {
+            return;
+        }
+        let Some(opaque) = child(comp.node, "OpaqueData") else { return };
+        // every parameter after Bypass: its new value, else the one it has (none saved: the top
+        // of its range, 1)
+        let new_value = |p: Node<'a, 'i>| changed.iter().find(|(n, _)| n.id() == p.id()).map(|(_, v)| *v);
+        let have = |p: Node<'a, 'i>| prproj_fx::start_value(p).and_then(|s| s.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(1.0);
+        let values: Vec<f64> = comp.params.iter().skip(1).map(|p| new_value(*p).unwrap_or_else(|| have(*p))).collect();
+        let is_new: Vec<bool> = comp.params.iter().skip(1).map(|p| new_value(*p).is_some()).collect();
+        let bytes = self.binary(opaque).filter(|b| !b.is_empty());
+        let state = match bytes.as_deref() {
+            Some(b) if prproj_fx::is_binary_state(b) => {
+                let (maps, _) = prproj_fx::mappings(comp, comp.target());
+                let params: Vec<prproj_fx::StateParam> = comp
+                    .params
+                    .iter()
+                    .skip(1)
+                    .map(|p| prproj_fx::StateParam {
+                        old: have(*p),
+                        new: new_value(*p),
+                        conv: maps.iter().find(|m| m.node.id() == p.id()).map(|m| m.conv),
+                        switch: child_text(*p, "Name").is_some_and(|n| n.trim().ends_with(" Enabled")),
+                    })
+                    .collect();
+                prproj_fx::binary_state(b, &params)
+            }
+            Some(b) => std::str::from_utf8(b).ok().and_then(|t| prproj_fx::param_list(Some(t), &values, &is_new)).map(String::into_bytes),
+            None => prproj_fx::param_list(None, &values, &is_new).map(String::into_bytes),
+        };
+        let Some(state) = state else {
+            self.report.warn(format!(
+                "\"{}\" on \"{clip}\": its settings were written, but Premiere keeps its own (the effect's saved state has another layout)",
+                comp.label()
+            ));
+            return;
+        };
+        let hash = crate::prproj_title::binary_hash(&state);
+        let inst = self.inst_of(comp.node, copies);
+        self.edit(
+            inst,
+            opaque.range(),
+            format!("<OpaqueData Encoding=\"base64\" BinaryHash=\"{hash}\">{}</OpaqueData>", crate::prproj_text::base64_encode(&state)),
+        );
     }
 
     /// A track's fader and pan as FilmCraft has them, written where they differ from the Premiere

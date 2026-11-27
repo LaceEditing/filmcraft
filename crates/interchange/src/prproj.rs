@@ -838,7 +838,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                             for (id, v) in [("frequency", d.frequency), ("bandwidth", d.bandwidth), ("threshold", d.threshold), ("reduction", d.reduction)] {
                                 e.params.insert(id.into(), Param::new(ParamValue::Float(v)));
                             }
-                        } else if !prproj_fx::audio_effect_read(def.id) {
+                        } else if !prproj_fx::audio_effect_read(def.id) || def.id == "deesser" {
+                            // (a DeEsser that outputs the sibilance only is not FilmCraft's)
                             e.enabled = false;
                             *self.audio_off.entry(def.name.to_string()).or_insert(0) += 1;
                         }

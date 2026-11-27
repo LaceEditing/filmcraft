@@ -1744,3 +1744,118 @@ fn track_fader_pan_and_the_mix_fader_are_written_back() {
     let a2 = &back.sequence(seq_id(&back)).unwrap().audio_tracks[1];
     assert!((a2.volume_db + 12.0).abs() < 1e-9 && a2.lane(LANE_VOLUME).is_none_or(|l| l.keyframes.is_empty()), "{}", a2.volume_db);
 }
+
+/// An audio effect's state follows the parameters written (Premiere plays the state: as Premiere
+/// Pro 2027 saves it, a `ParamList` of every parameter after Bypass).
+#[test]
+fn an_audio_effects_state_takes_the_values_written() {
+    use prproj_fx::param_list;
+    // no state yet (an effect Premiere saved at its defaults): the whole list
+    let made = param_list(None, &[0.03125, 1.0, 0.75], &[false, false, true]).unwrap();
+    assert!(made.starts_with("<?xml version='1.0'?>\n<prop.map version='4'>"), "{made}");
+    let list = "<key>ParamList</key>\n<array>\n<array.type><float/></array.type>\n<float>0.03125</float>\n<float>1</float>\n<float>0.75</float>\n</array>";
+    assert!(made.contains(list), "{made}");
+    assert!(made.contains("<key>Type</key>\n<int type='signed' size='32'>0</int>") && made.ends_with("</prop.map>\n"));
+    // a factory preset by name is replaced by the list too
+    let preset = "<?xml version='1.0'?>\n<prop.map version='4'>\n<prop.list>\n<prop.pair>\n<key>FactoryPreset</key>\n<ustring>(Default)</ustring>\n</prop.pair>\n</prop.list>\n</prop.map>\n";
+    assert_eq!(param_list(Some(preset), &[0.03125, 1.0, 0.75], &[false, false, true]).as_deref(), Some(made.as_str()));
+    // a list Premiere wrote keeps its text but for the changed value
+    let theirs = made
+        .replace("<float>0.03125</float>", "<float>0.031250000</float>")
+        .replace("<int type='signed' size='32'>0</int>", "<int type='signed' size='32'>7</int>");
+    let again = param_list(Some(&theirs), &[0.5, 1.0, 0.25], &[false, false, true]).unwrap();
+    assert!(again.contains("<float>0.031250000</float>\n<float>1</float>\n<float>0.25</float>\n</array>"), "{again}");
+    assert!(again.contains("size='32'>7</int>"), "the rest of the state is kept");
+    // a 32-bit float, as Premiere holds it
+    assert!(param_list(None, &[1.0 / 3.0], &[true]).unwrap().contains("<float>0.33333334</float>"));
+    // another shape is left alone: a list of another length, or something else altogether
+    assert_eq!(param_list(Some(&theirs), &[0.5, 1.0], &[true, false]), None);
+    assert_eq!(param_list(Some("RIFF...."), &[0.5], &[true]), None);
+    assert_eq!(param_list(Some("<prop.map><key>ParamList</key><array><float>1"), &[0.5], &[true]), None);
+}
+
+/// The binary states Premiere Pro 2027 saves for some audio effects take the values written, in
+/// the effect's own units or the parameters' 0…1, whichever the state holds.
+#[test]
+fn an_audio_effects_binary_state_takes_the_values_written() {
+    use prproj_fx::{Conv, StateParam, binary_state, is_binary_state};
+    let listed = |version: u8, floats: &[f32]| {
+        let mut b = vec![version];
+        b.extend_from_slice(b" nafetS");
+        b.extend_from_slice(&(floats.len() as u32).to_le_bytes());
+        floats.iter().for_each(|f| b.extend_from_slice(&f.to_le_bytes()));
+        b
+    };
+    let floats = |b: &[u8]| -> Vec<f32> { b[12..].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect() };
+    let p = |old: f64, new: Option<f64>, conv: Option<Conv>| StateParam { old, new, conv, switch: false };
+    // Single-band Compressor: Gain, Threshold, Ratio, Attack, Release, Auto Makeup, in dB, :1, ms
+    let state = listed(1, &[0.0, 0.0, 1.0, 10.0, 100.0, 0.0]);
+    assert!(is_binary_state(&state) && !is_binary_state(b"<?xml version='1.0'?>"));
+    let params = [
+        p(0.5, None, Some(Conv::Lin(-30.0, 30.0))),
+        p(1.0, Some(0.5), Some(Conv::Lin(-60.0, 0.0))),
+        p(0.0, Some(7.0 / 29.0), Some(Conv::Lin(1.0, 30.0))),
+        p(0.02, None, Some(Conv::Lin(0.0, 500.0))),
+        p(0.02, None, Some(Conv::Lin(0.0, 5000.0))),
+        p(0.0, None, None),
+    ];
+    let made = binary_state(&state, &params).unwrap();
+    assert_eq!(&made[..12], &state[..12], "the header is kept");
+    assert_eq!(floats(&made), [0.0, -30.0, 8.0, 10.0, 100.0, 0.0]);
+    // DeReverb keeps the parameters' own 0…1 (Amount 40 % is 0.4), and one more float
+    let state = listed(2, &[0.4, 0.0, 1.0, 0.0, 0.0, 0.0]);
+    let params = [
+        p(0.4, Some(1.0), Some(Conv::Lin(0.0, 100.0))),
+        p(0.0, Some(0.25), Some(Conv::Lin(0.0, 20.0))),
+        p(1.0, Some(0.0), Some(Conv::Flag(1))),
+        p(0.0, None, None),
+        p(0.0, None, None),
+    ];
+    assert_eq!(floats(&binary_state(&state, &params).unwrap()), [1.0, 0.25, 0.0, 0.0, 0.0, 0.0]);
+    // Dynamics: the number of parameters, then each: a switch as one byte, another as a float
+    let mut rack = 4u32.to_le_bytes().to_vec();
+    rack.push(0);
+    rack.extend_from_slice(&(-20f32).to_le_bytes());
+    rack.extend_from_slice(&1f32.to_le_bytes());
+    let params = [
+        StateParam { old: 0.0, new: Some(1.0), conv: Some(Conv::Flag(1)), switch: true },
+        p(2.0 / 3.0, Some(0.5), Some(Conv::Lin(-60.0, 0.0))),
+        p(0.0, Some(3.0 / 7.0), Some(Conv::Lin(1.0, 8.0))),
+    ];
+    let made = binary_state(&rack, &params).unwrap();
+    assert_eq!(made[..5], [4, 0, 0, 0, 1]);
+    assert_eq!(f32::from_le_bytes(made[5..9].try_into().unwrap()), -30.0);
+    assert_eq!(f32::from_le_bytes(made[9..13].try_into().unwrap()), 4.0);
+    // a switch alone can be written though nothing says which units the state is in
+    let only_switch = [StateParam { old: 0.0, new: Some(1.0), conv: Some(Conv::Flag(1)), switch: true }, p(0.9, None, None), p(0.1, None, None)];
+    assert_eq!(binary_state(&rack, &only_switch).unwrap()[4], 1);
+    // left alone: a state that disagrees with the parameter it would replace, a changed
+    // parameter on an unknown scale, another count or length, anything cut short
+    let state = listed(1, &[0.0, -12.0, 1.0, 10.0, 100.0, 0.0]);
+    let single = |new_ratio: Option<f64>, threshold_conv: Option<Conv>| {
+        [
+            p(0.5, None, Some(Conv::Lin(-30.0, 30.0))),
+            p(1.0, Some(0.5), threshold_conv),
+            p(0.0, new_ratio, Some(Conv::Lin(1.0, 30.0))),
+            p(0.02, None, Some(Conv::Lin(0.0, 500.0))),
+            p(0.02, None, Some(Conv::Lin(0.0, 5000.0))),
+            p(0.0, None, None),
+        ]
+    };
+    assert_eq!(binary_state(&state, &single(None, Some(Conv::Lin(-60.0, 0.0)))), None, "the state says -12 dB, the parameter 0 dB");
+    let state = listed(1, &[0.0, 0.0, 1.0, 10.0, 100.0, 0.0]);
+    assert_eq!(binary_state(&state, &single(None, None)), None);
+    assert_eq!(binary_state(&state, &single(None, Some(Conv::Ratio))), None);
+    assert_eq!(binary_state(&rack, &single(None, Some(Conv::Lin(-60.0, 0.0)))), None);
+    for cut in 0..state.len() {
+        assert_eq!(binary_state(&state[..cut], &single(None, Some(Conv::Lin(-60.0, 0.0)))), None, "cut at {cut}");
+    }
+    for cut in 0..rack.len() {
+        assert_eq!(binary_state(&rack[..cut], &params), None, "cut at {cut}");
+    }
+    // hostile numbers are data: no panic, and a NaN never matches
+    let nan = listed(1, &[f32::NAN, f32::INFINITY, -f32::INFINITY, 1e38, -1e38, f32::MIN_POSITIVE]);
+    let _ = binary_state(&nan, &single(Some(f64::NAN), Some(Conv::Lin(-60.0, 0.0))));
+    let _ = binary_state(&[0xff; 64], &params);
+    let _ = binary_state(&[], &[]);
+}

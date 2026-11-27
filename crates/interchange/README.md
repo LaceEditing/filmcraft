@@ -184,6 +184,32 @@ committed).
   `Number of X/Y Pairs` (n·7) points `Location1…7` → `Value1…7`, both in dB = 100·n − 100; one that
   is the identity line up to a knee and straight above it comes in as a threshold / ratio
   compressor, with `Peak/RMS` (1 Peak, 0 RMS) and Output Gain (96·n − 48 dB).
+- An audio effect keeps its settings twice: as the component's parameters, and as the effect's
+  own state in the component's `OpaqueData`. **Premiere plays the state**: a setting written into
+  the parameters alone shows in no render (Premiere Pro 27.0: Amplify +6 dB written that way
+  played at 0 dB). The writer keeps the state in step with the parameters it writes
+  (`prproj_fx::param_list`, `binary_state`). As Premiere Pro 2027 saves it, the state is one of:
+  - nothing, or a property list naming a factory preset (`FactoryPreset` `(Default)`): an effect
+    never changed. Writing a setting replaces it with the next form.
+  - a property list (`prop.map` version 4) whose `ParamList` is an array of floats, one per
+    parameter after Bypass, in order, each the parameter's own 0…1 (one saved with no value is
+    1), then `Type` 0 and `Version` 1 (Amplify, Parametric Equalizer, Hard Limiter, Studio
+    Reverb, Tube-modeled Compressor, Bandpass, Notch Filter, Dynamics Processing).
+  - binary: a byte, `" nafetS"`, a 32-bit count, then one little-endian float per parameter
+    after Bypass, in the effect's own units (DeEsser: −30 dB, 100 ms, 5000 Hz…; Single-band and
+    Multiband Compressor) or, in DeReverb's, the parameters' 0…1 (Amount 40 % is 0.4; it has one
+    more float at the end).
+  - binary, Dynamics: the number of parameters as 32 bits, then each parameter after Bypass in
+    order: a switch (`… Enabled`) as one byte, any other as a float in its own units.
+
+  The state's `BinaryHash` is the title payloads' (28 hex digits, then length + 12). Which units
+  a binary state holds is read from the state itself, and a changed value is only written where
+  the state agreed with the parameter it replaces; otherwise the writer reports that Premiere
+  keeps its own settings. Simple effects (Bass, Treble, Highpass, Lowpass, Delay) have no state:
+  Premiere plays their parameters.
+- Bandpass's `Q` is 0.1 + 9.9·n² (2.575 at its default 0.5), as its `Cutoff` is a square law.
+  DeEsser's scales (Threshold −80·(1 − n) dB, Center Frequency 500 + 11 500·n Hz, Bandwidth
+  100 + 7 400·n Hz, Mode 1 Multiband) are written back as they are read.
 - Pan and the mixer: a clip's pan is its own `AudioClipTrackItem/Panner` → `StereoToStereoPanProcessor`
   (parameter `Balance`) or `MonoToStereoPanProcessor` (`Pan`), both 0…1 with the centre at 0.5 and
   `IsInverted` true; a clip whose pan was never changed has no `Panner`. Each `AudioClipTrack`'s

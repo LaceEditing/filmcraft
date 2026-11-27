@@ -203,6 +203,11 @@ pub(crate) const AUDIO_PARAMS: &[(&str, &str, &str, Conv)] = &[
     // Make-Up n 0.5 with Auto Gain off brings Premiere's level up by 10.0 dB (Round 5 B2.5)
     ("dereverb", "Auto Gain", "auto_gain", Conv::Flag(1)),
     ("dereverb", "Make-Up Gain", "makeup", Conv::Lin(0.0, 20.0)),
+    // the scales of [`deesser_settings`], which reads them; these write them back
+    ("deesser", "Mode", "mode", Conv::Choice(2)),
+    ("deesser", "Center Frequency", "frequency", Conv::Lin(500.0, 12000.0)),
+    ("deesser", "Bandwidth", "bandwidth", Conv::Lin(100.0, 7500.0)),
+    ("deesser", "Threshold", "threshold", Conv::Lin(-80.0, 0.0)),
     ("dynamics_rack", "AutoGate Enabled", "gate_on", Conv::Flag(1)),
     ("dynamics_rack", "AutoGate Threshold", "gate_threshold", Conv::Lin(-60.0, 0.0)),
     ("dynamics_rack", "Compressor Enabled", "comp_on", Conv::Flag(1)),
@@ -239,6 +244,9 @@ pub(crate) const AUDIO_PARAMS: &[(&str, &str, &str, Conv)] = &[
     ("highpass", "Cutoff", "cutoff", Conv::Sq(10.0, 23770.0)),
     ("lowpass", "Cutoff", "cutoff", Conv::Sq(10.0, 23770.0)),
     ("bandpass", "Cutoff", "center", Conv::Sq(10.0, 23770.0)),
+    // Q 0.1 at 0, 2.575 at 0.5 (the default), 10 at 1: a second-order band-pass of that Q
+    // fits Premiere Pro 27.0's renders at 0.1, 0.25, 0.5, 0.75 and 1 within 0.02 dB
+    ("bandpass", "Q", "q", Conv::Sq(0.1, 10.0)),
     ("pitch_shifter", "Transpose Ratio", "semitones", Conv::Ratio),
     ("loudness_radar", "Target Loudness", "target", Conv::Lin(-36.0, -6.0)),
     ("parametric_eq", "Gain", "master_gain", Conv::Lin(-96.0, 48.0)),
@@ -779,7 +787,7 @@ pub(crate) fn decode(p: Node<'_, '_>, conv: Conv) -> Option<Canon> {
     }
     // an audio effect setting at 1 (the top of its 0…1 range) is saved with no value at all
     let audio_top = || {
-        (matches!(conv, Conv::Lin(..) | Conv::Sq(..) | Conv::Ratio | Conv::FxDb | Conv::Flag(_) | Conv::Slope)
+        (matches!(conv, Conv::Lin(..) | Conv::Sq(..) | Conv::Ratio | Conv::FxDb | Conv::Flag(_) | Conv::Slope | Conv::Choice(2..))
             && p.attribute("ClassID").is_some_and(|c| c.starts_with(AUDIO_PARAM_CLASS)))
         .then_some(Val::F(1.0))
     };
@@ -958,6 +966,188 @@ pub(crate) fn fader_canon(p: &Param, floor: f64) -> Option<Canon> {
         (k.in_slope, k.out_slope) = (None, None);
     }
     from_param(&linear, Conv::Float, &Ctx { speed: 1.0, frame: (0.0, 0.0), src: (0.0, 0.0) })
+}
+
+/// The number a parameter's new text gives it (its `StartKeyframe` value), for an audio effect's
+/// state ([`param_list`]).
+pub(crate) fn state_value(t: &ParamText) -> Option<f64> {
+    t.start_keyframe.split(',').nth(1)?.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// An audio effect's own state with new values.
+///
+/// Premiere's audio effects keep their settings twice: as the component's parameters, and in its
+/// `OpaqueData`, the effect's own state, which is what Premiere plays when it opens a project. As
+/// Premiere Pro 2027 saves an effect once a setting was changed, that state is a property list
+/// whose `ParamList` holds every parameter after the first (Bypass) as a 32-bit float, in order
+/// (one saved with no value, the top of its range, is 1); an effect left at its defaults has no
+/// list (no state at all, or a reference to a factory preset). `values` are the parameters' values after Bypass, in order;
+/// `changed` says which of them are new. An existing list keeps its text but for the changed
+/// values; without one, a list is made of all of them. `None`: the state is in another shape
+/// (a list of another length, something that is not a property list) and is left alone.
+pub(crate) fn param_list(state: Option<&str>, values: &[f64], changed: &[bool]) -> Option<String> {
+    let float = |v: f64| format!("<float>{}</float>", v as f32);
+    let has_list = state.is_some_and(|s| s.contains("<key>ParamList</key>"));
+    let Some(state) = state.filter(|_| has_list) else {
+        // nothing there, or a factory preset by name: the whole list
+        if state.is_some_and(|s| !s.trim().is_empty() && !s.contains("<key>FactoryPreset</key>")) {
+            return None;
+        }
+        let floats: String = values.iter().map(|v| format!("{}\n", float(*v))).collect();
+        return Some(format!(
+            "<?xml version='1.0'?>\n<prop.map version='4'>\n<prop.list>\n<prop.pair>\n<key>ParamList</key>\n<array>\n<array.type><float/></array.type>\n{floats}</array>\n</prop.pair>\n<prop.pair>\n<key>Type</key>\n<int type='signed' size='32'>0</int>\n</prop.pair>\n<prop.pair>\n<key>Version</key>\n<float>1</float>\n</prop.pair>\n</prop.list>\n</prop.map>\n"
+        ));
+    };
+    let start = state.find("<key>ParamList</key>")?;
+    let end = start + state.get(start..)?.find("</array>")?;
+    let body = state.get(start..end)?;
+    // the list's floats, by position in the text
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(i) = body.get(at..).and_then(|b| b.find("<float>")) {
+        let open = at + i;
+        let close = open + body.get(open..)?.find("</float>")? + "</float>".len();
+        spans.push((open, close));
+        at = close;
+    }
+    if spans.len() != values.len() {
+        return None;
+    }
+    let mut out = String::with_capacity(state.len() + 16);
+    out.push_str(state.get(..start)?);
+    let mut last = 0;
+    for (i, (open, close)) in spans.iter().enumerate() {
+        out.push_str(body.get(last..*open)?);
+        match (values.get(i), changed.get(i)) {
+            (Some(v), Some(true)) => out.push_str(&float(*v)),
+            _ => out.push_str(body.get(*open..*close)?),
+        }
+        last = *close;
+    }
+    out.push_str(body.get(last..)?);
+    out.push_str(state.get(end..)?);
+    Some(out)
+}
+
+/// One parameter after Bypass, for an audio effect's binary state ([`binary_state`]).
+pub(crate) struct StateParam {
+    /// The number the project has for it (0…1; none saved is 1).
+    pub old: f64,
+    /// The number written now, when it changed.
+    pub new: Option<f64>,
+    /// How the number reads in the effect's own units, when FilmCraft knows.
+    pub conv: Option<Conv>,
+    /// An on/off switch ("… Enabled"): one byte in the Dynamics effect's state.
+    pub switch: bool,
+}
+
+/// Whether an effect's state is binary (a text state is a property list: [`param_list`]).
+pub(crate) fn is_binary_state(state: &[u8]) -> bool {
+    state.contains(&0) || std::str::from_utf8(state).is_err()
+}
+
+/// A 0…1 setting in the effect's own units, for the conversions an audio effect's state uses.
+fn state_units(conv: Conv, n: f64) -> Option<f64> {
+    match conv {
+        Conv::Lin(lo, hi) => Some(lo + (hi - lo) * n),
+        Conv::Sq(lo, hi) => Some(lo + (hi - lo) * n * n),
+        Conv::Flag(_) | Conv::Bool | Conv::Choice(_) => Some(n),
+        _ => None,
+    }
+}
+
+/// An audio effect's binary state with new values.
+///
+/// Some of Premiere's audio effects keep their state ([`param_list`]) as numbers, not text. Two
+/// layouts, as Premiere Pro 2027 saves them:
+/// - a byte, `" nafetS"`, a 32-bit count, then one little-endian 32-bit float per parameter after
+///   Bypass, in order (DeEsser, DeReverb, Single-band and Multiband Compressor; DeReverb's has
+///   one more float at the end);
+/// - the number of parameters as 32 bits, then every parameter after Bypass in order, a switch
+///   as one byte and any other as a float (Dynamics).
+///
+/// The floats are in the effect's own units (a DeEsser Threshold of −30 dB is −30, its 0.625 as a
+/// parameter) or, in DeReverb's state, the parameters' own 0…1. Which, is read from the state:
+/// from the parameters whose two forms differ. A changed value is written only where the state
+/// agrees with the parameter it replaces. `None`: another layout, a state that does not agree
+/// with its parameters, or a changed parameter on a scale FilmCraft does not know; the state is
+/// then left alone.
+pub(crate) fn binary_state(state: &[u8], params: &[StateParam]) -> Option<Vec<u8>> {
+    // where each parameter's value is, and how many bytes it has
+    let mut places = Vec::with_capacity(params.len());
+    if state.get(1..8) == Some(b" nafetS".as_slice()) {
+        for i in 0..params.len() {
+            places.push((12usize.checked_add(i.checked_mul(4)?)?, 4usize));
+        }
+        if state.len() < 12usize.checked_add(params.len().checked_mul(4)?)? {
+            return None;
+        }
+    } else {
+        let count = u32::from_le_bytes(state.get(..4)?.try_into().ok()?);
+        if count as usize != params.len().checked_add(1)? {
+            return None;
+        }
+        let mut at = 4usize;
+        for p in params {
+            let size = if p.switch { 1 } else { 4 };
+            places.push((at, size));
+            at = at.checked_add(size)?;
+        }
+        if at != state.len() {
+            return None;
+        }
+    }
+    let read = |(at, size): (usize, usize)| -> Option<f64> {
+        let b = state.get(at..at.checked_add(size)?)?;
+        Some(match size {
+            1 => f64::from(*b.first()?),
+            _ => f64::from(f32::from_le_bytes(b.try_into().ok()?)),
+        })
+    };
+    let near = |a: f64, b: f64| (a - b).abs() <= 2e-3 * a.abs().max(b.abs()).max(1.0);
+    // the units the state is in: the parameters whose two forms differ say
+    let (mut own, mut unit) = (0usize, 0usize);
+    for (p, place) in params.iter().zip(&places) {
+        let Some(real) = p.conv.and_then(|c| state_units(c, p.old)) else { continue };
+        if near(real, p.old) {
+            continue;
+        }
+        let have = read(*place)?;
+        own += usize::from(near(have, real));
+        unit += usize::from(near(have, p.old));
+    }
+    let in_own_units = match (own, unit) {
+        (1.., 0) => Some(true),
+        (0, 1..) => Some(false),
+        // nothing tells them apart: only a value that is the same either way can be written
+        (0, 0) => None,
+        _ => return None,
+    };
+    let mut out = state.to_vec();
+    for (p, place) in params.iter().zip(&places) {
+        let Some(new) = p.new else { continue };
+        let conv = p.conv?;
+        let form = |n: f64| -> Option<f64> {
+            let real = state_units(conv, n)?;
+            match in_own_units {
+                Some(true) => Some(real),
+                Some(false) => Some(n),
+                None => near(real, n).then_some(n),
+            }
+        };
+        // the state has to agree with the parameter it replaces
+        if !near(read(*place)?, form(p.old)?) {
+            return None;
+        }
+        let v = form(new)?;
+        let (at, size) = *place;
+        let slot = out.get_mut(at..at.checked_add(size)?)?;
+        match size {
+            1 => slot.copy_from_slice(&[u8::from(v >= 0.5)]),
+            _ => slot.copy_from_slice(&(v as f32).to_le_bytes()),
+        }
+    }
+    Some(out)
 }
 
 /// FilmCraft → Premiere. `None` when the value has another shape than the conversion expects.
