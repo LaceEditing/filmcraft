@@ -473,7 +473,7 @@ fn push_tracks(sc: Scene, layers: &mut PlanStack) {
         }
         if let Some(trn) = tr.transitions.iter().find(|x| x.range().contains(t)) {
             // These dissolves are symmetric: Reverse (play B→A backwards) renders the same frames.
-            let p = trn.progress(t) as f32;
+            let p = crate::transitions::video_progress(trn, t, seq.settings.frame_rate.frame_duration());
             let a = trn.from.and_then(|id| tr.item(id)).filter(|i| i.enabled);
             let b = trn.to.and_then(|id| tr.item(id)).filter(|i| i.enabled);
             match trn.effect.effect.as_str() {
@@ -507,12 +507,13 @@ fn push_tracks(sc: Scene, layers: &mut PlanStack) {
                     }
                 }
                 _ => {
-                    // cross dissolve: A at full, B over it at p (premultiplied over == linear mix when A is opaque)
+                    // cross dissolve: A at full, B over it at p, mixed on the encoded values as
+                    // Premiere's (`blend::code_lerp`: "over" is that mix when A is opaque)
                     if let Some(it) = a {
                         push_item(sc, it, 1.0 - if b.is_none() { p } else { 0.0 }, Some(Blend::Normal), layers);
                     }
                     if let Some(it) = b {
-                        push_item(sc, it, p, Some(Blend::Normal), layers);
+                        push_item(sc, it, p, Some(if a.is_some() { Blend::MixCode } else { Blend::Normal }), layers);
                     }
                 }
             }

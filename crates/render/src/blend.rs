@@ -1,6 +1,9 @@
 //! Blend modes (Premiere's 27), composited on premultiplied linear-light images.
 //!
-//! Normal is computed in linear light. The other modes are defined on display-encoded values (as
+//! Normal is computed in linear light; a Normal layer less than fully opaque mixes with what is
+//! under it on Premiere's linear light, a 2.4 power of the encoded values ([`curve_mix`]). The
+//! internal [`Blend::MixCode`] mixes the encoded values themselves (Cross Dissolve). The other modes
+//! are defined on display-encoded values (as
 //! artists expect from every editing app), so their math runs on sRGB-encoded straight colour, and,
 //! as in Premiere (with Composite in Linear Color on or off), the result is mixed with the
 //! backdrop by the top layer's alpha on those encoded values too, then converted back to linear.
@@ -45,6 +48,10 @@ pub enum Blend {
     Saturation,
     Color,
     Luminosity,
+    /// Not a blend mode of Premiere's menu: Normal "over" on the encoded values, as Premiere's
+    /// Cross Dissolve mixes its two sides (measured on Premiere Pro 27.0: the 8-bit values mix
+    /// in proportion). Not in [`Blend::ALL`]; its [`Blend::index`] is 27.
+    MixCode,
 }
 
 impl Blend {
@@ -79,6 +86,9 @@ impl Blend {
     ];
     /// Position in [`Blend::ALL`] (= `filmcraft_project::effect::BLEND_MODES`).
     pub fn index(self) -> u32 {
+        if self == Blend::MixCode {
+            return MIX_CODE_INDEX;
+        }
         Self::ALL.iter().position(|b| *b == self).unwrap_or(0) as u32
     }
     /// Whether compositing needs the destination colour (every mode but Normal and Dissolve,
@@ -90,6 +100,83 @@ impl Blend {
     pub fn from_index(i: u32) -> Blend {
         Self::ALL.get(i as usize).copied().unwrap_or(Blend::Normal)
     }
+}
+
+/// [`Blend::MixCode`]'s index (the GPU compositor's mode number).
+pub const MIX_CODE_INDEX: u32 = 27;
+
+/// The power of Premiere's linear light: with Composite in Linear Color on (its default), Premiere
+/// Pro 27.0 mixes a layer at 25, 50 and 75 % opacity with the layer under it as `v^2.4` of the 8-bit
+/// values (mean error 0.22 code values over a 17 x 17 grid of levels; the sRGB curve, 1.35).
+pub const MIX_GAMMA: f32 = 2.4;
+
+/// Whether a layer at `opacity` in `mode` mixes on Premiere's linear light ([`curve_mix`]).
+pub fn mixes_on_curve(mode: Blend, opacity: f32) -> bool {
+    mode == Blend::Normal && opacity < 1.0 && opacity > 0.0
+}
+
+/// `v` within 0..1, a NaN as 0.
+#[inline]
+fn unit(v: f32) -> f32 {
+    if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) }
+}
+
+/// A straight linear-light value (FilmCraft's: sRGB) on Premiere's mixing scale.
+#[inline]
+fn to_mix(v: f32) -> f32 {
+    linear_to_srgb(unit(v)).powf(MIX_GAMMA)
+}
+
+#[inline]
+fn from_mix(v: f32) -> f32 {
+    srgb_to_linear(unit(v).powf(1.0 / MIX_GAMMA))
+}
+
+/// Premultiplied `s` over premultiplied `d`, the colours mixed on Premiere's linear light (a
+/// [`MIX_GAMMA`] power of the encoded values) instead of FilmCraft's.
+pub fn curve_mix(d: [f32; 4], s: [f32; 4]) -> [f32; 4] {
+    let (sa, da) = (s[3], d[3]);
+    if sa <= 0.0 {
+        return d;
+    }
+    if da <= 0.0 || sa >= 1.0 {
+        let k = 1.0 - sa;
+        return [s[0] + d[0] * k, s[1] + d[1] * k, s[2] + d[2] * k, s[3] + d[3] * k];
+    }
+    let ao = sa + da - sa * da;
+    let mut out = [0.0, 0.0, 0.0, ao];
+    for c in 0..3 {
+        let m = (sa * to_mix(s[c] / sa) + (1.0 - sa) * da * to_mix(d[c] / da)) / ao;
+        out[c] = from_mix(m) * ao;
+    }
+    out
+}
+
+/// Premultiplied `a` and `b` mixed `k` of the way to `b` on the encoded values (Premiere's Cross
+/// Dissolve): alpha mixes in proportion, colour as its alpha-weighted encoded value.
+pub fn code_lerp(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
+    lerp_on(a, b, k, |v| linear_to_srgb(unit(v)), |v| srgb_to_linear(unit(v)))
+}
+
+/// [`code_lerp`] on Premiere's linear light ([`MIX_GAMMA`]; its Film Dissolve).
+pub fn curve_lerp(a: [f32; 4], b: [f32; 4], k: f32) -> [f32; 4] {
+    lerp_on(a, b, k, to_mix, from_mix)
+}
+
+#[inline]
+fn lerp_on(a: [f32; 4], b: [f32; 4], k: f32, enc: impl Fn(f32) -> f32, dec: impl Fn(f32) -> f32) -> [f32; 4] {
+    let (wa, wb) = (a[3] * (1.0 - k), b[3] * k);
+    let oa = wa + wb;
+    if oa <= 0.0 {
+        return [0.0; 4];
+    }
+    let mut out = [0.0, 0.0, 0.0, oa];
+    for c in 0..3 {
+        let ea = if a[3] > 0.0 { enc(a[c] / a[3]) } else { 0.0 };
+        let eb = if b[3] > 0.0 { enc(b[c] / b[3]) } else { 0.0 };
+        out[c] = dec((wa * ea + wb * eb) / oa) * oa;
+    }
+    out
 }
 
 /// Hard Mix's tolerance below `b + s = 1`.
@@ -286,7 +373,7 @@ pub fn composite_at(dst: &mut Image, src: &Image, x0: usize, y0: usize, opacity:
             // a blended layer with nothing under it is drawn as it is, at full opacity: Premiere
             // 26.5 draws a picture alone on V1 in Color or Multiply at 100, 50 and 0 % opaque and
             // unchanged (Round 5 A4 probe; Normal at 50 % is half transparent, at 0 % not drawn)
-            if mode.reads_destination() && da <= 0.0 {
+            if mode.reads_destination() && mode != Blend::MixCode && da <= 0.0 {
                 let k = 1.0 - s[j + 3];
                 for c in 0..4 {
                     d[i + c] = s[j + c] + d[i + c] * k;
@@ -304,7 +391,13 @@ pub fn composite_at(dst: &mut Image, src: &Image, x0: usize, y0: usize, opacity:
                 }
                 sp = [sp[0] / sa, sp[1] / sa, sp[2] / sa, 1.0];
             }
-            if mode == Blend::Normal || mode == Blend::Dissolve {
+            if mixes_on_curve(mode, opacity) {
+                let o = curve_mix([d[i], d[i + 1], d[i + 2], da], sp);
+                d[i..i + 4].copy_from_slice(&o);
+                continue;
+            }
+            // (MixCode over nothing: plain "over")
+            if mode == Blend::Normal || mode == Blend::Dissolve || (mode == Blend::MixCode && da <= 0.0) {
                 let k = 1.0 - sp[3];
                 for c in 0..4 {
                     d[i + c] = sp[c] + d[i + c] * k;
@@ -337,6 +430,59 @@ mod tests {
         let s = Image::filled(2, 1, [0.0, 0.25, 0.0, 0.5]);
         composite(&mut d, &s, 1.0, Blend::Normal);
         assert_eq!(d.get(0, 0), [0.25, 0.25, 0.0, 1.0]);
+    }
+
+    /// Premiere Pro 27.0's own pixels (the compositing kit: a grey ramp at 25, 50 and 75 % over
+    /// another): (opacity, top level, bottom level, Premiere's level), within 1 (the kit samples
+    /// its ramps to the nearest level).
+    #[test]
+    fn opacity_mixes_as_premieres_does() {
+        let cases = [
+            (0.25, 255, 0, 143),
+            (0.25, 0, 64, 57),
+            (0.25, 128, 32, 75),
+            (0.25, 64, 192, 172),
+            (0.5, 255, 0, 191),
+            (0.5, 0, 64, 48),
+            (0.5, 128, 32, 97),
+            (0.5, 255, 128, 205),
+            (0.75, 32, 0, 28),
+            (0.75, 64, 192, 117),
+            (0.75, 255, 128, 232),
+        ];
+        for (opacity, top, bottom, want) in cases {
+            let lin = |v: i32| srgb_to_linear(v as f32 / 255.0);
+            let mut d = Image::filled(1, 1, [lin(bottom), lin(bottom), lin(bottom), 1.0]);
+            composite(&mut d, &Image::filled(1, 1, [lin(top), lin(top), lin(top), 1.0]), opacity, Blend::Normal);
+            let got = (linear_to_srgb(d.get(0, 0)[0]) * 255.0).round() as i32;
+            assert!((got - want).abs() <= 1, "{top} at {opacity} over {bottom}: {got}, Premiere {want}");
+        }
+        // fully opaque and fully transparent layers are untouched by the curve
+        let mut d = Image::filled(1, 1, [0.2, 0.3, 0.4, 1.0]);
+        composite(&mut d, &Image::filled(1, 1, [0.5, 0.5, 0.5, 1.0]), 1.0, Blend::Normal);
+        assert_eq!(d.get(0, 0), [0.5, 0.5, 0.5, 1.0]);
+        // over nothing, a half-opaque layer is itself at half alpha
+        let mut d = Image::filled(1, 1, [0.0; 4]);
+        composite(&mut d, &Image::filled(1, 1, [0.5, 0.25, 0.0, 1.0]), 0.5, Blend::Normal);
+        assert_eq!(d.get(0, 0), [0.25, 0.125, 0.0, 0.5]);
+    }
+
+    /// Premiere's Cross Dissolve mixes the encoded values: red and blue half way are 0.5 encoded.
+    #[test]
+    fn code_lerp_mixes_encoded_values() {
+        let o = code_lerp([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], 0.5);
+        assert!((linear_to_srgb(o[0]) - 0.5).abs() < 1e-5 && (linear_to_srgb(o[2]) - 0.5).abs() < 1e-5 && o[3] == 1.0, "{o:?}");
+        // with transparency the colour is alpha-weighted; nothing on both sides stays nothing
+        assert_eq!(code_lerp([0.0; 4], [0.0; 4], 0.3), [0.0; 4]);
+        let o = code_lerp([0.0; 4], [0.5, 0.0, 0.0, 0.5], 0.5);
+        assert!((o[3] - 0.25).abs() < 1e-6 && (o[0] / o[3] - 1.0).abs() < 1e-5, "{o:?}");
+        // hostile values stay finite
+        for v in [f32::NAN, f32::INFINITY, -1.0, 1e30] {
+            let o = code_lerp([v, v, v, 1.0], [v, 0.0, 0.0, 1.0], 0.5);
+            assert!(o.iter().all(|x| x.is_finite()), "{v}: {o:?}");
+            let o = curve_mix([v, v, v, 1.0], [v * 0.5, 0.0, 0.0, 0.5]);
+            assert!(o.iter().all(|x| x.is_finite()), "{v}: {o:?}");
+        }
     }
 
     #[test]

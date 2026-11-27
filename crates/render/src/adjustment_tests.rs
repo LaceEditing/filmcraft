@@ -257,6 +257,19 @@ fn at(s: &Scene, frame: i64) -> [f32; 4] {
     render_sequence(&s.p, s.seq, R.tick_of(frame), RenderOptions::default(), &s.map).get(160, 90)
 }
 
+/// How far a 12-frame dissolve starting at `start` is at `frame` (Premiere's eased timing, a frame
+/// drawn at its end: `transitions::video_progress`).
+fn eased(frame: i64, start: i64) -> f32 {
+    crate::transitions::smoothstep(0.0, 1.0, ((frame + 1 - start) as f32 / 12.0).clamp(0.0, 1.0))
+}
+
+/// Opaque `top` at `k` over opaque `under`, mixed as a layer at that opacity is (Premiere's
+/// linear light: `blend::curve_mix`).
+fn faded(under: [f32; 3], top: [f32; 3], k: f32) -> [f32; 3] {
+    let o = crate::blend::curve_mix([under[0], under[1], under[2], 1.0], [top[0] * k, top[1] * k, top[2] * k, k]);
+    [o[0], o[1], o[2]]
+}
+
 /// A dissolve at the start of an adjustment layer (Cmd+D) fades its effects in, and one at its
 /// end fades them out, instead of leaving them off for the transition and cutting in after it.
 #[test]
@@ -268,14 +281,18 @@ fn a_dissolve_fades_the_adjustment_layers_effects_in_and_out() {
     fx(&mut s, adj, "invert");
     dissolve(&mut s, 1, None, Some(adj), 0);
     dissolve(&mut s, 1, Some(adj), None, 36);
-    // fade in over frames 0..12: red → halfway → cyan
-    assert!(near(at(&s, 0), [1.0, 0.0, 0.0], 1e-3), "{:?}", at(&s, 0));
-    assert!(near(at(&s, 3), [0.75, 0.25, 0.25], 1e-3), "a quarter in: {:?}", at(&s, 3));
-    assert!(near(at(&s, 6), [0.5, 0.5, 0.5], 1e-3), "halfway in: {:?}", at(&s, 6));
-    assert!(near(at(&s, 24), [0.0, 1.0, 1.0], 1e-3), "{:?}", at(&s, 24));
+    // fade in over frames 0..12: the inverted picture (cyan) over red at the dissolve's opacity
+    let (red, cyan) = ([1.0, 0.0, 0.0], [0.0, 1.0, 1.0]);
+    for f in [0, 3, 5, 6, 11] {
+        assert!(near(at(&s, f), faded(red, cyan, eased(f, 0)), 1e-3), "frame {f}: {:?}", at(&s, f));
+    }
+    // halfway (the frame before the middle) is half on Premiere's light, more than half encoded
+    assert!(filmcraft_color::linear_to_srgb(at(&s, 5)[1]) > 0.7, "{:?}", at(&s, 5));
+    assert!(near(at(&s, 24), cyan, 1e-3), "{:?}", at(&s, 24));
     // fade out over frames 36..48
-    assert!(near(at(&s, 42), [0.5, 0.5, 0.5], 1e-3), "halfway out: {:?}", at(&s, 42));
-    assert!(near(at(&s, 45), [0.75, 0.25, 0.25], 1e-3), "three quarters out: {:?}", at(&s, 45));
+    for f in [36, 41, 42, 45] {
+        assert!(near(at(&s, f), faded(red, cyan, 1.0 - eased(f, 36)), 1e-3), "frame {f}: {:?}", at(&s, f));
+    }
 }
 
 /// The layer's own opacity and blend mode still count during the fade.
@@ -288,16 +305,20 @@ fn a_dissolve_on_an_adjustment_layer_keeps_its_opacity_and_blend_mode() {
     fx(&mut s, adj, "invert");
     clip(&mut s, adj).effect_mut("opacity").unwrap().params.get_mut("opacity").unwrap().value = ParamValue::Float(50.0);
     dissolve(&mut s, 1, None, Some(adj), 0);
-    // halfway through the fade, at 50 % opacity: a quarter of the way to cyan
-    assert!(near(at(&s, 6), [0.75, 0.25, 0.25], 1e-3), "{:?}", at(&s, 6));
-    // Multiply (red × cyan = black) fades from red to black. Halfway, the fade is alpha ½ on a
-    // Multiply layer, which (as in Premiere, `blend::composite`) mixes the blend with the backdrop
-    // on encoded values: encoded ½ red.
+    // through the fade, at 50 % opacity: the layer as it is after the fade (half way to cyan) at
+    // the dissolve's opacity
+    let red = [1.0, 0.0, 0.0];
+    let after = at(&s, 24);
+    assert!(after[1] > 0.1 && after[0] < 0.9, "half way to cyan: {after:?}");
+    assert!(near(at(&s, 6), faded(red, [after[0], after[1], after[2]], eased(6, 0)), 1e-3), "{:?}", at(&s, 6));
+    // Multiply (red × cyan = black) fades from red to black: the fade's opacity on a Multiply
+    // layer, which (as in Premiere, `blend::composite`) mixes the blend with the backdrop on
+    // encoded values.
     let op = clip(&mut s, adj).effect_mut("opacity").unwrap();
     op.params.get_mut("opacity").unwrap().value = ParamValue::Float(100.0);
     op.params.get_mut("blend").unwrap().value =
         ParamValue::Choice(filmcraft_project::effect::BLEND_MODES.iter().position(|b| *b == "Multiply").unwrap() as u32);
-    assert!(near(at(&s, 6), [filmcraft_color::srgb_to_linear(0.5), 0.0, 0.0], 1e-3), "{:?}", at(&s, 6));
+    assert!(near(at(&s, 6), [filmcraft_color::srgb_to_linear(1.0 - eased(6, 0)), 0.0, 0.0], 1e-3), "{:?}", at(&s, 6));
     assert!(near(at(&s, 24), [0.0, 0.0, 0.0], 1e-3), "{:?}", at(&s, 24));
 }
 
@@ -321,8 +342,9 @@ fn a_transition_with_an_adjustment_layer_is_not_planned_as_layers() {
     let q = s.p.sequence(s.seq).unwrap();
     // frame 20 is still on the blue clip, but the dissolve into the adjustment layer shows
     assert!(!crate::plan::layered_at(&s.p, q, R.tick_of(20), 1.0, crate::plan::DeviceCaps::ALL));
-    // halfway (frame 24): half blue, half the inverted red (cyan)
-    assert!(near(at(&s, 24), [0.0, 0.5, 1.0], 1e-3), "{:?}", at(&s, 24));
+    // at the cut (frame 24): blue and the inverted red (cyan) mixed on the encoded values, past
+    // half (the eased dissolve's middle is the frame before)
+    assert!(near(at(&s, 24), [0.0, filmcraft_color::srgb_to_linear(eased(24, 18)), 1.0], 1e-3), "{:?}", at(&s, 24));
 }
 
 /// The picture's bounds (in sequence pixels) and the share of the frame it covers.

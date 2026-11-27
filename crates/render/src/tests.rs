@@ -180,9 +180,15 @@ fn cross_dissolve_midpoint() {
         reverse: false,
     };
     p.sequence_mut(seq).unwrap().video_tracks[0].transitions.push(tr);
-    let img = render_sequence(&p, seq, r.tick_of(24), RenderOptions::default(), &map);
-    let c = img.get(10, 10);
-    assert!((c[0] - 0.5).abs() < 0.05 && (c[2] - 0.5).abs() < 0.05, "{c:?}");
+    // Premiere's midpoint is the frame before the cut (a frame is drawn at its end), where the
+    // two mix half and half on the encoded values: 0.5 encoded red and blue
+    let half = filmcraft_color::srgb_to_linear(0.5);
+    let c = render_sequence(&p, seq, r.tick_of(23), RenderOptions::default(), &map).get(10, 10);
+    assert!((c[0] - half).abs() < 1e-3 && (c[2] - half).abs() < 1e-3 && c[1].abs() < 1e-6, "{c:?}");
+    // eased: a frame on, more than 7/12 of the way
+    let c = render_sequence(&p, seq, r.tick_of(24), RenderOptions::default(), &map).get(10, 10);
+    let k = crate::transitions::smoothstep(0.0, 1.0, 7.0 / 12.0);
+    assert!((filmcraft_color::linear_to_srgb(c[2]) - k).abs() < 1e-3 && k > 7.0 / 12.0, "{c:?}");
     // Iris Round at 50 %: B opens in the centre; reversed, A closes into the centre instead.
     for reverse in [false, true] {
         let trs = &mut p.sequence_mut(seq).unwrap().video_tracks[0].transitions;

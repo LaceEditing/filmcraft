@@ -1022,7 +1022,7 @@ impl GpuCompositor {
         depth: u32,
         clear: bool,
     ) {
-        let backdrop = if layers.iter().any(|l| l.blend.reads_destination()) { Some(self.backdrop(w, h)) } else { None };
+        let backdrop = if layers.iter().any(reads_backdrop) { Some(self.backdrop(w, h)) } else { None };
         // Layers whose effects the GPU stage can't run (no stage on this device, or a working image
         // larger than a texture), and groups too large for a texture (or nested implausibly deep),
         // are rendered on the CPU here and drawn as plain RGBA layers.
@@ -1159,7 +1159,7 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&tex[2]) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&tex[3]) },
             ];
-            let (layout, region) = match (&backdrop, l.blend.reads_destination()) {
+            let (layout, region) = match (&backdrop, reads_backdrop(l)) {
                 (Some(b), true) => {
                     entries.push(wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&b.1) });
                     (&self.blend_bgl, Some(quad_bounds(l, w, h)))
@@ -1543,6 +1543,13 @@ fn accum_pass<'e>(enc: &'e mut wgpu::CommandEncoder, view: &wgpu::TextureView, l
 
 /// The output pixels a layer's quad can touch, as (x, y, width, height) clamped to the `w`×`h`
 /// output with a one-pixel margin; None when it touches none. A non-finite matrix covers it all.
+/// Whether a layer is drawn by `fs_blend`, reading the accumulator under it: the blend modes that
+/// need the destination, and a Normal layer mixing on Premiere's linear light
+/// (`filmcraft_render::blend::mixes_on_curve`) instead of fixed-function "over".
+fn reads_backdrop(l: &PlanLayer) -> bool {
+    l.blend.reads_destination() || filmcraft_render::blend::mixes_on_curve(l.blend, l.opacity)
+}
+
 fn quad_bounds(l: &PlanLayer, w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
     let m = &l.matrix;
     let (fw, fh) = (l.size().0 as f64, l.size().1 as f64);

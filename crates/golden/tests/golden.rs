@@ -894,7 +894,8 @@ fn gpu_transition_of_blended_clips_matches_cpu_render() {
         &s.sources,
     );
     let filmcraft_render::plan::FramePlan::Layers { layers, .. } = &plan else { panic!("planned as a CPU image") };
-    assert!(layers.iter().all(|l| l.blend == filmcraft_render::Blend::Normal));
+    // (B mixes over A on the encoded values, as Premiere's Cross Dissolve: `Blend::MixCode`)
+    assert!(layers.iter().all(|l| matches!(l.blend, filmcraft_render::Blend::Normal | filmcraft_render::Blend::MixCode)));
     let mut c = filmcraft_gpu::GpuCompositor::new(&dev, &q);
     c.composite(&plan);
     let (gw, gh, mut px) = c.read_output().expect("GPU readback");

@@ -398,18 +398,31 @@ fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
     }
     let d = textureLoad(backdrop, vec2<i32>(in.pos.xy), 0);
     let da = d.a;
-    // with nothing under it the layer is drawn as it is, at full opacity (as Premiere draws it)
+    let mode = u32(u.p3.x);
+    let sp = raw * u.p0.x;
+    // Normal and the internal code-value mix (27) keep their opacity over nothing: plain "over"
+    if da <= 0.0 && (mode == 0u || mode == 27u) {
+        return sp + d * (1.0 - sp.a);
+    }
+    // with nothing under it a blended layer is drawn as it is, at full opacity (as Premiere draws it)
     if da <= 0.0 {
         return raw + d * (1.0 - raw.a);
     }
-    let sp = raw * u.p0.x;
     let sa = sp.a;
     if sa <= 0.0 {
         discard;
     }
+    // Normal below full opacity: mixed on Premiere's linear light, a 2.4 power of the encoded
+    // values (`blend::curve_mix`)
+    if mode == 0u {
+        let ao = sa + da - sa * da;
+        let ms = pow(clamp(linear_to_srgb(sp.rgb / sa), vec3(0.0), vec3(1.0)), vec3(2.4));
+        let mb = pow(clamp(linear_to_srgb(d.rgb / da), vec3(0.0), vec3(1.0)), vec3(2.4));
+        let m = (sa * ms + (1.0 - sa) * da * mb) / ao;
+        return vec4(srgb_to_linear(pow(clamp(m, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.4))) * ao, ao);
+    }
     let cs = linear_to_srgb(sp.rgb / sa);
     let cb = linear_to_srgb(d.rgb / da);
-    let mode = u32(u.p3.x);
     let bl = blend_rgb(mode, cb, cs);
     // Linear Dodge, Linear Light, Subtract and Divide go into the mix unclamped (as Premiere's do)
     let b = select(clamp(bl, vec3(0.0), vec3(1.0)), bl, mode == 10u || mode == 16u || mode == 21u || mode == 22u);

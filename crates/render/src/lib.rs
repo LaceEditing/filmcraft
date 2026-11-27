@@ -260,6 +260,19 @@ fn seq_canvas(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, s
             let below = canvas.snapshot();
             let la = a.and_then(|i| layer(i, &below));
             let lb = b.and_then(|i| layer(i, &below));
+            // a dissolve from or to nothing is the one clip at the dissolve's opacity over what is
+            // below, mixed as any layer at that opacity (on Premiere's linear light; the layered
+            // plan draws it so too)
+            if matches!(tr.effect.effect.as_str(), "cross_dissolve" | "film_dissolve") && la.is_some() != lb.is_some() {
+                let p = transitions::video_progress(tr, t, seq.settings.frame_rate.frame_duration());
+                let (one, k) = match (la, lb) {
+                    (Some(l), None) => (l, 1.0 - p),
+                    (None, Some(l)) => (l, p),
+                    _ => continue,
+                };
+                blend::composite(canvas.get(), &one.0, k, one.1);
+                continue;
+            }
             // a fade from or to nothing keeps the one layer's blend mode (an adjustment layer in
             // Multiply ends the fade as it carries on); between two layers they mix normally
             let bl = match (&la, &lb) {
@@ -268,7 +281,7 @@ fn seq_canvas(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, s
             };
             let la = la.map(|l| l.0).unwrap_or_else(|| Image::new(w, h));
             let lb = lb.map(|l| l.0).unwrap_or_else(|| Image::new(w, h));
-            let p = tr.progress(t) as f32;
+            let p = transitions::video_progress(tr, t, seq.settings.frame_rate.frame_duration());
             // Reverse plays the transition backwards (e.g. an iris closing on the outgoing clip)
             // while still going from A to B.
             let mixed = if tr.reverse {

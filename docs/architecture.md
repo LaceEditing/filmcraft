@@ -221,6 +221,14 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
         ui-egui frames.rs worker pool ──► monitors (program/source), thumbnails, prefetch
 ```
 
+- **How layers mix (Premiere Pro 27.0's rules, measured).** Images stay in linear-light
+  premultiplied f32, but where two pictures mix the mix follows Premiere: a Normal layer below
+  full opacity mixes on a 2.4 power of the encoded values (Premiere's Composite in Linear Color,
+  `blend::curve_mix`), Cross Dissolve mixes the encoded values themselves (`blend::code_lerp`,
+  `Blend::MixCode` on the GPU), Film Dissolve and Dip to Black mix on the 2.4 curve, the other
+  blend modes on encoded values. The measured dissolves ease in and out
+  (`transitions::video_progress`). The GPU draws a Normal layer below full opacity with
+  `fs_blend`, which reads the accumulator under it.
 - **Sources.** `media::MediaSource` yields `video_frame(FrameRequest)` and
   `audio(start, frames, rate)` in media time. Sources are `Send + Sync` and shared by monitors,
   thumbnails, playback and export. The engine's `MediaPool` creates one per project item, lazily,

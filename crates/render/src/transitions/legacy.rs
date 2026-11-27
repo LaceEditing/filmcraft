@@ -33,6 +33,17 @@ fn masked(a: &Image, b: &Image, m: impl Fn(f32, f32) -> f32 + Sync) -> Image {
     out
 }
 
+/// `a` and `b` mixed `p` of the way to `b`, pixel by pixel, with `lerp`.
+fn mixed(a: &Image, b: &Image, p: f32, lerp: fn([f32; 4], [f32; 4], f32) -> [f32; 4]) -> Image {
+    let mut out = Image::new(a.w, a.h);
+    out.px.par_chunks_mut(4).zip(a.px.par_chunks(4).zip(b.px.par_chunks(4))).for_each(|(o, (x, y))| {
+        if let (Ok(x), Ok(y)) = (<[f32; 4]>::try_from(x), <[f32; 4]>::try_from(y)) {
+            o.copy_from_slice(&lerp(x, y, p));
+        }
+    });
+    out
+}
+
 fn over(dst: &mut Image, src: &Image) {
     crate::blend::composite(dst, src, 1.0, crate::blend::Blend::Normal);
 }
@@ -92,7 +103,12 @@ fn legacy(id: &str, e: &EffectInstance, a: &Image, b: &Image, p: f32) -> Image {
     let aspect = (a.w as f32) / (a.h as f32).max(1.0);
     let pd = p as f64;
     match id {
+        // Premiere Pro 27.0 mixes a Cross Dissolve's sides on the 8-bit values themselves and a Film
+        // Dissolve's on its linear light (a 2.4 power): measured on 17 x 17 grids of levels. The
+        // legacy ones keep FilmCraft's earlier maths.
+        "cross_dissolve" if e.effect == "cross_dissolve" => mixed(a, b, p, crate::blend::code_lerp),
         "cross_dissolve" => masked(a, b, |_, _| p),
+        "film_dissolve" if e.effect == "film_dissolve" => mixed(a, b, p, crate::blend::curve_lerp),
         "film_dissolve" => {
             // blend in a gamma-2.2-like space for a filmic, less-dippy dissolve
             let mut out = Image::new(a.w, a.h);
@@ -113,9 +129,19 @@ fn legacy(id: &str, e: &EffectInstance, a: &Image, b: &Image, p: f32) -> Image {
             let col = if id == "dip_to_black" { [0.0, 0.0, 0.0, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
             let mut out = Image::filled(a.w, a.h, col);
             let (src, k) = if p < 0.5 { (a, 1.0 - p * 2.0) } else { (b, (p - 0.5) * 2.0) };
+            // the clip at k over the colour, mixed as a layer at that opacity is (Premiere Pro 27.0
+            // fades it on its linear light: `blend::curve_mix`)
             let mut s = src.clone();
             s.scale_alpha(k);
-            over(&mut out, &s);
+            if crate::blend::mixes_on_curve(crate::blend::Blend::Normal, k) && !e.effect.ends_with("_legacy") {
+                out.px.par_chunks_mut(4).zip(s.px.par_chunks(4)).for_each(|(o, x)| {
+                    if let (Ok(d), Ok(x)) = (<[f32; 4]>::try_from(&*o), <[f32; 4]>::try_from(x)) {
+                        o.copy_from_slice(&crate::blend::curve_mix(d, x));
+                    }
+                });
+            } else {
+                over(&mut out, &s);
+            }
             out
         }
         "wipe" => {

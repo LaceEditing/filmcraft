@@ -467,7 +467,9 @@ fn camera_long_gop_two_audio_tracks_trim_dissolve_to_prores() {
     let alphas: Vec<f64> = (64..=78).map(mix).collect();
     assert!(alphas[0].abs() < 0.05 && (alphas[14] - 1.0).abs() < 0.05, "outside the dissolve: {alphas:?}");
     assert!(alphas.windows(2).all(|w| w[1] >= w[0] - 0.02), "the dissolve progresses: {alphas:?}");
-    assert!((alphas[7] - 0.5).abs() < 0.12, "half way at the cut (frame 71): {alphas:?}");
+    // (a Cross Dissolve mixes the encoded values and eases, as Premiere's: half way the frame
+    // before the cut, frame 70)
+    assert!((alphas[6] - 0.5).abs() < 0.03, "half way the frame before the cut (frame 70): {alphas:?}");
 
     // sound: both tracks in the mix at their own level while the clip plays, silence on the matte
     let got_pcm = pcm(&ffmpeg, &out, 0);

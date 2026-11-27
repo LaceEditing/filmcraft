@@ -233,6 +233,32 @@ fn push_moves_frames_by_the_eased_distance() {
     }
 }
 
+/// Premiere Pro 27.0's Cross Dissolve of 30 frames, centred on a cut at frame 15: how far it is at
+/// each frame (fitted on its renders, the dissolve kit), and FilmCraft's eased timing.
+#[test]
+fn dissolves_ease_as_premieres_do() {
+    let r = filmcraft_time::FrameRate::FPS_30;
+    let tr = filmcraft_project::Transition {
+        id: filmcraft_project::TransitionId(1),
+        effect: filmcraft_project::find_effect("cross_dissolve").unwrap().instance(),
+        start: r.tick_of(0),
+        duration: r.tick_of(30),
+        from: None,
+        to: None,
+        align: Default::default(),
+        reverse: false,
+    };
+    let premiere = [(1, 0.0063), (3, 0.0417), (7, 0.1725), (10, 0.3043), (14, 0.5), (17, 0.6389), (21, 0.811), (25, 0.9375), (28, 0.9943)];
+    for (frame, want) in premiere {
+        let got = crate::transitions::video_progress(&tr, r.tick_of(frame), r.frame_duration());
+        assert!((got - want).abs() < 0.016, "frame {frame}: {got}, Premiere {want}");
+    }
+    // the transitions not measured keep a straight line
+    let mut wipe = tr.clone();
+    wipe.effect = filmcraft_project::find_effect("wipe").unwrap().instance();
+    assert!((crate::transitions::video_progress(&wipe, r.tick_of(10), r.frame_duration()) - 10.0 / 30.0).abs() < 1e-6);
+}
+
 #[test]
 fn modern_and_legacy_ids_are_distinct_renders() {
     let (a, b) = (frame_a(), frame_b());
@@ -281,8 +307,10 @@ fn morph_cut_moves_the_subject_instead_of_double_exposing() {
         let (m, d) = (column_err(&morph, x), column_err(&dissolve, x));
         assert!(m < 0.12, "x={x}: morph off by {m} (dissolve {d})");
     }
+    // (Cross Dissolve mixes the encoded values: half of the 0.95 subject over the 0.3 background
+    // shows 0.57, not 0.3)
     for x in [98usize, 170] {
-        assert!(column_err(&dissolve, x) > 0.3, "x={x}: the dissolve ghosts here");
+        assert!(column_err(&dissolve, x) > 0.2, "x={x}: the dissolve ghosts here");
     }
     let (e_morph, e_dissolve) = (mean_abs(&morph, &want), mean_abs(&dissolve, &want));
     assert!(e_morph * 10.0 < e_dissolve, "morph {e_morph} vs dissolve {e_dissolve}");
