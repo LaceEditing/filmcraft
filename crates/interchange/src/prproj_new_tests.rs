@@ -574,3 +574,31 @@ fn blend_modes_are_written_into_a_new_project() {
     let first = seq.video_tracks[0].items.iter().find(|c| c.start.0 == 0).unwrap();
     assert_eq!(first.effect("opacity").and_then(|e| e.params.get("blend")).map(|p| p.value.clone()), Some(ParamValue::Choice(3)));
 }
+
+/// Clip ▸ Video Options ▸ Time Interpolation is written as Premiere Pro 2027 saves it
+/// (`TimeInterpolationType` 1 Frame Blending, 2 Optical Flow on the `VideoClip`; none for Frame
+/// Sampling) and read back: before, every clip came out of a Premiere project frame-sampled.
+#[test]
+fn time_interpolation_is_written_and_read() {
+    use filmcraft_project::TimeInterpolation;
+    let (mut p, main, _) = project();
+    {
+        let q = p.sequence_mut(main).unwrap();
+        q.video_tracks[0].items[0].speed = 0.5;
+        q.video_tracks[0].items[0].time_interpolation = TimeInterpolation::FrameBlending;
+        q.video_tracks[1].items[0].time_interpolation = TimeInterpolation::OpticalFlow;
+    }
+    let (bytes, _) = create(&p, &opts()).unwrap();
+    let (xml, _) = prproj_graph::decompress(&bytes).unwrap();
+    let text = String::from_utf8(xml).unwrap();
+    assert!(crate::prproj_write::problems(&text).is_empty(), "{:?}", crate::prproj_write::problems(&text));
+    assert_eq!(text.matches("<TimeInterpolationType>1</TimeInterpolationType>").count(), 1);
+    assert_eq!(text.matches("<TimeInterpolationType>2</TimeInterpolationType>").count(), 1);
+    assert!(text.contains("</Clip><TimeInterpolationType>"), "after the VideoClip's Clip, as Premiere writes it");
+    let (back, _) = read(&bytes);
+    let seq = back.items.values().find(|i| i.name == "Main Edit").and_then(|i| i.as_sequence()).unwrap();
+    let first = seq.video_tracks[0].items.iter().find(|c| c.start.0 == 0).unwrap();
+    assert_eq!(first.time_interpolation, TimeInterpolation::FrameBlending);
+    assert_eq!(seq.video_tracks[1].items[0].time_interpolation, TimeInterpolation::OpticalFlow);
+    assert!(seq.video_tracks[0].items.iter().skip(1).all(|c| c.time_interpolation == TimeInterpolation::FrameSampling));
+}

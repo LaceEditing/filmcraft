@@ -748,6 +748,15 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         if kind == TrackKind::Video && child_text(clip, "ScaleToFramePolicy").map(str::trim) == Some("1") {
             ti.scale_to_frame = true;
         }
+        // Clip ▸ Video Options ▸ Time Interpolation (Premiere Pro 2027: `TimeInterpolationType`
+        // 1 Frame Blending, 2 Optical Flow on the clip; none is Frame Sampling)
+        if kind == TrackKind::Video {
+            ti.time_interpolation = match child_text(clip, "TimeInterpolationType").map(str::trim) {
+                Some("1") => filmcraft_project::TimeInterpolation::FrameBlending,
+                Some("2") => filmcraft_project::TimeInterpolation::OpticalFlow,
+                _ => filmcraft_project::TimeInterpolation::FrameSampling,
+            };
+        }
         match child_text(clip, "FrameHold").map(str::trim) {
             Some(FRAME_HOLD_AT) => ti.frame_hold = time(child_text(clip, "FrameHoldStart")).map(Tick),
             // Frame Hold Options ▸ Hold On: In Point (Round 5 B11)

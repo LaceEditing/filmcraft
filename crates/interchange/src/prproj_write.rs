@@ -1997,6 +1997,22 @@ impl<'a, 'i> Writer<'a, 'i> {
                     }
                 }
             }
+            // Clip ▸ Video Options ▸ Time Interpolation: `TimeInterpolationType` on the clip, after
+            // its `Clip` (1 Frame Blending, 2 Optical Flow; none for Frame Sampling), as Premiere
+            // Pro 2027 saves it
+            let interp = match c.time_interpolation {
+                filmcraft_project::TimeInterpolation::FrameSampling => None,
+                filmcraft_project::TimeInterpolation::FrameBlending => Some("1"),
+                filmcraft_project::TimeInterpolation::OpticalFlow => Some("2"),
+            };
+            let saved = child(clip, "TimeInterpolationType");
+            if interp != saved.and_then(|n| n.text()).map(str::trim).filter(|t| *t != "0") {
+                match (interp, saved) {
+                    (Some(v), _) => self.set_child(clip_inst, clip, "TimeInterpolationType", v),
+                    (None, Some(n)) => self.remove(clip_inst, n),
+                    (None, None) => {}
+                }
+            }
             // Clip ▸ Video Options ▸ Scale to Frame Size: `ScaleToFramePolicy` 1 on the clip
             let policy = child(clip, "ScaleToFramePolicy");
             if c.scale_to_frame != policy.and_then(|n| n.text()).is_some_and(|t| t.trim() == "1") {

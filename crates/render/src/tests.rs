@@ -575,6 +575,18 @@ fn a_reversed_clip_shows_exactly_its_source_range() {
     // every timeline frame stays inside the clip's source range, each source frame shown once
     let all: Vec<i64> = (0..20).flat_map(|f| shown(&p, f, false)).collect();
     assert_eq!(all, (10..=29).rev().collect::<Vec<_>>());
+    // forward at 33.33 % (Premiere saves 0.3333): timeline frame 3 is source frame 0.9999 after
+    // the In, which Premiere Pro 27.0 shows as the In (the speed kit), not the next frame
+    {
+        let it = p.sequence_mut(seq).unwrap().find_item_mut(id).unwrap().1;
+        it.reverse = false;
+        it.speed = 0.3333;
+    }
+    for (f, want) in [(0, 10), (2, 10), (3, 10), (4, 11), (6, 11), (7, 12)] {
+        for planned in [false, true] {
+            assert_eq!(shown(&p, f, planned), [want], "33.33 %, timeline frame {f}, planned {planned}");
+        }
+    }
 }
 
 #[test]
@@ -620,6 +632,34 @@ fn a_still_image_needs_no_in_between_frame() {
         Arc::new(GeneratorSource::new(Generator::ColorMatte { color: [1.0; 4] }, 4, 4, FrameRate::FPS_29_97, Tick(10 * TICKS_PER_SECOND)));
     let (_, w) = media_interpolation(&it, t, &movie, rate).unwrap();
     assert!((w - 0.25).abs() < 1e-3, "a quarter into the source frame: {w}");
+}
+
+/// Premiere Pro 27.0 blends a forward clip's last frame with the media frame past its Out point
+/// (the speed kit: 30 fps at 50 % with Frame Blending, its 60th frame half way into the next
+/// source frame); FilmCraft showed the last frame alone. Where the media ends, nothing is mixed in.
+#[test]
+fn a_forward_clip_blends_with_the_media_past_its_out_point() {
+    let (mut p, red, _, _, _) = setup();
+    let r = FrameRate::FPS_30;
+    let movie: SharedSource = Arc::new(GeneratorSource::new(Generator::ColorMatte { color: [1.0; 4] }, 4, 4, r, r.tick_of(100)));
+    let mut it = p.make_track_item(red, TrackKind::Video, Tick::ZERO, TimeRange::new(r.tick_of(60), r.tick_of(30)), r).unwrap();
+    it.time_interpolation = filmcraft_project::TimeInterpolation::FrameBlending;
+    it.speed = 0.5;
+    it.duration = r.tick_of(60);
+    assert_eq!(it.source_out(), r.tick_of(90));
+    let last = r.tick_of(59);
+    assert!(interpolation_blend(&it, last, r, r).is_none(), "the source-range rule alone");
+    let (next, w) = media_interpolation(&it, last, &movie, r).expect("blended with frame 90");
+    assert_eq!(next, r.tick_of(90));
+    assert!((w - 0.5).abs() < 1e-3, "{w}");
+    // reversed, the clip stays within its range (#3948)
+    it.reverse = true;
+    assert!(media_interpolation(&it, r.tick_of(0), &movie, r).is_none_or(|(n, _)| n < it.source_out()));
+    // at the end of the media there is no later frame
+    it.reverse = false;
+    it.source_in = r.tick_of(70);
+    assert_eq!(it.source_out(), r.tick_of(100));
+    assert!(media_interpolation(&it, last, &movie, r).is_none());
 }
 
 #[test]

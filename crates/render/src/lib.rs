@@ -720,14 +720,15 @@ fn media_frame(item: &TrackItem, t: Tick, sources: &dyn SourceProvider, want: f3
     Some((src, frame, n))
 }
 
-/// The media time to ask a source for the video frame a clip shows at timeline `t`. A reversed
-/// clip's source time is the instant just before its mirrored position; readers that round the
-/// request to the nearest unit of a coarse timescale (MP4) land on the next frame from there,
-/// showing one frame past the clip's source range and never its In (#318). Snapped down to the
-/// start of the `media_rate` frame that contains it, every reader shows that frame.
+/// The media time to ask a source for the video frame a clip shows at timeline `t`: the start of
+/// the `media_rate` frame that contains the clip's source time, so every reader shows that frame.
+/// Readers round a request to the nearest unit of a coarse timescale (MP4, MOV): a reversed clip's
+/// source time, the instant just before its mirrored position, landed on the next frame (#318),
+/// and so did a forward one just short of a frame, as at 33.33 % (frame 3 is source frame 0.9999,
+/// which Premiere Pro 27.0 shows as frame 0: the speed kit).
 pub(crate) fn video_source_time(item: &TrackItem, t: Tick, media_rate: filmcraft_time::FrameRate) -> Tick {
     let ft = item.source_time_at(t);
-    if !item.reverse || item.frame_hold.is_some() || media_rate.frame_duration().0 <= 0 {
+    if item.frame_hold.is_some() || media_rate.frame_duration().0 <= 0 {
         return ft;
     }
     media_rate.tick_of(media_rate.frame_at(ft)).clamp(item.source_in.min(ft), ft)
@@ -829,6 +830,11 @@ pub fn render_clip(
 /// frame lies past the clip's source out. Frame Blending cross-fades the two frames; Optical Flow
 /// synthesises the in-between frame from their motion ([`flow`]).
 pub fn interpolation_blend(item: &TrackItem, t: Tick, src_rate: filmcraft_time::FrameRate, seq_rate: filmcraft_time::FrameRate) -> Option<(Tick, f32)> {
+    blend_before(item, t, src_rate, seq_rate, item.source_out())
+}
+
+/// [`interpolation_blend`] with the later frame anywhere before `end` (media time).
+fn blend_before(item: &TrackItem, t: Tick, src_rate: filmcraft_time::FrameRate, seq_rate: filmcraft_time::FrameRate, end: Tick) -> Option<(Tick, f32)> {
     if item.time_interpolation == filmcraft_project::TimeInterpolation::FrameSampling || item.frame_hold.is_some() {
         return None;
     }
@@ -850,7 +856,7 @@ pub fn interpolation_blend(item: &TrackItem, t: Tick, src_rate: filmcraft_time::
     // away. A reversed clip starts just before its source out and a forward one can end there;
     // both show their last frame alone.
     let next = src_rate.tick_of(f + 1);
-    if next >= item.source_out() {
+    if next >= end {
         return None;
     }
     // the mix depends only on the media position, so reversed clips blend the same pair
@@ -863,7 +869,12 @@ pub(crate) fn media_interpolation(item: &TrackItem, t: Tick, src: &SharedSource,
     if src.info().kind == filmcraft_media::MediaKind::Still {
         return None;
     }
-    interpolation_blend(item, t, src.info().frame_rate(), seq_rate)
+    // a forward clip's last frames blend with the media past its Out point, where the media has
+    // more (Premiere Pro 27.0: the speed kit's last blended frame mixes in the next source frame);
+    // a reversed one stays within its range (#3948)
+    let media_end = src.info().duration;
+    let end = if item.reverse || media_end.0 <= 0 { item.source_out() } else { item.source_out().max(media_end) };
+    blend_before(item, t, src.info().frame_rate(), seq_rate, end)
 }
 
 /// Largest power-of-two box decimation that keeps at least `target_w` pixels of width.
